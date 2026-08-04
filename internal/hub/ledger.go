@@ -1,0 +1,1393 @@
+// Package hub is the dynamic-mode control plane: a per-run task ledger with an
+// A2A lifecycle, a policy engine that enforces the run's budget in Go, and the
+// two protocol surfaces agents reach it through (MCP for the agents themselves,
+// A2A JSON-RPC for anything outside loom).
+//
+// The ledger is the single source of truth. Delegation from the coordinator,
+// peer handoff between workers, and external A2A calls all land in the same
+// table and go through the same guards — there is no side door that skips the
+// budget or the audit trail.
+package hub
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"loom/internal/model"
+	"loom/internal/store"
+)
+
+// Executor is the engine's half of the contract: the hub decides *that* a task
+// should run, the engine knows *how* to run one. StartTask must not block —
+// the engine spawns its own goroutine.
+type Executor interface {
+	StartTask(rs *RunSession, taskID string)
+	CancelTask(rs *RunSession, taskID string)
+}
+
+// RunConfig wires one dynamic run.
+type RunConfig struct {
+	Run       *model.Run
+	Workflow  *model.Workflow
+	Pool      []*model.Agent
+	Workspace string
+	Exec      Executor
+
+	// OnChange persists and publishes a run snapshot. It is called with the
+	// session lock held, so it must not call back into the RunSession.
+	OnChange func(*model.Run)
+	// OnEvent appends to the run's audit log; same locking contract.
+	OnEvent func(typ, taskID, msg string)
+	// OnCost records a priced unit into the global ledger.
+	OnCost func(store.CostEntry)
+	// SaveAgent persists a coordinator-created agent into the shared pool.
+	SaveAgent func(*model.Agent) error
+}
+
+// ErrApprovalPending is returned when work is requested before a human has
+// released the run's initial approval gate. Callers that can do something
+// about it (the coordinator) match on it to add role-specific guidance.
+var ErrApprovalPending = errors.New("approval pending")
+
+// CreatedByExternal marks tasks submitted by outside A2A clients.
+const CreatedByExternal = "external"
+
+// reworkRootLocked follows a rework chain back to the original failed task, so
+// rework counting and kind routing always key on the root, not the latest link.
+func reworkRootLocked(run *model.Run, id string) string {
+	for {
+		t := run.Tasks[id]
+		if t == nil || t.RetryOf == "" {
+			return id
+		}
+		id = t.RetryOf
+	}
+}
+
+// reworkAdvice tells a coordinator what "back to the planning layer" means for
+// each non-reworkable failure kind.
+func reworkAdvice(kind string) string {
+	switch kind {
+	case model.FailSpecUnclear:
+		return "The instruction itself was the problem: rewrite it (or the acceptance criteria) before delegating again."
+	case model.FailMissingDep:
+		return "Something upstream was never provided: produce the missing dependency first, then delegate."
+	case model.FailConflict:
+		return "The requirement conflicts with other work: resolve the conflict in the plan before anything is redone."
+	default:
+		return "The failure was not classified as a work obstacle, so repeating the work cannot help."
+	}
+}
+
+// Verdict is how a dynamic run ends: the coordinator's own declaration.
+type Verdict struct {
+	Status    string // succeeded | failed
+	Summary   string
+	Artifacts []string
+}
+
+// RunSession is the ledger and policy engine for one dynamic run.
+type RunSession struct {
+	hub       *Hub
+	cfg       RunConfig
+	budget    model.BudgetConfig
+	workspace string
+
+	mu   sync.Mutex
+	run  *model.Run
+	pool map[string]*model.Agent
+
+	// dispatched marks tasks handed to the executor. A task occupies a session
+	// slot from dispatch, not from the moment it reports working: the executor
+	// starts asynchronously, and counting only by status would let a second
+	// schedule() pass re-dispatch the same task and overshoot MaxParallel.
+	dispatched map[string]bool
+
+	ctrl map[string]*taskCtrl
+
+	// approval gate
+	approvalNeeded bool
+	approvalDone   bool
+	approvalCh     chan approvalResult
+
+	// coordinator liveness / stall detection
+	lastTransition time.Time
+	pendingNotice  string
+
+	// inspections counts the coordinator's audited reads of run deliverables.
+	// finish_run(succeeded) is refused while it is zero and artifacts exist:
+	// machine checks decide "correct", but only actually reading the output
+	// can catch "correct but off-course".
+	inspections int
+
+	// seq increments on every ledger transition; the round driver compares it
+	// across rounds to detect a coordinator that acts without effect.
+	seq uint64
+
+	// changed is closed and replaced on every ledger transition; waiters take a
+	// reference before checking state, so no transition can be missed.
+	changed chan struct{}
+
+	verdict  *Verdict
+	finished chan struct{}
+	closed   bool
+	cancel   context.CancelFunc
+}
+
+type approvalResult struct {
+	approved bool
+	reason   string
+}
+
+// taskCtrl is the per-task control block: how the hub talks to a running
+// worker without reaching into the engine's goroutine.
+type taskCtrl struct {
+	// inbox holds steering messages for a working task. They are delivered at
+	// the next turn boundary, because ACP has no way to interrupt a turn in
+	// flight (see docs/DECISIONS-v2.md D4).
+	inbox []string
+	// answer unblocks a worker parked in ask_coordinator. Buffered so the
+	// answering side never blocks on a worker that gave up.
+	answer chan string
+	cancel context.CancelFunc
+}
+
+func (rs *RunSession) newTaskCtrl() *taskCtrl {
+	return &taskCtrl{answer: make(chan string, 1)}
+}
+
+// ---- lifecycle ----
+
+// Run returns the live run object. Callers must not mutate it.
+func (rs *RunSession) Run() *model.Run { return rs.run }
+
+// Workspace is the run's shared exchange directory.
+func (rs *RunSession) Workspace() string { return rs.workspace }
+
+// Budget is the effective budget for this run.
+func (rs *RunSession) Budget() model.BudgetConfig { return rs.budget }
+
+// Done is closed once the run reaches a verdict or is torn down.
+func (rs *RunSession) Done() <-chan struct{} { return rs.finished }
+
+// Verdict returns the coordinator's declared outcome, or nil if it never gave one.
+func (rs *RunSession) Verdict() *Verdict {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.verdict
+}
+
+// Close tears the session down: every non-terminal task is canceled and the
+// hub stops routing to this run.
+func (rs *RunSession) Close() {
+	rs.mu.Lock()
+	if rs.closed {
+		rs.mu.Unlock()
+		return
+	}
+	rs.closed = true
+	var toCancel []string
+	for _, t := range rs.run.Tasks {
+		if !model.TaskTerminal(t.Status) {
+			toCancel = append(toCancel, t.ID)
+		}
+	}
+	// Unblock anything parked in the approval gate.
+	if rs.approvalCh != nil {
+		select {
+		case rs.approvalCh <- approvalResult{approved: false, reason: "run ended"}:
+		default:
+		}
+	}
+	rs.mu.Unlock()
+
+	for _, id := range toCancel {
+		// Once the coordinator has delivered its verdict, anything still in
+		// flight is work nobody will consume — including tasks an external
+		// A2A client injected. Killing it bounds the run; saying so plainly
+		// is what keeps that from looking like a crash.
+		rs.cancelTask(id, "run ended before this task finished; no one remained to consume its result")
+	}
+	rs.mu.Lock()
+	rs.notifyLocked()
+	rs.mu.Unlock()
+	close(rs.finished)
+	rs.hub.removeRun(rs.run.ID)
+}
+
+// ---- change notification ----
+
+// waitChange returns a channel closed on the next ledger transition. Take it
+// *before* reading state, then select on it, and no transition can slip by.
+func (rs *RunSession) waitChange() <-chan struct{} {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.changed
+}
+
+// notifyLocked wakes every waiter and republishes. Must hold rs.mu.
+func (rs *RunSession) notifyLocked() {
+	rs.lastTransition = time.Now()
+	rs.seq++
+	close(rs.changed)
+	rs.changed = make(chan struct{})
+	if rs.cfg.OnChange != nil {
+		rs.cfg.OnChange(rs.run)
+	}
+}
+
+// Seq returns the ledger's transition counter.
+func (rs *RunSession) Seq() uint64 {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.seq
+}
+
+func (rs *RunSession) event(typ, taskID, msg string) {
+	if rs.cfg.OnEvent != nil {
+		rs.cfg.OnEvent(typ, taskID, msg)
+	}
+}
+
+// ---- pool ----
+
+// PoolAgents lists the agents this run may delegate to.
+func (rs *RunSession) PoolAgents() []*model.Agent {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	out := make([]*model.Agent, 0, len(rs.pool))
+	for _, a := range rs.pool {
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func (rs *RunSession) agent(name string) *model.Agent {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.pool[name]
+}
+
+// AddAgent extends the run's pool with a newly created agent.
+func (rs *RunSession) AddAgent(a *model.Agent) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.pool[a.Name] = a
+}
+
+// ---- task creation ----
+
+// DelegateRequest is one request to put work on the ledger, from whatever
+// source. Every path — coordinator delegate, peer handoff, external A2A —
+// funnels through Delegate so no caller can dodge the budget.
+type DelegateRequest struct {
+	Agent       string
+	Title       string
+	Instruction string
+	Constraints string // cross-domain constraints the worker cannot infer; required for internal callers
+	ContextHint string
+	CreatedBy   string // "coordinator" | "external" | parent task id
+	Depth       int
+
+	// Acceptance is the machine-checkable passing bar, fixed before the worker
+	// starts. Required for internal callers; external A2A submissions get a
+	// default artifact-agnostic contract (the boundary hardening for external
+	// callers is tracked separately).
+	Acceptance []model.AcceptanceCheck
+
+	// RetryOf marks this delegation as rework of a failed task. Rework is only
+	// legal when that task failed as "blocked"; every other failure kind means
+	// the plan, not the worker, needs to change.
+	RetryOf string
+}
+
+// Delegate creates a task after checking every applicable budget rule. The
+// errors it returns are written to be *read by a model*: they say what the
+// limit was and what to do instead, because a coordinator that understands the
+// refusal converges, and one that doesn't retries forever.
+func (rs *RunSession) Delegate(req DelegateRequest) (*model.Task, error) {
+	rs.mu.Lock()
+	if rs.closed {
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("this run has ended; no further tasks can be created")
+	}
+	if rs.approvalNeeded && !rs.approvalDone {
+		rs.mu.Unlock()
+		// Role-neutral wording: this path is also reached by external A2A
+		// callers, which have no propose_plan of their own to call. The
+		// coordinator's tool adds that hint itself.
+		return nil, fmt.Errorf("%w: this run is awaiting human approval of its initial plan, so no task can be created yet", ErrApprovalPending)
+	}
+	if n := len(rs.run.Tasks); n >= rs.budget.MaxTasks {
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("task budget exhausted: %d of %d tasks already created. "+
+			"Do not create more — converge with what you have, or finish_run with what is achievable", n, rs.budget.MaxTasks)
+	}
+	if req.Depth > rs.budget.MaxDelegationDepth {
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("delegation depth %d exceeds the limit of %d: this work must be done at the current level, not delegated further",
+			req.Depth, rs.budget.MaxDelegationDepth)
+	}
+	agent := rs.pool[req.Agent]
+	if agent == nil {
+		names := make([]string, 0, len(rs.pool))
+		for n := range rs.pool {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("unknown agent %q; available: %s", req.Agent, strings.Join(names, ", "))
+	}
+	if strings.TrimSpace(req.Instruction) == "" {
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("instruction is required and must be self-contained: the worker cannot see your context")
+	}
+	internal := req.CreatedBy != CreatedByExternal
+	if internal {
+		if strings.TrimSpace(req.Constraints) == "" {
+			rs.mu.Unlock()
+			return nil, fmt.Errorf("constraints is required: state the cross-domain constraints this worker cannot infer " +
+				"(interfaces to honor, formats, style rules, boundaries with other tasks). Write \"none\" only if there " +
+				"genuinely are none")
+		}
+		if err := ValidateChecks(req.Acceptance); err != nil {
+			rs.mu.Unlock()
+			return nil, err
+		}
+	}
+	if agent.Independent && strings.TrimSpace(req.ContextHint) != "" {
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("agent %q is an independent verifier: it must form its own view from the artifacts. "+
+			"Do not pass a context_hint — put the requirement and the artifact paths in the instruction, and nothing "+
+			"about how the work was done or what its author concluded", req.Agent)
+	}
+
+	// Rework routing: an explicit retry_of, or an implicit one when this
+	// delegation targets the same agent and title as an already-failed task.
+	// Detecting the implicit case is what stops "just don't say retry_of"
+	// from becoming the bypass.
+	retryOf := req.RetryOf
+	if retryOf == "" && internal {
+		for _, id := range rs.run.TaskOrder {
+			prev := rs.run.Tasks[id]
+			if prev.Status == model.TaskFailed && prev.Agent == req.Agent &&
+				strings.EqualFold(strings.TrimSpace(prev.Title), strings.TrimSpace(req.Title)) && prev.Title != "" {
+				retryOf = id
+			}
+		}
+	}
+	if retryOf != "" {
+		orig := rs.run.Tasks[retryOf]
+		if orig == nil {
+			rs.mu.Unlock()
+			return nil, fmt.Errorf("retry_of names unknown task %q", retryOf)
+		}
+		if orig.Status != model.TaskFailed {
+			rs.mu.Unlock()
+			return nil, fmt.Errorf("task %s is %s, not failed; only failed tasks can be reworked", retryOf, orig.Status)
+		}
+		root := reworkRootLocked(rs.run, retryOf)
+		if kind := rs.run.Tasks[root].FailureKind; kind != model.FailBlocked {
+			rs.mu.Unlock()
+			return nil, fmt.Errorf("task %s failed as %q — rework cannot fix that. %s Do not re-send the same task; "+
+				"change the plan instead", root, kind, reworkAdvice(kind))
+		}
+		reworks := 0
+		for _, t := range rs.run.Tasks {
+			if t.RetryOf != "" && reworkRootLocked(rs.run, t.RetryOf) == root {
+				reworks++
+			}
+		}
+		if reworks >= rs.budget.MaxReworksPerTask {
+			rs.mu.Unlock()
+			return nil, fmt.Errorf("task %s has already been reworked %d time(s), the limit for one task. Escalate: "+
+				"revise the plan (different agent, smaller scope, different approach) or finish_run with what is "+
+				"honestly achievable", root, reworks)
+		}
+	}
+
+	now := time.Now()
+	t := &model.Task{
+		ID:          store.NewTaskID(),
+		Agent:       req.Agent,
+		Title:       strings.TrimSpace(req.Title),
+		Instruction: req.Instruction,
+		Constraints: strings.TrimSpace(req.Constraints),
+		CreatedBy:   req.CreatedBy,
+		RetryOf:     retryOf,
+		Depth:       req.Depth,
+		Status:      model.TaskSubmitted,
+		Acceptance:  req.Acceptance,
+		CreatedAt:   now,
+	}
+	if t.Title == "" {
+		t.Title = firstLine(req.Instruction, 60)
+	}
+	instruction := req.Instruction
+	if h := strings.TrimSpace(req.ContextHint); h != "" {
+		instruction += "\n\nContext from the delegator: " + h
+	}
+	t.Instruction = instruction
+	t.Messages = append(t.Messages, model.TaskMessage{
+		Ts: now, From: req.CreatedBy, Role: model.MsgInstruction, Text: instruction,
+	})
+	rs.run.Tasks[t.ID] = t
+	rs.run.TaskOrder = append(rs.run.TaskOrder, t.ID)
+	rs.ctrl[t.ID] = rs.newTaskCtrl()
+	rs.notifyLocked()
+	rs.mu.Unlock()
+
+	rs.event("task_created", t.ID, fmt.Sprintf("%s → %s: %s (depth %d)", req.CreatedBy, req.Agent, t.Title, t.Depth))
+	rs.schedule()
+	return t, nil
+}
+
+// schedule dispatches as many queued tasks as the parallelism budget allows.
+//
+// A slot is held from dispatch until the task is terminal — including while it
+// sits in input-required, because a task blocked on a question still owns a
+// live agent session and the memory behind it (docs/DECISIONS-v2.md D10).
+// Occupancy is recomputed from the ledger on every pass so it can never drift.
+func (rs *RunSession) schedule() {
+	rs.mu.Lock()
+	if rs.closed {
+		rs.mu.Unlock()
+		return
+	}
+	occupied := 0
+	var queue []string
+	for _, id := range rs.run.TaskOrder {
+		t := rs.run.Tasks[id]
+		switch {
+		case model.TaskTerminal(t.Status):
+			delete(rs.dispatched, id)
+		case rs.dispatched[id] || t.Status == model.TaskWorking || t.Status == model.TaskInputRequired:
+			occupied++
+		case t.Status == model.TaskSubmitted:
+			queue = append(queue, id)
+		}
+	}
+	var start []string
+	for _, id := range queue {
+		if occupied >= rs.budget.MaxParallel {
+			break
+		}
+		occupied++
+		rs.dispatched[id] = true
+		start = append(start, id)
+	}
+	rs.mu.Unlock()
+
+	// StartTask is called outside the lock: the engine may touch the ledger.
+	for _, id := range start {
+		rs.cfg.Exec.StartTask(rs, id)
+	}
+}
+
+// ---- task state transitions ----
+
+// legalTransitions is the A2A lifecycle, spelled out so an out-of-order
+// report from a worker goroutine is rejected loudly instead of corrupting the
+// ledger.
+var legalTransitions = map[string]map[string]bool{
+	model.TaskSubmitted:     {model.TaskWorking: true, model.TaskCanceled: true, model.TaskFailed: true},
+	model.TaskWorking:       {model.TaskInputRequired: true, model.TaskCompleted: true, model.TaskFailed: true, model.TaskCanceled: true},
+	model.TaskInputRequired: {model.TaskWorking: true, model.TaskCompleted: true, model.TaskFailed: true, model.TaskCanceled: true},
+	model.TaskCompleted:     {},
+	model.TaskFailed:        {},
+	model.TaskCanceled:      {},
+}
+
+// transitionLocked applies a state change if the lifecycle permits it.
+func (rs *RunSession) transitionLocked(t *model.Task, to string) error {
+	if t.Status == to {
+		return nil
+	}
+	if !legalTransitions[t.Status][to] {
+		return fmt.Errorf("illegal task transition %s → %s for %s", t.Status, to, t.ID)
+	}
+	t.Status = to
+	return nil
+}
+
+// TaskStarted marks a task as working; called by the engine when the worker
+// session is live.
+func (rs *RunSession) TaskStarted(taskID string) error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	t := rs.run.Tasks[taskID]
+	if t == nil {
+		return fmt.Errorf("unknown task %s", taskID)
+	}
+	if err := rs.transitionLocked(t, model.TaskWorking); err != nil {
+		return err
+	}
+	t.StartedAt = time.Now()
+	rs.notifyLocked()
+	return nil
+}
+
+// TaskActivity records what the worker is doing right now. This is live UI
+// signal only: it neither persists nor counts as a ledger transition, so it
+// can't reset the stall detector.
+func (rs *RunSession) TaskActivity(taskID, text string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if t := rs.run.Tasks[taskID]; t != nil && !model.TaskTerminal(t.Status) {
+		t.Activity = text
+		if rs.cfg.OnChange != nil {
+			rs.cfg.OnChange(rs.run)
+		}
+	}
+}
+
+// RecordTaskCost prices one turn of a task.
+func (rs *RunSession) RecordTaskCost(taskID, modelID string, usage model.TokenUsage, cost float64, durMs int64) {
+	rs.mu.Lock()
+	t := rs.run.Tasks[taskID]
+	if t == nil {
+		rs.mu.Unlock()
+		return
+	}
+	t.CostUSD += cost
+	t.Usage.Add(usage)
+	t.DurationMs += durMs
+	rs.run.CostUSD += cost
+	rs.run.Usage.Add(usage)
+	agent := t.Agent
+	rs.mu.Unlock()
+
+	if rs.cfg.OnCost != nil && (cost != 0 || !usage.Empty()) {
+		rs.cfg.OnCost(store.CostEntry{
+			WorkflowID: rs.run.WorkflowID, RunID: rs.run.ID, Unit: "task", UnitID: taskID,
+			Agent: agent, Model: modelID, Usage: usage, CostUSD: cost,
+		})
+	}
+}
+
+// CompleteTask puts a task into a terminal state and frees its session slot.
+// Failures land with kind "unspecified", which the rework router treats as
+// not rework-eligible; use CompleteTaskWith when the kind is known.
+func (rs *RunSession) CompleteTask(taskID, summary string, artifacts []string, taskErr error) {
+	rs.CompleteTaskWith(taskID, summary, artifacts, taskErr, "", nil)
+}
+
+// CompleteTaskWith is CompleteTask plus the failure classification and the
+// executed acceptance results — the two fields the coordinator's routing and
+// the audit trail key on.
+func (rs *RunSession) CompleteTaskWith(taskID, summary string, artifacts []string, taskErr error,
+	failureKind string, acceptance []model.CheckResult) {
+	rs.mu.Lock()
+	t := rs.run.Tasks[taskID]
+	if t == nil || model.TaskTerminal(t.Status) {
+		rs.mu.Unlock()
+		return
+	}
+	if acceptance != nil {
+		t.AcceptanceResults = acceptance
+	}
+	to := model.TaskCompleted
+	if taskErr != nil {
+		to = model.TaskFailed
+		t.Error = taskErr.Error()
+		if failureKind == "" {
+			failureKind = model.FailUnspecified
+		}
+		t.FailureKind = failureKind
+	}
+	// A worker can be terminated from working or input-required; force the
+	// transition table's hand only through the legal edges.
+	if err := rs.transitionLocked(t, to); err != nil {
+		t.Status = to // terminal states are absorbing; never leave a zombie
+	}
+	t.Summary = summary
+	t.Artifacts = artifacts
+	t.Activity = ""
+	t.EndedAt = time.Now()
+	if summary != "" {
+		t.Messages = append(t.Messages, model.TaskMessage{
+			Ts: t.EndedAt, From: t.ID, Role: model.MsgResult, Text: summary,
+		})
+	}
+	rs.notifyLocked()
+	rs.mu.Unlock()
+
+	if taskErr != nil {
+		rs.event("task_status", taskID, fmt.Sprintf("failed (%s): %s", failureKind, taskErr.Error()))
+	} else {
+		rs.event("task_status", taskID, "completed: "+firstLine(summary, 120))
+	}
+	rs.schedule()
+}
+
+// cancelTask stops a task and its worker session.
+func (rs *RunSession) cancelTask(taskID, reason string) {
+	rs.mu.Lock()
+	t := rs.run.Tasks[taskID]
+	if t == nil || model.TaskTerminal(t.Status) {
+		rs.mu.Unlock()
+		return
+	}
+	t.Status = model.TaskCanceled
+	t.Error = reason
+	t.Activity = ""
+	t.EndedAt = time.Now()
+	ctrl := rs.ctrl[taskID]
+	rs.notifyLocked()
+	rs.mu.Unlock()
+
+	if ctrl != nil {
+		select { // release a worker parked on a question
+		case ctrl.answer <- "":
+		default:
+		}
+	}
+	rs.cfg.Exec.CancelTask(rs, taskID)
+	rs.event("task_status", taskID, "canceled: "+reason)
+}
+
+// CancelTask is the exported entry point (A2A tasks/cancel, run teardown).
+func (rs *RunSession) CancelTask(taskID, reason string) error {
+	rs.mu.Lock()
+	_, ok := rs.run.Tasks[taskID]
+	rs.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("unknown task %s", taskID)
+	}
+	rs.cancelTask(taskID, reason)
+	rs.schedule()
+	return nil
+}
+
+// ---- messaging ----
+
+// Ask parks a task in input-required and blocks until an answer arrives, the
+// task dies, or the run ends. The worker stays inside its MCP tool call for
+// the whole wait, so answering costs no extra turn and loses no context.
+func (rs *RunSession) Ask(ctx context.Context, taskID, question string) (string, error) {
+	rs.mu.Lock()
+	t := rs.run.Tasks[taskID]
+	if t == nil {
+		rs.mu.Unlock()
+		return "", fmt.Errorf("unknown task %s", taskID)
+	}
+	if err := rs.transitionLocked(t, model.TaskInputRequired); err != nil {
+		rs.mu.Unlock()
+		return "", err
+	}
+	t.Messages = append(t.Messages, model.TaskMessage{
+		Ts: time.Now(), From: taskID, Role: model.MsgQuestion, Text: question,
+	})
+	ctrl := rs.ctrl[taskID]
+	rs.notifyLocked()
+	rs.mu.Unlock()
+
+	rs.event("task_message", taskID, "asked the coordinator: "+firstLine(question, 120))
+
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-rs.finished:
+		return "", fmt.Errorf("run ended while waiting for an answer")
+	case answer := <-ctrl.answer:
+		if answer == "" {
+			return "", fmt.Errorf("task was canceled while waiting for an answer")
+		}
+		rs.mu.Lock()
+		if t := rs.run.Tasks[taskID]; t != nil && t.Status == model.TaskInputRequired {
+			rs.transitionLocked(t, model.TaskWorking)
+		}
+		rs.notifyLocked()
+		rs.mu.Unlock()
+		return answer, nil
+	}
+}
+
+// SendResult tells the sender how a message was delivered, so a coordinator
+// can tell "it heard you" from "it will hear you at the next turn".
+type SendResult struct {
+	Delivery string `json:"delivery"` // immediate | queued_next_turn
+	Note     string `json:"note,omitempty"`
+}
+
+// Send delivers a message to a task. An input-required task is unblocked in
+// place; a working task gets it at its next turn boundary, which is the best
+// ACP allows (docs/DECISIONS-v2.md D4).
+func (rs *RunSession) Send(taskID, from, text string) (*SendResult, error) {
+	rs.mu.Lock()
+	t := rs.run.Tasks[taskID]
+	if t == nil {
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("unknown task %s", taskID)
+	}
+	if model.TaskTerminal(t.Status) {
+		st := t.Status
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("task %s is already %s; it cannot receive messages. Delegate a new task instead", taskID, st)
+	}
+	if t.Turns >= rs.budget.MaxTurnsPerTask {
+		turns := t.Turns
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("task %s has used all %d of its allowed turns: no more back-and-forth is possible. "+
+			"Decide based on what it has produced, or delegate a fresh task with a sharper instruction", taskID, turns)
+	}
+	role := model.MsgFollowup
+	t.Messages = append(t.Messages, model.TaskMessage{Ts: time.Now(), From: from, Role: role, Text: text})
+	ctrl := rs.ctrl[taskID]
+	waiting := t.Status == model.TaskInputRequired
+	if !waiting {
+		ctrl.inbox = append(ctrl.inbox, text)
+	}
+	rs.notifyLocked()
+	rs.mu.Unlock()
+
+	rs.event("task_message", taskID, from+" → task: "+firstLine(text, 120))
+	if waiting {
+		select {
+		case ctrl.answer <- text:
+		default: // worker already moved on; the message stays in the audit log
+		}
+		return &SendResult{Delivery: "immediate"}, nil
+	}
+	return &SendResult{
+		Delivery: "queued_next_turn",
+		Note:     "the worker is mid-turn; it will receive this as a follow-up turn once the current one ends",
+	}, nil
+}
+
+// TakeInbox drains queued follow-up messages for a task. The engine calls this
+// at a turn boundary: a non-empty result means the task continues for another
+// turn instead of finalizing.
+func (rs *RunSession) TakeInbox(taskID string) []string {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	ctrl := rs.ctrl[taskID]
+	if ctrl == nil || len(ctrl.inbox) == 0 {
+		return nil
+	}
+	out := ctrl.inbox
+	ctrl.inbox = nil
+	return out
+}
+
+// TurnSpent counts a prompt turn against the task's turn budget.
+func (rs *RunSession) TurnSpent(taskID string) (used, max int) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	t := rs.run.Tasks[taskID]
+	if t == nil {
+		return 0, rs.budget.MaxTurnsPerTask
+	}
+	t.Turns++
+	return t.Turns, rs.budget.MaxTurnsPerTask
+}
+
+// Progress records a mid-flight report from a worker.
+func (rs *RunSession) Progress(taskID, text string) error {
+	rs.mu.Lock()
+	t := rs.run.Tasks[taskID]
+	if t == nil {
+		rs.mu.Unlock()
+		return fmt.Errorf("unknown task %s", taskID)
+	}
+	t.Messages = append(t.Messages, model.TaskMessage{
+		Ts: time.Now(), From: taskID, Role: model.MsgProgress, Text: text,
+	})
+	rs.notifyLocked()
+	rs.mu.Unlock()
+	rs.event("task_message", taskID, "progress: "+firstLine(text, 120))
+	return nil
+}
+
+// PeerMessage records a worker-to-worker exchange on both tasks' ledgers.
+func (rs *RunSession) PeerMessage(fromTask, toTask, text string) error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	src, dst := rs.run.Tasks[fromTask], rs.run.Tasks[toTask]
+	if src == nil || dst == nil {
+		return fmt.Errorf("unknown task in peer exchange")
+	}
+	m := model.TaskMessage{Ts: time.Now(), From: fromTask, Role: model.MsgPeer, Text: text}
+	src.Messages = append(src.Messages, m)
+	dst.Messages = append(dst.Messages, m)
+	rs.notifyLocked()
+	return nil
+}
+
+// Related reports whether two tasks are lineage-adjacent: parent, child, or
+// sibling under the same creator. ask_agent is limited to these so a worker
+// can consult the work it actually depends on, not broadcast run-wide.
+func (rs *RunSession) Related(a, b string) bool {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	ta, tb := rs.run.Tasks[a], rs.run.Tasks[b]
+	if ta == nil || tb == nil {
+		return false
+	}
+	return ta.CreatedBy == b || tb.CreatedBy == a || (ta.CreatedBy == tb.CreatedBy && ta.CreatedBy != "")
+}
+
+// ---- awaiting ----
+
+// TaskView is the summary shape returned to the coordinator: enough to decide,
+// small enough not to blow up its context. Full message history stays in the
+// ledger for the UI and the audit trail.
+type TaskView struct {
+	ID         string   `json:"task_id"`
+	Agent      string   `json:"agent"`
+	Title      string   `json:"title"`
+	Status     string   `json:"status"`
+	Summary    string   `json:"summary,omitempty"`
+	Question   string   `json:"question,omitempty"` // set when status is input-required
+	Error      string   `json:"error,omitempty"`
+	Artifacts  []string `json:"artifacts,omitempty"`
+	Activity   string   `json:"activity,omitempty"`
+	Depth      int      `json:"depth"`
+	Turns      int      `json:"turns"`
+	CostUSD    float64  `json:"cost_usd"`
+	Acceptance string   `json:"acceptance,omitempty"` // executed-check summary, e.g. "2/2 checks passed"
+
+	// Failure routing, filled when status is failed. Route says what the
+	// budget engine will actually permit: "rework-allowed" only for kind
+	// "blocked"; everything else must go back to the plan.
+	FailureKind string `json:"failure_kind,omitempty"`
+	Route       string `json:"route,omitempty"`
+}
+
+func (rs *RunSession) viewLocked(t *model.Task) TaskView {
+	v := TaskView{
+		ID: t.ID, Agent: t.Agent, Title: t.Title, Status: t.Status,
+		Summary: t.Summary, Error: t.Error, Artifacts: t.Artifacts,
+		Activity: t.Activity, Depth: t.Depth, Turns: t.Turns, CostUSD: t.CostUSD,
+	}
+	if len(t.AcceptanceResults) > 0 {
+		v.Acceptance = SummarizeResults(t.AcceptanceResults)
+	}
+	if t.Status == model.TaskFailed {
+		v.FailureKind = t.FailureKind
+		if t.FailureKind == model.FailBlocked {
+			v.Route = "rework-allowed"
+		} else {
+			v.Route = "replan-required"
+		}
+	}
+	if t.Status == model.TaskInputRequired {
+		for i := len(t.Messages) - 1; i >= 0; i-- {
+			if t.Messages[i].Role == model.MsgQuestion {
+				v.Question = t.Messages[i].Text
+				break
+			}
+		}
+	}
+	return v
+}
+
+// View returns the summary of one task.
+func (rs *RunSession) View(taskID string) (TaskView, bool) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	t := rs.run.Tasks[taskID]
+	if t == nil {
+		return TaskView{}, false
+	}
+	return rs.viewLocked(t), true
+}
+
+// Views returns summaries for the given tasks, or all of them if ids is empty.
+func (rs *RunSession) Views(ids []string) []TaskView {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(ids) == 0 {
+		ids = rs.run.TaskOrder
+	}
+	out := make([]TaskView, 0, len(ids))
+	for _, id := range ids {
+		if t := rs.run.Tasks[id]; t != nil {
+			out = append(out, rs.viewLocked(t))
+		}
+	}
+	return out
+}
+
+// settled reports whether a task has reached a state the coordinator can act
+// on: terminal, or blocked on a question only it can answer.
+func settled(status string) bool {
+	return model.TaskTerminal(status) || status == model.TaskInputRequired
+}
+
+// SettledFingerprint distinguishes settled states a round has already seen
+// from new ones. It includes the question text so a task that asks a second
+// question — same status, different content — still wakes a new round.
+func SettledFingerprint(v TaskView) string {
+	if !settled(v.Status) {
+		return ""
+	}
+	if v.Status == model.TaskInputRequired {
+		return v.Status + "|" + v.Question
+	}
+	return v.Status
+}
+
+func settledFingerprintLocked(t *model.Task) string {
+	if !settled(t.Status) {
+		return ""
+	}
+	if t.Status == model.TaskInputRequired {
+		q := ""
+		for i := len(t.Messages) - 1; i >= 0; i-- {
+			if t.Messages[i].Role == model.MsgQuestion {
+				q = t.Messages[i].Text
+				break
+			}
+		}
+		return t.Status + "|" + q
+	}
+	return t.Status
+}
+
+// awaitHardCap bounds how long a single await call blocks. The MCP client owns
+// the tool-call timeout and loom does not, so await is built to always return
+// an honest snapshot well inside any plausible client limit, and to be called
+// again (docs/DECISIONS-v2.md D5).
+const awaitHardCap = 120 * time.Second
+
+// AwaitResult is what the coordinator gets back from await.
+type AwaitResult struct {
+	Tasks    []TaskView `json:"tasks"`
+	TimedOut bool       `json:"timed_out"`
+	Hint     string     `json:"hint,omitempty"`
+	Notice   string     `json:"notice,omitempty"`
+}
+
+// Await blocks until the requested tasks are settled (mode "all") or at least
+// one is (mode "any"), the cap elapses, or the run ends.
+func (rs *RunSession) Await(ctx context.Context, ids []string, mode string, timeoutSec int) (*AwaitResult, error) {
+	rs.mu.Lock()
+	if len(ids) == 0 {
+		ids = append([]string(nil), rs.run.TaskOrder...)
+	}
+	for _, id := range ids {
+		if rs.run.Tasks[id] == nil {
+			rs.mu.Unlock()
+			return nil, fmt.Errorf("unknown task %q", id)
+		}
+	}
+	rs.mu.Unlock()
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("there are no tasks to await; delegate something first")
+	}
+
+	limit := awaitHardCap
+	if timeoutSec > 0 && time.Duration(timeoutSec)*time.Second < limit {
+		limit = time.Duration(timeoutSec) * time.Second
+	}
+	deadline := time.NewTimer(limit)
+	defer deadline.Stop()
+
+	for {
+		ch := rs.waitChange()
+
+		rs.mu.Lock()
+		done, any := true, false
+		for _, id := range ids {
+			if settled(rs.run.Tasks[id].Status) {
+				any = true
+			} else {
+				done = false
+			}
+		}
+		notice := rs.takeNoticeLocked()
+		rs.mu.Unlock()
+
+		ready := done || (mode == "any" && any)
+		if ready || notice != "" {
+			res := &AwaitResult{Tasks: rs.Views(ids), Notice: notice}
+			if !ready {
+				res.TimedOut = true
+				res.Hint = "returned early to deliver a notice; the tasks below are still in flight"
+			}
+			return res, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-rs.finished:
+			return &AwaitResult{Tasks: rs.Views(ids), Hint: "the run has ended"}, nil
+		case <-deadline.C:
+			return &AwaitResult{
+				Tasks:    rs.Views(ids),
+				TimedOut: true,
+				Hint: "not settled yet — this is a normal partial result, not an error. " +
+					"Call await again to keep waiting, or act on what has settled.",
+			}, nil
+		case <-ch:
+		}
+	}
+}
+
+// ---- stall detection ----
+
+// takeNoticeLocked pops a pending system notice for delivery to the coordinator.
+func (rs *RunSession) takeNoticeLocked() string {
+	n := rs.pendingNotice
+	rs.pendingNotice = ""
+	return n
+}
+
+// peekNotice reports a pending notice without consuming it (tests only).
+func (rs *RunSession) peekNotice() string {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.pendingNotice
+}
+
+// TakeNotice pops a pending notice; hub tools attach it to their result so the
+// coordinator sees it wherever it happens to be.
+func (rs *RunSession) TakeNotice() string {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.takeNoticeLocked()
+}
+
+// watchStall warns when the whole ledger goes quiet. A dynamic run has no
+// structural progress guarantee, so "nothing has changed in ten minutes" is
+// the only signal that distinguishes deep work from a wedged coordinator.
+func (rs *RunSession) watchStall(ctx context.Context) {
+	// Poll at a quarter of the stall threshold so the warning lands within
+	// ~25% of it, clamped to keep the timer sane at either extreme. Without
+	// the lower bound tracking the threshold, a small StallSec would silently
+	// do nothing — a setting that lies is worse than no setting.
+	interval := time.Duration(rs.budget.StallSec) * time.Second / 4
+	if interval < time.Second {
+		interval = time.Second
+	}
+	if interval > 30*time.Second {
+		interval = 30 * time.Second
+	}
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	warned := time.Time{}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-rs.finished:
+			return
+		case <-tick.C:
+			rs.mu.Lock()
+			idle := time.Since(rs.lastTransition)
+			last := rs.lastTransition
+			stalled := idle > time.Duration(rs.budget.StallSec)*time.Second && last.After(warned)
+			if stalled {
+				warned = time.Now()
+				rs.pendingNotice = fmt.Sprintf(
+					"SYSTEM: no task has changed state for %s. Assess progress now: either report where each "+
+						"in-flight task stands and change strategy, or call finish_run with what has been achieved.",
+					idle.Round(time.Second))
+			}
+			rs.mu.Unlock()
+			if stalled {
+				rs.event("stall_warning", "", fmt.Sprintf("no ledger transition for %s", idle.Round(time.Second)))
+				rs.mu.Lock()
+				rs.notifyLocked() // wake any await so the notice lands immediately
+				rs.mu.Unlock()
+			}
+		}
+	}
+}
+
+// ---- approval gate ----
+
+// Propose parks the run at the approval gate with the coordinator's initial
+// plan and blocks until a human decides.
+func (rs *RunSession) Propose(ctx context.Context, p *model.Proposal) error {
+	rs.mu.Lock()
+	if rs.approvalDone {
+		rs.mu.Unlock()
+		return fmt.Errorf("the plan has already been approved; delegate directly from here on")
+	}
+	rs.run.Proposal = p
+	rs.run.Status = model.RunAwaitingApproval
+	if rs.run.Coordinator != nil {
+		rs.run.Coordinator.Status = "awaiting_approval"
+	}
+	ch := make(chan approvalResult, 1)
+	rs.approvalCh = ch
+	rs.notifyLocked()
+	rs.mu.Unlock()
+
+	rs.event("run_status", "", fmt.Sprintf("awaiting approval of initial plan (%d tasks)", len(p.Tasks)))
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case res := <-ch:
+		rs.mu.Lock()
+		rs.approvalCh = nil
+		if res.approved {
+			rs.approvalDone = true
+			rs.run.PlanApproved = true // persisted, so a resumed run never re-asks
+			rs.run.Status = model.RunRunning
+			if rs.run.Coordinator != nil {
+				rs.run.Coordinator.Status = "working"
+			}
+		}
+		rs.notifyLocked()
+		rs.mu.Unlock()
+		if !res.approved {
+			rs.event("run_status", "", "plan rejected: "+res.reason)
+			return fmt.Errorf("the plan was rejected: %s. Stop and call finish_run with status failed", res.reason)
+		}
+		rs.event("info", "", "initial plan approved")
+		return nil
+	}
+}
+
+// Approve releases the approval gate.
+func (rs *RunSession) Approve() error {
+	rs.mu.Lock()
+	ch := rs.approvalCh
+	rs.mu.Unlock()
+	if ch == nil {
+		return fmt.Errorf("run is not awaiting approval")
+	}
+	select {
+	case ch <- approvalResult{approved: true}:
+	default:
+	}
+	return nil
+}
+
+// Reject refuses the proposed plan.
+func (rs *RunSession) Reject(reason string) error {
+	rs.mu.Lock()
+	ch := rs.approvalCh
+	rs.mu.Unlock()
+	if ch == nil {
+		return fmt.Errorf("run is not awaiting approval")
+	}
+	select {
+	case ch <- approvalResult{approved: false, reason: reason}:
+	default:
+	}
+	return nil
+}
+
+// AwaitingApproval reports whether a human decision is pending.
+func (rs *RunSession) AwaitingApproval() bool {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.approvalCh != nil
+}
+
+// ---- coordinator round support ----
+
+// Inspect is the coordinator's audited read of a run deliverable: a file under
+// the exchange directory, returned truncated, counted, and logged. It is the
+// only read access the coordinator has — its session gets no file tools — so
+// every look at the work leaves a ledger trace.
+const maxInspectBytes = 16 * 1024
+
+func (rs *RunSession) Inspect(path string) (string, error) {
+	if err := checkPathOK(path); err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(filepath.Join(rs.workspace, path))
+	if err != nil {
+		return "", fmt.Errorf("cannot read %q: %v. Inspect paths are relative to the exchange directory; "+
+			"check the artifact list of the task that claimed to produce it", path, err)
+	}
+	truncated := false
+	if len(data) > maxInspectBytes {
+		data = data[:maxInspectBytes]
+		truncated = true
+	}
+	rs.mu.Lock()
+	rs.inspections++
+	rs.mu.Unlock()
+	rs.event("inspection", "", fmt.Sprintf("coordinator read %s (%d bytes)", path, len(data)))
+	out := string(data)
+	if truncated {
+		out += "\n\n[truncated at 16KB]"
+	}
+	return out, nil
+}
+
+// Inspections reports how many deliverables the coordinator has actually read.
+func (rs *RunSession) Inspections() int {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.inspections
+}
+
+// maxCoordinatorNotes bounds the externalized memory: enough to carry strategy
+// across rounds, small enough that it can never become a second transcript.
+const maxCoordinatorNotes = 20
+
+// AddNote persists one coordinator note across rounds.
+func (rs *RunSession) AddNote(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	rs.mu.Lock()
+	rs.run.CoordinatorNotes = append(rs.run.CoordinatorNotes, text)
+	if n := len(rs.run.CoordinatorNotes); n > maxCoordinatorNotes {
+		rs.run.CoordinatorNotes = rs.run.CoordinatorNotes[n-maxCoordinatorNotes:]
+	}
+	rs.notifyLocked()
+	rs.mu.Unlock()
+}
+
+// AwaitRound blocks until there is something a fresh coordinator round should
+// act on: a task settled into a state the previous round has not seen, a
+// pending system notice, or an idle ledger (nothing in flight). It returns the
+// reason, or "" when the run ended or ctx expired. seen maps task id → the
+// SettledFingerprint the previous round observed.
+func (rs *RunSession) AwaitRound(ctx context.Context, seen map[string]string) string {
+	for {
+		ch := rs.waitChange()
+
+		rs.mu.Lock()
+		reason := ""
+		if rs.pendingNotice != "" {
+			reason = "notice"
+		}
+		inFlight := false
+		for _, id := range rs.run.TaskOrder {
+			t := rs.run.Tasks[id]
+			if fp := settledFingerprintLocked(t); fp != "" {
+				if seen[id] != fp {
+					reason = "settled"
+				}
+			} else {
+				inFlight = true
+			}
+		}
+		if reason == "" && !inFlight {
+			reason = "idle"
+		}
+		closed := rs.closed
+		rs.mu.Unlock()
+
+		if closed {
+			return ""
+		}
+		if reason != "" {
+			return reason
+		}
+		select {
+		case <-ctx.Done():
+			return ""
+		case <-rs.finished:
+			return ""
+		case <-ch:
+		}
+	}
+}
+
+// ---- verdict ----
+
+// Finish records the coordinator's verdict and ends the run.
+func (rs *RunSession) Finish(v *Verdict) error {
+	rs.mu.Lock()
+	if rs.verdict != nil {
+		rs.mu.Unlock()
+		return fmt.Errorf("finish_run was already called for this run")
+	}
+	// Success may not be declared sight-unseen: if any completed task produced
+	// artifacts, at least one must have been read via inspect. This is the
+	// mechanical floor under "the coordinator verifies before signing off" —
+	// a prompt can ask for more, but it can never deliver less.
+	if v.Status == model.RunSucceeded && rs.inspections == 0 {
+		for _, t := range rs.run.Tasks {
+			if t.Status == model.TaskCompleted && len(t.Artifacts) > 0 {
+				rs.mu.Unlock()
+				return fmt.Errorf("cannot declare success without having read any deliverable: use the inspect tool " +
+					"on at least one artifact in the exchange directory first, then call finish_run again")
+			}
+		}
+	}
+	rs.verdict = v
+	if rs.run.Coordinator != nil {
+		rs.run.Coordinator.Status = "done"
+		rs.run.Coordinator.Decision = v.Summary
+	}
+	rs.notifyLocked()
+	rs.mu.Unlock()
+	rs.event("run_status", "", "coordinator verdict: "+v.Status+" — "+firstLine(v.Summary, 160))
+	return nil
+}
+
+// CoordinatorActivity records what the coordinator is doing, for its card.
+func (rs *RunSession) CoordinatorActivity(text string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.run.Coordinator != nil {
+		rs.run.Coordinator.Activity = text
+		if rs.cfg.OnChange != nil {
+			rs.cfg.OnChange(rs.run)
+		}
+	}
+}
+
+// Snapshot of budget consumption, for the progress tool and the UI.
+type BudgetStatus struct {
+	TasksUsed       int    `json:"tasks_used"`
+	TasksMax        int    `json:"tasks_max"`
+	Running         int    `json:"running"`
+	MaxParallel     int    `json:"max_parallel"`
+	MaxDepth        int    `json:"max_delegation_depth"`
+	MaxTurnsPerTask int    `json:"max_turns_per_task"`
+	RunElapsedSec   int    `json:"run_elapsed_sec"`
+	RunTimeoutSec   int    `json:"run_timeout_sec"`
+	PeerHandoff     bool   `json:"peer_handoff_allowed"`
+	AgentCreation   bool   `json:"agent_creation_allowed"`
+	ApprovalState   string `json:"approval_state"`
+}
+
+func (rs *RunSession) BudgetStatus() BudgetStatus {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	running := 0
+	for _, t := range rs.run.Tasks {
+		if t.Status == model.TaskWorking || t.Status == model.TaskInputRequired {
+			running++
+		}
+	}
+	state := "not required"
+	if rs.approvalNeeded {
+		state = "pending"
+		if rs.approvalDone {
+			state = "approved"
+		}
+	}
+	return BudgetStatus{
+		TasksUsed: len(rs.run.Tasks), TasksMax: rs.budget.MaxTasks,
+		Running: running, MaxParallel: rs.budget.MaxParallel,
+		MaxDepth: rs.budget.MaxDelegationDepth, MaxTurnsPerTask: rs.budget.MaxTurnsPerTask,
+		RunElapsedSec: int(time.Since(rs.run.CreatedAt).Seconds()), RunTimeoutSec: rs.budget.RunTimeoutSec,
+		PeerHandoff: rs.budget.AllowPeerHandoff, AgentCreation: rs.budget.AllowAgentCreation,
+		ApprovalState: state,
+	}
+}
+
+func firstLine(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	if len([]rune(s)) > n {
+		return string([]rune(s)[:n]) + "…"
+	}
+	return s
+}

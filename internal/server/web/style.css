@@ -1,0 +1,390 @@
+/* loom — Aurora glass theme.
+   Deep-navy base with fixed aurora blobs, frosted-glass panels, one gradient
+   accent (violet → cyan). Selection is expressed as a gradient border, live
+   states as a glow. Class names are unchanged from the previous theme so the
+   markup in app.js keeps working. */
+
+:root {
+  --bg: #0a0d1c;
+  --panel-glass: rgba(255, 255, 255, 0.045);
+  --panel-solid: #10162a;      /* for gradient-border padding-box fills */
+  --panel2: rgba(255, 255, 255, 0.07);
+  --border: rgba(255, 255, 255, 0.09);
+  --border-soft: rgba(255, 255, 255, 0.06);
+  --text: #e8eaf2;
+  --muted: #8b93ad;
+  --accent: #8b5cf6;
+  --accent2: #22d3ee;
+  --grad: linear-gradient(120deg, #8b5cf6, #3898ec);
+  --grad-full: linear-gradient(120deg, #8b5cf6, #22d3ee);
+  --ok: #34d399;
+  --bad: #fb7185;
+  --warn: #fbbf24;
+  --run: #38bdf8;
+  --idle: #4b5573;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.55 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+}
+/* aurora blobs — fixed, behind everything */
+body::before, body::after {
+  content: ""; position: fixed; border-radius: 50%; pointer-events: none; z-index: 0;
+}
+body::before {
+  width: 640px; height: 640px; top: -260px; left: -140px;
+  background: radial-gradient(circle, rgba(139, 92, 246, 0.22), transparent 65%);
+}
+body::after {
+  width: 700px; height: 700px; bottom: -320px; right: -180px;
+  background: radial-gradient(circle, rgba(34, 211, 238, 0.13), transparent 65%);
+}
+code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+a { color: #a5b4fc; text-decoration: none; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 5px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-track { background: transparent; }
+
+#app { display: flex; min-height: 100vh; position: relative; z-index: 1; }
+
+/* sidebar */
+.side {
+  width: 208px; flex-shrink: 0; border-right: 1px solid var(--border-soft);
+  padding: 20px 14px; position: sticky; top: 0; height: 100vh;
+  background: rgba(255, 255, 255, 0.02);
+  backdrop-filter: blur(14px);
+}
+.logo { font-size: 19px; font-weight: 700; letter-spacing: .5px; padding: 2px 10px 18px; }
+.logo span {
+  background: var(--grad-full);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.logo small { display: block; color: var(--muted); font-size: 11px; font-weight: 400; margin-top: 2px; }
+.nav a {
+  display: block; padding: 8px 12px; border-radius: 10px; color: var(--muted);
+  margin-bottom: 2px; font-weight: 500; transition: color .15s, background .15s;
+}
+.nav a:hover { background: var(--panel2); color: var(--text); }
+.nav a.active {
+  background: linear-gradient(120deg, rgba(139, 92, 246, 0.18), rgba(34, 211, 238, 0.10));
+  color: var(--text); border: 1px solid rgba(139, 92, 246, 0.25); padding: 7px 11px;
+}
+
+/* main */
+.main { flex: 1; padding: 24px 28px; max-width: 1280px; min-width: 0; }
+.page-head { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }
+.page-head h1 { font-size: 19px; font-weight: 650; margin-right: auto; letter-spacing: -.01em; }
+
+/* generic */
+.panel {
+  background: var(--panel-glass); border: 1px solid var(--border);
+  border-radius: 16px; padding: 16px; backdrop-filter: blur(14px);
+}
+.muted { color: var(--muted); }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+/* fields sharing a row stretch to equal height and pin their control to the
+   bottom, so a label that wraps to two lines cannot misalign its neighbours */
+.row:has(> label.field) { align-items: stretch; }
+.row > label.field { display: flex; flex-direction: column; min-width: 0; margin-bottom: 12px; }
+.row > label.field > span { flex: 1; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+
+button, .btn {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 10px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+  font-family: inherit; font-weight: 500; transition: border-color .15s, box-shadow .15s;
+}
+button:hover, .btn:hover { border-color: rgba(139, 92, 246, 0.55); }
+button.primary {
+  background: var(--grad); border: none; color: #fff; font-weight: 600;
+  box-shadow: 0 2px 14px rgba(120, 110, 245, 0.35);
+}
+button.primary:hover { filter: brightness(1.12); box-shadow: 0 2px 20px rgba(120, 110, 245, 0.5); }
+button.danger { color: var(--bad); }
+button.danger:hover { border-color: var(--bad); box-shadow: 0 0 12px rgba(251, 113, 133, 0.2); }
+button.small { padding: 4px 10px; font-size: 12px; }
+button:disabled { opacity: .5; cursor: default; }
+
+input, textarea, select {
+  background: rgba(255, 255, 255, 0.05); color: var(--text); border: 1px solid var(--border);
+  border-radius: 10px; padding: 8px 10px; font-size: 13px; font-family: inherit; width: 100%;
+}
+input:focus, textarea:focus, select:focus {
+  outline: none; border-color: rgba(139, 92, 246, 0.6);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15);
+}
+select {
+  appearance: none; -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b93ad' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 10px center;
+  padding-right: 30px; text-overflow: ellipsis; white-space: nowrap; overflow: hidden;
+}
+select option { background: #141a30; }
+textarea { resize: vertical; min-height: 70px; }
+label.field { display: block; margin-bottom: 12px; }
+label.field > span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+label.check { display: flex; align-items: center; gap: 10px; font-size: 13px; cursor: pointer; }
+
+/* checkboxes render as switches (the pool picker overrides this: its inputs
+   are hidden and the whole card is the control) */
+label.check input[type="checkbox"], label.check input[type="radio"] {
+  appearance: none; -webkit-appearance: none; flex-shrink: 0;
+  width: 36px; height: 21px; border-radius: 11px;
+  background: rgba(255, 255, 255, 0.10); border: none; position: relative;
+  cursor: pointer; transition: background .18s; padding: 0; margin: 0;
+}
+label.check input[type="checkbox"]::after, label.check input[type="radio"]::after {
+  content: ""; position: absolute; width: 17px; height: 17px; border-radius: 50%;
+  background: var(--muted); top: 2px; left: 2px; transition: left .18s, background .18s;
+}
+label.check input:checked {
+  background: var(--grad); box-shadow: 0 0 14px rgba(139, 92, 246, 0.45);
+}
+label.check input:checked::after { left: 17px; background: #fff; }
+
+/* status chips — outlined, glowing when alive */
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 11px;
+  border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap;
+  border: 1px solid; background: transparent;
+}
+.chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.chip.planning, .chip.replanning, .chip.awaiting_approval, .chip.input-required, .chip.submitted
+  { color: var(--warn); border-color: rgba(251, 191, 36, 0.35); }
+.chip.submitted { color: var(--muted); border-color: rgba(139, 147, 173, 0.3); }
+.chip.running, .chip.working {
+  color: #67e8f9; border-color: rgba(103, 232, 249, 0.35);
+  box-shadow: 0 0 12px rgba(103, 232, 249, 0.15);
+}
+.chip.running::before, .chip.working::before { animation: pulse 1.2s infinite; }
+.chip.succeeded, .chip.completed { color: #86efac; border-color: rgba(134, 239, 172, 0.3); }
+.chip.failed { color: #fda4af; border-color: rgba(253, 164, 175, 0.35); }
+.chip.canceled, .chip.interrupted, .chip.pending, .chip.skipped
+  { color: var(--muted); border-color: rgba(139, 147, 173, 0.25); }
+@keyframes pulse { 50% { opacity: .3; } }
+
+/* workflow cards */
+.wf-card { transition: border-color .15s, box-shadow .15s, transform .15s; }
+.wf-card:hover { border-color: rgba(139, 92, 246, 0.35); box-shadow: 0 4px 24px rgba(120, 110, 245, 0.12); transform: translateY(-1px); }
+.wf-card h3 { font-size: 15px; margin-bottom: 4px; }
+.wf-card .desc { color: var(--muted); font-size: 13px; margin-bottom: 10px; min-height: 38px; }
+.badges { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.badge {
+  font-size: 11px; padding: 2px 9px; border-radius: 7px;
+  background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border-soft); color: var(--muted);
+}
+
+/* tables */
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border-soft); }
+td { padding: 9px 10px; border-bottom: 1px solid var(--border-soft); font-size: 13px; vertical-align: middle; }
+tr:last-child td { border-bottom: none; }
+tr.click { cursor: pointer; }
+tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
+
+/* modal */
+.modal-bg {
+  position: fixed; inset: 0; background: rgba(4, 6, 16, 0.65);
+  backdrop-filter: blur(6px);
+  display: flex; align-items: flex-start; justify-content: center; padding: 8vh 20px; z-index: 50;
+}
+.modal {
+  background: rgba(20, 26, 48, 0.85); backdrop-filter: blur(24px);
+  border: 1px solid var(--border); border-radius: 18px; padding: 22px 22px 0;
+  width: 560px; max-width: 100%; max-height: 82vh; overflow-y: auto;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5);
+}
+.modal h2 { font-size: 16px; margin-bottom: 16px; }
+/* action bar pinned to the bottom of the dialog: it sticks to the scrollport
+   while the form scrolls underneath, so 取消/保存 are always reachable */
+.modal .modal-foot {
+  position: sticky; bottom: 0; z-index: 2;
+  justify-content: flex-end;
+  margin: 16px -22px 0; padding: 13px 22px 16px;
+  background: rgba(20, 26, 48, 0.92); backdrop-filter: blur(24px);
+  border-top: 1px solid var(--border-soft);
+}
+
+/* run detail */
+.run-meta { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 6px; }
+.run-goal { font-size: 13px; margin-top: 8px; color: var(--text); white-space: pre-wrap; }
+.run-layout { display: grid; grid-template-columns: 1fr 340px; gap: 14px; margin-top: 14px; align-items: start; }
+@media (max-width: 1000px) { .run-layout { grid-template-columns: 1fr; } }
+.dag-wrap { overflow-x: auto; }
+.dag-wrap svg { display: block; }
+
+/* dag nodes */
+.dag-node { cursor: pointer; }
+.dag-node rect { fill: var(--panel-solid); stroke: #2a3352; stroke-width: 1.5; rx: 12; transition: stroke .15s; }
+.dag-node text { fill: var(--text); font-size: 12px; font-family: inherit; }
+.dag-node .sub { fill: var(--muted); font-size: 10.5px; }
+.dag-node.succeeded rect { stroke: var(--ok); }
+.dag-node.failed rect { stroke: var(--bad); }
+.dag-node.running rect {
+  stroke: var(--run); stroke-width: 2; animation: pulse 1.2s infinite;
+}
+.dag-node.running { filter: drop-shadow(0 0 8px rgba(56, 189, 248, 0.45)); }
+.dag-node.skipped rect, .dag-node.canceled rect { stroke-dasharray: 4 3; }
+.dag-node.superseded { opacity: .35; }
+.dag-node.selected rect { fill: #1a2340; stroke: var(--accent); }
+.dag-edge { stroke: rgba(139, 147, 173, 0.35); stroke-width: 1.5; fill: none; }
+.dag-dot { fill: rgba(139, 147, 173, 0.5); }
+.dag-node .statusdot.succeeded { fill: var(--ok); }
+.dag-node .statusdot.failed { fill: var(--bad); }
+.dag-node .statusdot.running { fill: var(--run); }
+.dag-node .statusdot.pending, .dag-node .statusdot.skipped, .dag-node .statusdot.canceled { fill: var(--idle); }
+
+/* node drawer */
+.drawer h3 { font-size: 14px; margin-bottom: 2px; }
+.drawer .kv { display: grid; grid-template-columns: 72px 1fr; gap: 4px 10px; font-size: 12px; margin: 10px 0; }
+.drawer .kv dt { color: var(--muted); }
+.drawer .summary {
+  font-size: 13px; white-space: pre-wrap; background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-soft); border-radius: 10px; padding: 10px;
+  margin: 8px 0; max-height: 300px; overflow-y: auto;
+}
+.drawer pre {
+  background: rgba(0, 0, 0, 0.3); border: 1px solid var(--border-soft); border-radius: 10px;
+  padding: 10px; font-size: 11.5px; overflow: auto; max-height: 420px; white-space: pre-wrap; margin-top: 8px;
+}
+
+/* events */
+.events { margin-top: 14px; }
+.events .ev { display: flex; gap: 10px; padding: 5px 0; font-size: 12.5px; border-bottom: 1px solid var(--border-soft); }
+.events .ev:last-child { border-bottom: none; }
+.ev .ts { color: var(--muted); white-space: nowrap; }
+.ev .tag { width: 100px; flex-shrink: 0; color: var(--muted); }
+.ev.replan .tag, .ev.stall_warning .tag, .ev.budget_hit .tag, .ev.cost_unavailable .tag { color: var(--warn); }
+.ev.error .tag { color: var(--bad); }
+.ev.task_created .tag, .ev.handoff .tag, .ev.agent_created .tag { color: #a5b4fc; }
+
+/* agent cards */
+.agent-card { transition: border-color .15s, box-shadow .15s; }
+.agent-card:hover { border-color: rgba(34, 211, 238, 0.3); }
+.agent-card h3 { font-size: 14px; }
+.agent-card .desc { color: var(--muted); font-size: 12.5px; margin: 6px 0 10px; }
+
+/* pool picker — the whole card is the control; the checkbox disappears and a
+   gradient border + check badge take over the selected state */
+.pool-picker { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.pool-picker label.check {
+  align-items: flex-start; position: relative;
+  border: 1px solid var(--border); border-radius: 13px; padding: 11px 13px;
+  background: rgba(255, 255, 255, 0.02); transition: border-color .15s;
+}
+.pool-picker label.check:hover { border-color: rgba(139, 92, 246, 0.4); }
+.pool-picker label.check input[type="checkbox"] {
+  position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none;
+}
+.pool-picker label.check:has(input:checked) {
+  border: 1.5px solid transparent; padding: 10.5px 12.5px;
+  background: linear-gradient(var(--panel-solid), var(--panel-solid)) padding-box,
+              var(--grad-full) border-box;
+  box-shadow: 0 4px 22px rgba(120, 110, 245, 0.2);
+}
+.pool-picker label.check::after {
+  content: "✓"; position: absolute; top: 9px; right: 11px; width: 17px; height: 17px;
+  border-radius: 50%; background: var(--grad-full); color: #fff; font-size: 10px;
+  display: flex; align-items: center; justify-content: center;
+  opacity: 0; transform: scale(.5); transition: opacity .15s, transform .15s;
+}
+.pool-picker label.check:has(input:checked)::after { opacity: 1; transform: scale(1); }
+.pool-picker label.check > span { display: block; padding-right: 20px; }
+.pool-picker label.check b { display: block; font-size: 13px; margin-bottom: 1px; }
+.pool-picker label.check .muted { font-size: 11.5px; display: block; }
+
+/* ---- dynamic mode ---- */
+
+/* mode picker: two glass cards, gradient border on the chosen one */
+.mode-pick { display: flex; gap: 10px; margin-bottom: 14px; }
+.mode-pick label {
+  flex: 1; border: 1px solid var(--border); border-radius: 14px; padding: 12px 14px;
+  cursor: pointer; display: block; background: rgba(255, 255, 255, 0.02);
+  transition: border-color .15s;
+}
+.mode-pick label:hover { border-color: rgba(139, 92, 246, 0.4); }
+.mode-pick label.on {
+  border: 1.5px solid transparent; padding: 11.5px 13.5px;
+  background: linear-gradient(var(--panel-solid), var(--panel-solid)) padding-box,
+              var(--grad-full) border-box;
+  box-shadow: 0 4px 22px rgba(120, 110, 245, 0.18);
+}
+.mode-pick label input[type="radio"] { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.mode-pick b { font-size: 13px; }
+.mode-pick label.on b {
+  background: linear-gradient(90deg, #c4b5fd, #67e8f9);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.mode-pick .why { display: block; color: var(--muted); font-size: 11.5px; margin-top: 4px; }
+
+/* coordinator card: pinned above the task tree */
+.coord {
+  border: 1.5px solid transparent; border-radius: 16px; padding: 13px 15px;
+  background: linear-gradient(rgba(20, 26, 48, 0.9), rgba(20, 26, 48, 0.9)) padding-box,
+              var(--grad-full) border-box;
+  box-shadow: 0 4px 28px rgba(120, 110, 245, 0.18);
+  margin-bottom: 12px;
+}
+.coord h3 { font-size: 13px; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.coord .decision { font-size: 12.5px; color: var(--muted); white-space: pre-wrap; margin-top: 6px; }
+
+/* task tree: lineage by indentation — the shape is emergent, so there is no
+   stable geometry to draw, only "who asked for this" */
+.tree { display: flex; flex-direction: column; gap: 5px; }
+.tnode {
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  border: 1px solid var(--border); border-radius: 12px; cursor: pointer;
+  background: rgba(255, 255, 255, 0.025); transition: border-color .15s;
+}
+.tnode:hover { border-color: rgba(139, 92, 246, 0.45); }
+.tnode.selected {
+  border: 1.5px solid transparent; padding: 8.5px 11.5px;
+  background: linear-gradient(#1a2138, #1a2138) padding-box, var(--grad-full) border-box;
+}
+.tnode .tdot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); flex-shrink: 0; }
+.tnode.working .tdot { background: #67e8f9; animation: pulse 1.2s infinite; box-shadow: 0 0 8px rgba(103, 232, 249, 0.7); }
+.tnode.completed .tdot { background: #86efac; }
+.tnode.failed .tdot { background: #fda4af; }
+.tnode.input-required .tdot { background: var(--warn); box-shadow: 0 0 8px rgba(251, 191, 36, 0.5); }
+.tnode .ttitle { font-size: 13px; font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tnode .tmeta { margin-left: auto; display: flex; gap: 10px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+.tnode .tact { color: #67e8f9; font-size: 11.5px; }
+.tlineage { border-left: 1px dashed rgba(139, 147, 173, 0.3); margin-left: 13px; padding-left: 13px; }
+
+/* message thread in the task drawer */
+.thread { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; max-height: 320px; overflow-y: auto; }
+.msg { border-radius: 10px; padding: 7px 10px; font-size: 12.5px; background: rgba(0, 0, 0, 0.22); border: 1px solid var(--border-soft); }
+.msg .who { font-size: 10.5px; color: var(--muted); margin-bottom: 3px; display: flex; gap: 8px; }
+.msg .body { white-space: pre-wrap; }
+.msg.question { border-color: rgba(251, 191, 36, 0.45); }
+.msg.followup { border-color: rgba(139, 92, 246, 0.5); }
+.msg.result { border-color: rgba(52, 211, 153, 0.45); }
+.msg.peer { border-color: rgba(139, 147, 173, 0.4); border-style: dashed; }
+
+/* budget meter */
+.budget { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); margin-top: 8px; }
+.budget b { color: var(--text); }
+
+/* proposal (initial approval gate) */
+.proposal {
+  border: 1.5px solid transparent; border-radius: 16px; padding: 15px; margin-top: 14px;
+  background: linear-gradient(rgba(20, 26, 48, 0.9), rgba(20, 26, 48, 0.9)) padding-box,
+              linear-gradient(120deg, #fbbf24, #f59e0b) border-box;
+  box-shadow: 0 4px 24px rgba(251, 191, 36, 0.12);
+}
+.proposal h3 { font-size: 14px; margin-bottom: 6px; }
+.proposal ol { margin: 10px 0 10px 20px; font-size: 13px; }
+.proposal li { margin-bottom: 4px; }
+
+.empty { color: var(--muted); text-align: center; padding: 40px 0; }
+.toast {
+  position: fixed; bottom: 24px; right: 24px;
+  background: rgba(20, 26, 48, 0.92); backdrop-filter: blur(16px);
+  border: 1px solid rgba(251, 113, 133, 0.5); color: var(--text); border-radius: 12px;
+  padding: 10px 16px; font-size: 13px; z-index: 99; max-width: 420px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
