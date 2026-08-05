@@ -351,6 +351,13 @@ type Task struct {
 	EndedAt    time.Time  `json:"ended_at,omitempty"`
 }
 
+// ChatMessage is one turn of the user ↔ coordinator conversation.
+type ChatMessage struct {
+	Ts   time.Time `json:"ts"`
+	From string    `json:"from"` // "user" | "coordinator"
+	Text string    `json:"text"`
+}
+
 // Event is one entry of a run's append-only audit log.
 type Event struct {
 	Ts   time.Time `json:"ts"`
@@ -389,6 +396,11 @@ type Run struct {
 	// PlanApproved persists the release of the initial approval gate, so a
 	// resumed run does not ask a human to approve a plan they already approved.
 	PlanApproved bool `json:"plan_approved,omitempty"`
+	// Chat is the running conversation between the user and the coordinator:
+	// the goal is its first message, later user messages wake new decision
+	// rounds, and each round's reply lands here. Persisted with the run, so a
+	// resumed run keeps its conversation.
+	Chat []ChatMessage `json:"chat,omitempty"`
 	// CoordinatorNotes is the coordinator's externalized memory: bounded notes
 	// it chose to persist across rounds. This — plus the task ledger — is ALL
 	// the state a new round starts from; there is no accumulated conversation.

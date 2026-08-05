@@ -118,92 +118,220 @@ function router() {
 }
 window.addEventListener("hashchange", router);
 
-// ---------- workflows list ----------
+// ---------- workflows: list + conversation ----------
 
+// The workflow page is a conversation surface: pick a workflow on the left,
+// talk to its main agent on the right. The main agent decomposes, delegates,
+// and reports back; the runtime status above the chat is the live task tree.
 async function wfListPage() {
-  const [wfs, costs] = await Promise.all([
-    api("/workflows"),
-    api("/costs/summary?by=workflow").catch(() => ({ workflows: [] })),
-  ]);
-  const spend = Object.fromEntries((costs.workflows || []).map((b) => [b.key, b.cost_usd]));
-  $main.innerHTML = `
-    <div class="page-head">
-      <h1>工作流</h1>
-      <button class="primary" onclick="location.hash='#/workflows/new'">+ 新建工作流</button>
-    </div>
-    <div class="grid">
-      ${wfs.map((w) => {
-        const dyn = w.mode === "dynamic";
-        const b = w.budget || {};
-        return `
-        <div class="panel wf-card">
-          <h3>${esc(w.name)}</h3>
-          <div class="desc">${esc(w.description || "")}</div>
-          <div class="badges">
-            <span class="badge" style="color:${dyn ? "var(--accent)" : "var(--muted)"}">${dyn ? "dynamic" : "static"}</span>
-            <span class="badge">池 ${w.agent_pool?.length || "全部"}</span>
-            ${dyn ? `<span class="badge">任务上限 ${b.max_tasks || 30}</span>
-                     <span class="badge">深度 ${b.max_delegation_depth || 3}</span>
-                     ${b.approval_policy !== "none" ? '<span class="badge">首批审批</span>' : ""}
-                     ${b.allow_peer_handoff ? '<span class="badge">peer handoff</span>' : ""}
-                     <span class="badge">并行 ${b.max_parallel || 3}</span>`
-                  : `${w.require_approval ? '<span class="badge">审批门</span>' : ""}
-                     ${w.replan_enabled ? `<span class="badge">replan×${w.max_replans}</span>` : ""}
-                     <span class="badge">并行 ${w.parallelism || 3}</span>`}
-            ${spend[w.id] ? `<span class="badge" title="按 API 牌价折算的等价成本,非实际账单">累计 est. ${fmtCost(spend[w.id])}</span>` : ""}
-          </div>
-          <div class="row">
-            <button class="primary" data-run="${esc(w.id)}">▶ 发起运行</button>
-            <button onclick="location.hash='#/workflows/${esc(w.id)}/edit'">编辑</button>
-            <a class="btn" href="#/runs" onclick="sessionStorage.setItem('wfFilter','${esc(w.id)}')">历史</a>
+  const wfs = await api("/workflows");
+  let selId = sessionStorage.getItem("wfSel");
+  if (!wfs.some((w) => w.id === selId)) selId = wfs[0]?.id || null;
+  let run = null; // the selected workflow's active (or latest) run
+  let es = null;
+
+  const terminalRun = (r) => ["succeeded", "failed", "canceled", "interrupted"].includes(r.status);
+  const selWf = () => wfs.find((w) => w.id === selId);
+
+  const loadRun = async () => {
+    run = null;
+    if (!selId) return;
+    try {
+      const runs = await api("/runs?workflow_id=" + selId); // newest first
+      const pick = runs.find((r) => !terminalRun(r)) || runs[0];
+      if (pick) run = await api("/runs/" + pick.id);
+    } catch { /* no runs yet */ }
+  };
+
+  const resub = () => {
+    if (es) { es.close(); es = null; }
+    if (!run) return;
+    es = new EventSource(`/api/runs/${run.id}/events`);
+    es.onmessage = (m) => { run = JSON.parse(m.data); renderRight(); };
+  };
+  cleanup = () => es && es.close();
+
+  const renderLeft = () => {
+    const list = $main.querySelector("#wf-list");
+    if (!list) return;
+    list.innerHTML = wfs.map((w) => `
+      <div class="wf-item ${w.id === selId ? "selected" : ""}" data-wf="${esc(w.id)}">
+        <div class="wf-item-head">
+          <b>${esc(w.name)}</b>
+          <span class="badge" style="color:${w.mode === "dynamic" ? "var(--accent)" : "var(--muted)"}">${w.mode === "dynamic" ? "dynamic" : "static"}</span>
+        </div>
+        <div class="muted" style="font-size:11.5px">${esc(w.description || "")}</div>
+      </div>`).join("") || '<div class="empty">还没有工作流</div>';
+    list.querySelectorAll("[data-wf]").forEach((el) =>
+      el.addEventListener("click", async () => {
+        selId = el.dataset.wf;
+        sessionStorage.setItem("wfSel", selId);
+        await loadRun();
+        renderLeft(); renderHead(); renderRight(); resub();
+      }));
+  };
+
+  const renderHead = () => {
+    const head = $main.querySelector("#wf-head");
+    const wf = selWf();
+    if (!head) return;
+    if (!wf) { head.innerHTML = ""; return; }
+    head.innerHTML = `
+      <h2 style="margin:0">${esc(wf.name)}</h2>
+      <span class="badge">${wf.mode === "dynamic" ? "dynamic · main agent 对话式编排" : "static · planner 组装 DAG"}</span>
+      <span style="flex:1"></span>
+      <button class="small" onclick="location.hash='#/workflows/${esc(wf.id)}/edit'">设置</button>
+      <a class="btn small" href="#/runs" onclick="sessionStorage.setItem('wfFilter','${esc(wf.id)}')">历史</a>`;
+  };
+
+  // Status zone: the selected run's live shape, compact. Deep inspection stays
+  // on the run page — every element here links into it.
+  const renderStatus = () => {
+    if (!run) return '<div class="empty" style="padding:18px">还没有运行 — 在下面对 main agent 说出你的目标,它会拆解并派发 agent 开始干活。</div>';
+    const dyn = run.mode === "dynamic";
+    const header = `
+      <div class="wf-run-head">
+        <a href="#/runs/${esc(run.id)}" class="mono" style="font-size:11px">${esc(run.id)}</a>
+        ${chip(run.status)}
+        ${run.coordinator?.rounds ? `<span class="badge">第 ${run.coordinator.rounds} 轮</span>` : ""}
+        <span class="badge" title="按 API 牌价折算">est. ${fmtCost(run.cost_usd)}</span>
+        <span class="badge">${runDuration(run)}</span>
+        ${terminalRun(run) ? "" : '<button class="small danger" data-act="cancel">取消</button>'}
+        ${run.status === "interrupted" && dyn ? '<button class="small primary" data-act="resume">▶ 恢复</button>' : ""}
+      </div>`;
+    if (dyn) {
+      const tasks = (run.task_order || []).map((id) => run.tasks[id]).filter(Boolean);
+      const rows = tasks.map((t) => `
+        <a class="wf-task ${esc(t.status)}" href="#/runs/${esc(run.id)}">
+          <span class="tdot"></span>
+          <span class="ttitle">${esc(t.title || t.id)}</span>
+          <span class="tmeta"><span class="mono">${esc(t.agent)}</span>
+            <span>${t.status === "working" && t.activity ? "⚙ " + esc(t.activity) : esc(TASK_LABEL[t.status] || t.status)}</span>
+            ${t.failure_kind ? `<span class="mono" style="color:var(--bad)">${esc(t.failure_kind)}</span>` : ""}
+          </span>
+        </a>`).join("");
+      return header + (rows ? `<div class="wf-tasks">${rows}</div>` : '<div class="muted" style="font-size:12px;padding:6px 2px">main agent 还没有派发任务…</div>');
+    }
+    const nodes = run.plan?.nodes || [];
+    const rows = nodes.map((n) => {
+      const ns = run.nodes[n.id] || {};
+      return `
+        <a class="wf-task ${esc(ns.status || "pending")}" href="#/runs/${esc(run.id)}">
+          <span class="tdot"></span>
+          <span class="ttitle">${esc(n.title || n.id)}</span>
+          <span class="tmeta"><span class="mono">${esc(n.agent)}</span><span>${esc(NODE_LABEL[ns.status] || ns.status || "")}</span></span>
+        </a>`;
+    }).join("");
+    return header + (rows ? `<div class="wf-tasks">${rows}</div>` : '<div class="muted" style="font-size:12px;padding:6px 2px">planner 正在组装 DAG…</div>');
+  };
+
+  // Chat zone: the conversation with the main agent, plus decision moments
+  // (approval, verdict) inline where they happen.
+  const renderChat = () => {
+    if (!run) return "";
+    const msgs = (run.chat || []).map((m) => `
+      <div class="cmsg ${m.from === "user" ? "me" : "agent"}">
+        <div class="cwho">${m.from === "user" ? "你" : "main agent"} · ${fmtTime(m.ts)}</div>
+        <div class="cbody">${esc(m.text)}</div>
+      </div>`).join("");
+    let tail = "";
+    if (run.status === "awaiting_approval" && run.proposal) {
+      tail = `
+        <div class="cmsg agent">
+          <div class="cwho">main agent · 计划待批准</div>
+          <div class="cbody">
+            ${esc(run.proposal.summary || "")}
+            <ol style="margin:8px 0 0 18px">${(run.proposal.tasks || []).map((t) =>
+              `<li>${esc(t.title || "")} → <span class="mono">${esc(t.agent)}</span></li>`).join("")}</ol>
+            <div class="row" style="margin-top:10px">
+              <button class="small primary" data-act="approve">✓ 批准</button>
+              <button class="small danger" data-act="reject">✗ 拒绝</button>
+            </div>
           </div>
         </div>`;
-      }).join("")}
-    </div>
-    ${wfs.length ? "" : '<div class="empty">还没有工作流</div>'}`;
-  $main.querySelectorAll("[data-run]").forEach((btn) =>
-    btn.addEventListener("click", () => {
-      const wf = wfs.find((w) => w.id === btn.dataset.run);
-      runModal(wf);
-    }));
-}
+    } else if (!terminalRun(run) && run.mode === "dynamic") {
+      tail = `<div class="cmsg agent typing"><div class="cbody">⋯ main agent 工作中(${esc(run.coordinator?.activity || "等待任务推进")})</div></div>`;
+    } else if (run.status === "failed" && run.error) {
+      tail = `<div class="cmsg agent"><div class="cwho">系统</div><div class="cbody" style="color:var(--bad)">${esc(run.error)}</div></div>`;
+    }
+    return msgs + tail;
+  };
 
-function runModal(wf) {
-  $overlay.innerHTML = `
-    <div class="modal-bg">
-      <div class="modal">
-        <h2>发起运行 — ${esc(wf.name)}</h2>
-        <label class="field"><span>${wf.mode === "dynamic"
-          ? "目标(coordinator 将据此运行时分解并委派)"
-          : "目标(planner 将据此从 agent 池组装 DAG)"}</span>
-          <textarea id="rm-goal" rows="5" placeholder="描述这次运行要达成什么…"></textarea>
-        </label>
-        <label class="check" style="margin-bottom:14px">
-          <input type="checkbox" id="rm-dry" ${meta.default_dry_run ? "checked" : ""}>
-          <span>演示模式(dry run)— 不调用任何模型,零成本走完完整编排链路</span>
-        </label>
-        <div class="row modal-foot">
-          <button id="rm-cancel">取消</button>
-          <button class="primary" id="rm-go">开始</button>
+  const renderRight = () => {
+    const st = $main.querySelector("#wf-status");
+    const log = $main.querySelector("#wf-chat-log");
+    if (!st || !log) return;
+    st.innerHTML = renderStatus();
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+    log.innerHTML = renderChat();
+    if (atBottom) log.scrollTop = log.scrollHeight;
+    const dryWrap = $main.querySelector("#wf-dry-wrap");
+    if (dryWrap) dryWrap.style.display = !run || terminalRun(run) ? "" : "none";
+    st.querySelectorAll("[data-act]").forEach(wireAct);
+    log.querySelectorAll("[data-act]").forEach(wireAct);
+  };
+
+  const wireAct = (btn) => btn.addEventListener("click", async () => {
+    const act = btn.dataset.act;
+    const body = act === "reject" ? { reason: prompt("拒绝理由(会告知 main agent):") || "" } : {};
+    try {
+      await api(`/runs/${run.id}/${act}`, { method: "POST", body });
+      if (act === "resume") { await loadRun(); resub(); }
+    } catch (e) { toast(e.message); }
+  });
+
+  const send = async () => {
+    const box = $main.querySelector("#wf-input");
+    const text = box.value.trim();
+    if (!text) return;
+    const wf = selWf();
+    if (!wf) return;
+    box.value = "";
+    try {
+      if (wf.mode === "dynamic") {
+        const dry = $main.querySelector("#wf-dry")?.checked || false;
+        const r = await api(`/workflows/${wf.id}/chat`, { method: "POST", body: { text, dry_run: dry } });
+        if (!run || r.id !== run.id) { run = r; resub(); }
+      } else {
+        const dry = $main.querySelector("#wf-dry")?.checked || false;
+        run = await api(`/workflows/${wf.id}/runs`, { method: "POST", body: { goal: text, dry_run: dry } });
+        resub();
+      }
+      renderRight();
+    } catch (e) { toast("发送失败:" + e.message); }
+  };
+
+  $main.innerHTML = `
+    <div class="wf-split">
+      <div class="wf-left">
+        <div class="wf-left-head">
+          <h1 style="font-size:16px;margin:0">工作流</h1>
+          <button class="small primary" onclick="location.hash='#/workflows/new'">+ 新建</button>
+        </div>
+        <div id="wf-list"></div>
+      </div>
+      <div class="wf-right">
+        <div class="wf-head" id="wf-head"></div>
+        <div class="wf-status" id="wf-status"></div>
+        <div class="wf-chat-log" id="wf-chat-log"></div>
+        <div class="wf-chat-input">
+          <label class="check" id="wf-dry-wrap" style="font-size:11.5px">
+            <input type="checkbox" id="wf-dry" ${meta.default_dry_run ? "checked" : ""}>
+            <span>演示模式(dry run,零成本)— 仅对新发起的运行生效</span></label>
+          <div class="row" style="align-items:flex-end">
+            <textarea id="wf-input" rows="2" placeholder="对 main agent 说出目标或追加要求…(Enter 发送,Shift+Enter 换行)"></textarea>
+            <button class="primary" id="wf-send">发送</button>
+          </div>
         </div>
       </div>
     </div>`;
-  $overlay.querySelector("#rm-cancel").onclick = () => ($overlay.innerHTML = "");
-  $overlay.querySelector(".modal-bg").addEventListener("click", (e) => {
-    if (e.target.classList.contains("modal-bg")) $overlay.innerHTML = "";
+  renderLeft(); renderHead();
+  await loadRun();
+  renderRight(); resub();
+  $main.querySelector("#wf-send").addEventListener("click", send);
+  $main.querySelector("#wf-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   });
-  $overlay.querySelector("#rm-go").onclick = async () => {
-    const goal = $overlay.querySelector("#rm-goal").value.trim();
-    if (!goal) return toast("请填写目标");
-    try {
-      const run = await api(`/workflows/${wf.id}/runs`, {
-        method: "POST",
-        body: { goal, dry_run: $overlay.querySelector("#rm-dry").checked },
-      });
-      $overlay.innerHTML = "";
-      location.hash = "#/runs/" + run.id;
-    } catch (e) { toast("发起失败:" + e.message); }
-  };
 }
 
 // ---------- workflow editor ----------

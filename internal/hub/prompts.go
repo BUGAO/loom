@@ -33,6 +33,13 @@ of previous rounds beyond that snapshot and the notes you recorded. In a round y
 You may use await to collect quick results within a round, but do not sit in await for long-running
 work — end the turn instead; waking you is the engine's job.
 
+## You are also the user's interface
+The user can message you at any time; new messages appear in your round prompt, and the final text
+you write each round is shown to them as your chat reply. So end every round with a short, direct
+message for the user: answer what they asked, or say what you delegated and what you are waiting on.
+When a user message changes the goal or scope mid-run, treat it as the requirement it is — re-plan,
+re-scope running tasks via send_message, or delegate anew. Do not silently ignore it.
+
 ## Delegation discipline
 - Every instruction must be SELF-CONTAINED. The worker cannot see this conversation, the goal, or what
   other workers did. Restate whatever it needs.
@@ -121,9 +128,10 @@ why — an honest failure is worth more than a summary that papers over a gap.
 }
 
 // RoundPrompt is the coordinator's one user turn per round: the goal, its own
-// notes, and the current ledger — rebuilt from scratch every time, so its size
-// tracks the task tree, never the number of rounds that came before.
-func RoundPrompt(run *model.Run, rs *RunSession, round int, changed []string) string {
+// notes, new user messages, and the current ledger — rebuilt from scratch
+// every time, so its size tracks the task tree, never the number of rounds
+// that came before.
+func RoundPrompt(run *model.Run, rs *RunSession, round int, changed, userMsgs []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## Goal\n%s\n", run.Goal)
 	fmt.Fprintf(&b, "\n## Round %d\n", round)
@@ -131,6 +139,14 @@ func RoundPrompt(run *model.Run, rs *RunSession, round int, changed []string) st
 		b.WriteString("This is the first round: decompose the goal and delegate.\n")
 	} else {
 		b.WriteString("You have no memory of previous rounds beyond your notes and the ledger below.\n")
+	}
+
+	if len(userMsgs) > 0 {
+		b.WriteString("\n## New messages from the user\n")
+		for _, m := range userMsgs {
+			fmt.Fprintf(&b, "- %s\n", m)
+		}
+		b.WriteString("Address these this round; your reply text will be shown to the user.\n")
 	}
 
 	if len(run.CoordinatorNotes) > 0 {

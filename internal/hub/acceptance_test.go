@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"loom/internal/model"
 )
@@ -295,6 +296,69 @@ func TestInspectRejectsEscapes(t *testing.T) {
 	}
 }
 
+// ---- user chat ----
+
+func TestUserChatWakesRound(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	task := mustDelegate(t, rs, "alpha")
+	rs.TaskStarted(task.ID)
+
+	// The round driver has seen everything; only a user message should wake it.
+	seen := map[string]string{}
+	woke := make(chan string, 1)
+	go func() { woke <- rs.AwaitRound(context.Background(), seen) }()
+	select {
+	case r := <-woke:
+		t.Fatalf("AwaitRound returned %q before any wake reason existed", r)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	if err := rs.UserChat("加一个深色模式"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-woke:
+		if r != "user" {
+			t.Fatalf("wake reason should be user, got %q", r)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a user message did not wake the round driver")
+	}
+
+	msgs := rs.TakeUserChat()
+	if len(msgs) != 1 || msgs[0] != "加一个深色模式" {
+		t.Fatalf("queued chat not delivered: %v", msgs)
+	}
+	if got := rs.TakeUserChat(); len(got) != 0 {
+		t.Fatal("chat queue should drain once")
+	}
+	chat := rs.Run().Chat
+	if len(chat) != 1 || chat[0].From != "user" {
+		t.Fatalf("chat log should record the user message: %+v", chat)
+	}
+}
+
+func TestCoordinatorReplyRecordedWithoutLedgerTransition(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	before := rs.Seq()
+	rs.CoordinatorReply("正在拆解,已派出两个任务")
+	if rs.Seq() != before {
+		t.Fatal("a chat reply must not count as ledger progress")
+	}
+	chat := rs.Run().Chat
+	if len(chat) != 1 || chat[0].From != "coordinator" {
+		t.Fatalf("reply missing from chat log: %+v", chat)
+	}
+}
+
+func TestUserChatRefusedAfterClose(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	rs.Close()
+	if err := rs.UserChat("hello?"); err == nil {
+		t.Fatal("chat to an ended run must be refused with guidance")
+	}
+}
+
 // ---- round context reconstruction (D2) ----
 
 // The round prompt is rebuilt from the ledger: for the same ledger state its
@@ -308,8 +372,8 @@ func TestRoundPromptDoesNotGrowWithRounds(t *testing.T) {
 		rs.CompleteTask(task.ID, "done", nil, nil)
 	}
 	run := rs.Run()
-	p5 := RoundPrompt(run, rs, 5, nil)
-	p50 := RoundPrompt(run, rs, 50, nil)
+	p5 := RoundPrompt(run, rs, 5, nil, nil)
+	p50 := RoundPrompt(run, rs, 50, nil, nil)
 	if diff := len(p50) - len(p5); diff < -2 || diff > 2 {
 		t.Fatalf("round prompt size changed by %d bytes between round 5 and 50 on an identical ledger", diff)
 	}

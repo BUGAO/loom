@@ -43,6 +43,7 @@ type handle struct {
 	cancel      context.CancelFunc
 	approveOnce sync.Once
 	approveCh   chan struct{}
+	wfID        string
 
 	mu sync.Mutex
 	rs *hub.RunSession
@@ -148,7 +149,7 @@ func (e *Engine) StartRun(wf *model.Workflow, goal string, dryRun bool) (*model.
 	}
 	run.DryRun = dryRun
 	ctx, cancel := context.WithCancel(context.Background())
-	h := &handle{cancel: cancel, approveCh: make(chan struct{})}
+	h := &handle{cancel: cancel, approveCh: make(chan struct{}), wfID: wf.ID}
 	e.mu.Lock()
 	e.active[run.ID] = h
 	e.mu.Unlock()
@@ -294,7 +295,7 @@ func (e *Engine) RetryNode(runID, nodeID string) (*model.Run, error) {
 	e.store.SaveRun(run)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	h := &handle{cancel: cancel, approveCh: make(chan struct{})}
+	h := &handle{cancel: cancel, approveCh: make(chan struct{}), wfID: wf.ID}
 	e.mu.Lock()
 	e.active[run.ID] = h
 	e.mu.Unlock()

@@ -106,6 +106,39 @@ func TestDynamicAcceptanceRejectsFalseClaim(t *testing.T) {
 	}
 }
 
+// The conversational surface: the goal opens the chat, and every coordinator
+// round leaves a reply the user can read.
+func TestChatCarriesGoalAndReplies(t *testing.T) {
+	eng, st, wf := dynSetup(t, noApproval())
+	run, err := eng.StartRun(wf, "build the thing", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := waitTerminal(t, st, run.ID)
+	if final.Status != model.RunSucceeded {
+		t.Fatalf("setup run failed: %s (%s)", final.Status, final.Error)
+	}
+	if len(final.Chat) < 2 {
+		t.Fatalf("chat should hold the goal and at least one reply, got %d messages", len(final.Chat))
+	}
+	if final.Chat[0].From != "user" || final.Chat[0].Text != "build the thing" {
+		t.Fatalf("the goal must open the conversation: %+v", final.Chat[0])
+	}
+	sawReply := false
+	for _, m := range final.Chat {
+		if m.From == "coordinator" && m.Text != "" {
+			sawReply = true
+		}
+	}
+	if !sawReply {
+		t.Fatal("no coordinator reply landed in the chat")
+	}
+	// A terminal run refuses further chat, pointing at the workflow entry.
+	if err := eng.ChatToRun(run.ID, "再改一下"); err == nil {
+		t.Fatal("chat to a finished run should be refused")
+	}
+}
+
 func TestResumeRefusedForNonInterrupted(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
 	run, err := eng.StartRun(wf, "build the thing", true)

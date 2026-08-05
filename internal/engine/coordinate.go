@@ -58,6 +58,12 @@ func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, 
 	run.Coordinator.Status = "working"
 	run.Coordinator.Model = coordModel
 
+	// The goal is the conversation's opening message; a resumed run keeps its
+	// existing chat.
+	if len(run.Chat) == 0 {
+		run.Chat = append(run.Chat, model.ChatMessage{Ts: time.Now(), From: "user", Text: run.Goal})
+	}
+
 	d := &dynamicRun{engine: e, run: run, wf: wf, dryRun: dryRun, sessions: sessions, workers: map[string]*workerHandle{}}
 
 	rs := e.hub.OpenRun(ctx, hub.RunConfig{
@@ -163,7 +169,7 @@ func (e *Engine) ResumeRun(runID string) (*model.Run, error) {
 	e.store.SaveRun(run)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	h := &handle{cancel: cancel, approveCh: make(chan struct{})}
+	h := &handle{cancel: cancel, approveCh: make(chan struct{}), wfID: wf.ID}
 	e.mu.Lock()
 	e.active[run.ID] = h
 	e.mu.Unlock()
@@ -213,6 +219,7 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 	var changed []string
 	noProgress := 0
 	startRound := d.run.Coordinator.Rounds // > 0 when resuming
+	userMsgs := rs.TakeUserChat()          // messages queued before the first round
 
 	for i := 1; ; i++ {
 		round := startRound + i
@@ -241,7 +248,7 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 			return fmt.Errorf("open coordinator session: %w", err)
 		}
 		start := time.Now()
-		res, perr := sess.Prompt(ctx, hub.RoundPrompt(d.run, rs, round, changed))
+		res, perr := sess.Prompt(ctx, hub.RoundPrompt(d.run, rs, round, changed, userMsgs))
 		sess.Close()
 		if res != nil {
 			d.run.Coordinator.DurationMs += time.Since(start).Milliseconds()
@@ -258,6 +265,8 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 			}
 			fmt.Fprintf(&transcript, "## Round %d\n\n%s\n\n", round, body)
 			e.store.WriteNodeOutput(d.run.ID, "coordinator", transcript.String())
+			// The round's final text is the coordinator's chat reply.
+			rs.CoordinatorReply(res.Text)
 		}
 		d.run.Coordinator.Activity = ""
 		if perr != nil {
@@ -298,6 +307,7 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 			return nil // run closed or ctx done; outer switch decides
 		}
 
+		userMsgs = rs.TakeUserChat()
 		changed = nil
 		for _, v := range rs.Views(nil) {
 			if fp := hub.SettledFingerprint(v); fp != "" && seen[v.ID] != fp {
@@ -305,6 +315,35 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 			}
 		}
 	}
+}
+
+// ChatToRun routes a user message into an active dynamic run's conversation.
+func (e *Engine) ChatToRun(runID, text string) error {
+	e.mu.Lock()
+	h := e.active[runID]
+	e.mu.Unlock()
+	if h == nil {
+		return fmt.Errorf("run %s is not active; message the workflow to start a new conversation", runID)
+	}
+	rs := h.runSession()
+	if rs == nil {
+		return fmt.Errorf("run %s is not a dynamic run", runID)
+	}
+	return rs.UserChat(text)
+}
+
+// ActiveDynamicRun returns the id of the workflow's currently active dynamic
+// run, or "" — the chat endpoint uses it to decide between continuing a
+// conversation and starting one.
+func (e *Engine) ActiveDynamicRun(wfID string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for id, h := range e.active {
+		if h.wfID == wfID && h.runSession() != nil {
+			return id
+		}
+	}
+	return ""
 }
 
 // hubServers renders the hub MCP endpoint for a session.

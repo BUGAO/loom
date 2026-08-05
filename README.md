@@ -144,12 +144,14 @@ worker 信封里的 `"status":"ok"` 只是**声明**;引擎在 worker 收尾后�
 | 审批点 `approval_policy=initial` | 首次 delegate 前必须先 `propose_plan`,否则一律拒绝;放行持久化,恢复运行不再重复审批 |
 | 验收实读门槛 | 有产出的 run,coordinator 零 `inspect` 就 `finish_run(succeeded)` 会被硬拒 |
 
-**coordinator 按轮驱动(无状态决策)**
+**coordinator 按轮驱动(无状态决策),同时是用户的对话界面**
 
 coordinator 不是一条越长越糊的会话:引擎按**轮**驱动它,每轮开一个全新会话,上下文由
-「目标 + 自存便签 + 任务台账快照 + 上轮以来的落定变化 + 预算余量」重建——单轮上下文随任务树大小走,
+「目标 + 自存便签 + 用户新消息 + 任务台账快照 + 上轮以来的落定变化 + 预算余量」重建——单轮上下文随任务树大小走,
 **不随轮数增长**。跨轮记忆走 `record_note`(外置到 run,限 20 条)。轮与轮之间由台账事件唤醒
-(任务落定/新反问/系统通知);连续两轮台账零变化且无 verdict,判 coordinator 卡死,run failed。
+(任务落定/新反问/**用户消息**/系统通知);连续两轮台账零变化且无 verdict,判 coordinator 卡死,run failed。
+goal 是对话的第一条消息;用户随时追加,下一个轮次送达,每轮的收尾文本作为 main agent 的聊天回复
+展示给用户。对话持久化在 run 里,用户消息同时进审计事件流。
 coordinator 的会话没有任何文件工具:它读产物的唯一通道是 hub 的 `inspect` 工具——有审计、有计数,
 这也是「验收实读门槛」能成为机制而非期望的原因。
 
@@ -191,7 +193,7 @@ acp 适配器缺失时 `claude` runtime 降级为 CLI 单发——static 仍可�
 
 ## Web UI
 
-- **工作流**:卡片管理、新建/编辑——mode 单选,static 显示 planner/replan 表单,dynamic 显示 coordinator 与预算表单;池多选;卡片上带该 workflow 的累计 est. 成本
+- **工作流(对话式)**:左侧 workflow 列表,右侧「运行状态 + 与 main agent 的聊天窗」。对 main agent 说出目标,它自行拆解并派发 agent;运行中随时追加消息(下一个决策轮次送达并回复);审批卡片、最终回复都在聊天流里。run 结束后继续发消息即开启新一轮对话(新 run)。设置入口进编辑器——mode 单选,static 显示 planner/replan 表单,dynamic 显示 coordinator 与预算表单
 - **运行详情(static)**:DAG 实时可视化(SSE 推送)——节点按依赖深度自动布局,状态着色,replan 世代同图呈现;点节点看指令/摘要/错误/产物/完整输出;审批、取消、从节点重试
 - **运行详情(dynamic)**:**任务树**取代 DAG——按血缘缩进的实时列表(handoff 子任务嵌在父任务下),coordinator 常驻置顶卡片(状态/当前工具/最近决策/transcript);点任务看完整消息往来(指令、进度、反问、答复、结果、同伴消息)与 token 细分;可对在途任务人工插话;审批视图展示首批任务清单与新 agent 提案
 - **运行记录**:全部 run 列表,mode 标签、进度(dynamic 显示 `完成/总数+`,因为树还在长)、est. 成本、耗时
@@ -203,6 +205,8 @@ acp 适配器缺失时 `claude` runtime 降级为 CLI 单发——static 仍可�
 GET/POST   /api/agents            GET/DELETE /api/agents/{name}
 GET/POST   /api/workflows         GET/DELETE /api/workflows/{id}
 POST       /api/workflows/{id}/runs        {goal, backend?}
+POST       /api/workflows/{id}/chat        {text, dry_run?}  对话入口:有活跃 dynamic run 则续聊,否则以 text 为 goal 起新 run
+POST       /api/runs/{id}/chat             {text}            向活跃 run 的 main agent 追加消息(下一轮送达)
 GET        /api/runs[?workflow_id=]        GET /api/runs/{id}
 POST       /api/runs/{id}/approve|reject|cancel
 POST       /api/runs/{id}/retry/{node}     static 专用

@@ -127,6 +127,11 @@ type RunSession struct {
 	// can catch "correct but off-course".
 	inspections int
 
+	// pendingChat holds user messages not yet delivered to a coordinator
+	// round. A non-empty queue wakes AwaitRound, and the next round's prompt
+	// carries the drained messages.
+	pendingChat []string
+
 	// seq increments on every ledger transition; the round driver compares it
 	// across rounds to detect a coordinator that acts without effect.
 	seq uint64
@@ -1248,11 +1253,60 @@ func (rs *RunSession) AddNote(text string) {
 	rs.mu.Unlock()
 }
 
+// ---- user chat ----
+
+// UserChat records a message from the user and wakes the round driver: the
+// user talking to the coordinator is a first-class wake reason, same as a
+// task settling.
+func (rs *RunSession) UserChat(text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fmt.Errorf("message is empty")
+	}
+	rs.mu.Lock()
+	if rs.closed {
+		rs.mu.Unlock()
+		return fmt.Errorf("this run has ended; message the workflow to start a new one")
+	}
+	rs.run.Chat = append(rs.run.Chat, model.ChatMessage{Ts: time.Now(), From: "user", Text: text})
+	rs.pendingChat = append(rs.pendingChat, text)
+	rs.notifyLocked()
+	rs.mu.Unlock()
+	rs.event("chat", "", "user → coordinator: "+firstLine(text, 120))
+	return nil
+}
+
+// TakeUserChat drains queued user messages for delivery into a round prompt.
+func (rs *RunSession) TakeUserChat() []string {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	out := rs.pendingChat
+	rs.pendingChat = nil
+	return out
+}
+
+// CoordinatorReply records the coordinator's round reply into the chat. It
+// persists and publishes but deliberately does NOT count as a ledger
+// transition: a coordinator that only talks, without moving the ledger, must
+// still trip the no-progress guard.
+func (rs *RunSession) CoordinatorReply(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	rs.mu.Lock()
+	rs.run.Chat = append(rs.run.Chat, model.ChatMessage{Ts: time.Now(), From: "coordinator", Text: text})
+	if rs.cfg.OnChange != nil {
+		rs.cfg.OnChange(rs.run)
+	}
+	rs.mu.Unlock()
+}
+
 // AwaitRound blocks until there is something a fresh coordinator round should
-// act on: a task settled into a state the previous round has not seen, a
-// pending system notice, or an idle ledger (nothing in flight). It returns the
-// reason, or "" when the run ended or ctx expired. seen maps task id → the
-// SettledFingerprint the previous round observed.
+// act on: a task settled into a state the previous round has not seen, a new
+// user message, a pending system notice, or an idle ledger (nothing in
+// flight). It returns the reason, or "" when the run ended or ctx expired.
+// seen maps task id → the SettledFingerprint the previous round observed.
 func (rs *RunSession) AwaitRound(ctx context.Context, seen map[string]string) string {
 	for {
 		ch := rs.waitChange()
@@ -1261,6 +1315,9 @@ func (rs *RunSession) AwaitRound(ctx context.Context, seen map[string]string) st
 		reason := ""
 		if rs.pendingNotice != "" {
 			reason = "notice"
+		}
+		if len(rs.pendingChat) > 0 {
+			reason = "user"
 		}
 		inFlight := false
 		for _, id := range rs.run.TaskOrder {

@@ -49,6 +49,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/workflows/{id}", s.getWorkflow)
 	mux.HandleFunc("DELETE /api/workflows/{id}", s.deleteWorkflow)
 	mux.HandleFunc("POST /api/workflows/{id}/runs", s.startRun)
+	mux.HandleFunc("POST /api/workflows/{id}/chat", s.chatWorkflow)
+	mux.HandleFunc("POST /api/runs/{id}/chat", s.chatRun)
 
 	mux.HandleFunc("GET /api/costs/summary", s.costSummary)
 
@@ -291,6 +293,65 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, run)
+}
+
+// chatWorkflow is the conversational entry point: a message to a workflow's
+// main agent. With an active dynamic run it continues that conversation;
+// otherwise the message becomes the goal of a fresh run. Static workflows have
+// no conversational coordinator, so each message simply starts a run.
+func (s *Server) chatWorkflow(w http.ResponseWriter, r *http.Request) {
+	wf, err := s.store.LoadWorkflow(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	body, ok := readBody[struct {
+		Text   string `json:"text"`
+		DryRun bool   `json:"dry_run"`
+	}](w, r)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(body.Text) == "" {
+		writeErr(w, 400, fmt.Errorf("text is required"))
+		return
+	}
+	if wf.EffectiveMode() == model.ModeDynamic {
+		if runID := s.engine.ActiveDynamicRun(wf.ID); runID != "" {
+			if err := s.engine.ChatToRun(runID, body.Text); err != nil {
+				writeErr(w, 400, err)
+				return
+			}
+			run, err := s.store.LoadRun(runID)
+			if err != nil {
+				writeErr(w, statusFor(err), err)
+				return
+			}
+			writeJSON(w, 200, run)
+			return
+		}
+	}
+	run, err := s.engine.StartRun(wf, body.Text, body.DryRun)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, run)
+}
+
+// chatRun continues a specific active run's conversation.
+func (s *Server) chatRun(w http.ResponseWriter, r *http.Request) {
+	body, ok := readBody[struct {
+		Text string `json:"text"`
+	}](w, r)
+	if !ok {
+		return
+	}
+	if err := s.engine.ChatToRun(r.PathValue("id"), body.Text); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
 func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
