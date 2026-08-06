@@ -519,3 +519,15 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
   .cmsg { max-width: 100%; }
   .run-layout { grid-template-columns: 1fr; }
 }
+
+/* Header row: the global width:100% on selects must not apply here — the
+   session picker gets a bounded width and the buttons never wrap. */
+.wf-head h2, .wf-head .badge { white-space: nowrap; }
+.wf-head select {
+  width: auto; flex: 0 1 340px; min-width: 140px;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.wf-head button, .wf-head .btn { white-space: nowrap; flex-shrink: 0; }
+/* When the row genuinely cannot fit, whole controls wrap to a second line —
+   never squeezed button text, never clipped controls. */
+.wf-head { flex-wrap: wrap; }
