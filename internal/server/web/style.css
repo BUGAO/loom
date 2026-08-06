@@ -465,3 +465,57 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
   background: var(--panel-glass); padding: 10px 12px; flex-shrink: 0;
 }
 .wf-chat-input textarea { flex: 1; resize: none; }
+
+/* ---- screen adaptation ---- */
+/* The conversation page goes full-bleed; other pages keep the 1280px column. */
+.main.wide { max-width: none; }
+
+/* Wide screens: the pane may be arbitrarily wide, but prose should not be —
+   cap bubble line length and let the list column breathe a little. */
+.wf-split { grid-template-columns: clamp(240px, 18vw, 320px) 1fr; }
+.cmsg .cbody { max-width: min(720px, 100%); }
+.cmsg { max-width: 92%; }
+
+/* Narrow screens: stack — workflow list becomes a short scrollable band on
+   top, the conversation keeps the rest of the viewport. */
+@media (max-width: 1000px) {
+  .wf-split {
+    grid-template-columns: 1fr;
+    grid-template-rows: 170px minmax(0, 1fr);
+    height: calc(100vh - 76px);
+  }
+  .wf-left { max-height: none; }
+  .wf-status { max-height: 30%; }
+  .wf-head { flex-wrap: wrap; }
+  .main { padding: 14px; }
+}
+
+/* Very short viewports: give the chat priority over the status band. */
+@media (max-height: 640px) {
+  .wf-status { max-height: 26%; }
+}
+
+/* Phone-width shell: the sidebar becomes a top bar, content goes full width.
+   (The conversation grid has already collapsed to one column by this point.) */
+@media (max-width: 760px) {
+  #app { flex-direction: column; }
+  .side {
+    width: 100%; height: auto; position: static;
+    display: flex; align-items: center; gap: 6px;
+    padding: 8px 12px; border-right: 0; border-bottom: 1px solid var(--border-soft);
+  }
+  .logo { font-size: 16px; padding: 0 6px 0 0; margin-right: 6px; }
+  .logo small { display: none; }
+  .nav { display: flex; gap: 4px; }
+  .nav a { margin-bottom: 0; padding: 6px 10px; font-size: 13px; white-space: nowrap; }
+  .main { padding: 10px; }
+  .wf-split {
+    height: calc(100vh - 116px);
+    grid-template-rows: 132px minmax(0, 1fr);
+    gap: 10px;
+  }
+  .wf-head { padding: 8px 10px; }
+  .wf-head h2 { font-size: 15px; }
+  .cmsg { max-width: 100%; }
+  .run-layout { grid-template-columns: 1fr; }
+}

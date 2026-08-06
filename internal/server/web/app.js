@@ -108,6 +108,9 @@ function router() {
   const section = parts[0] || "workflows";
   document.querySelectorAll("[data-nav]").forEach((a) =>
     a.classList.toggle("active", a.dataset.nav === section));
+  // The conversation page is the one full-bleed surface; everything else
+  // keeps the readable 1280px column.
+  $main.classList.toggle("wide", section === "workflows" && !parts[1]);
   if (section === "workflows" && parts[1] === "new") return wfEditPage(null);
   if (section === "workflows" && parts[2] === "edit") return wfEditPage(parts[1]);
   if (section === "workflows") return wfListPage();
