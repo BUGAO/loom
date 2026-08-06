@@ -139,6 +139,64 @@ func TestChatCarriesGoalAndReplies(t *testing.T) {
 	}
 }
 
+// A session IS a run: a message to a finished session reopens it — same
+// ledger, same notes, same conversation — instead of starting a new run.
+func TestReopenFinishedSessionContinues(t *testing.T) {
+	eng, st, wf := dynSetup(t, noApproval())
+	run, err := eng.StartRun(wf, "build the thing", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := waitTerminal(t, st, run.ID)
+	if first.Status != model.RunSucceeded {
+		t.Fatalf("setup run failed: %s (%s)", first.Status, first.Error)
+	}
+	tasksBefore := len(first.Tasks)
+	roundsBefore := first.Coordinator.Rounds
+
+	if _, err := eng.ReopenRun(run.ID, "在同一会话里再推进一步"); err != nil {
+		t.Fatal(err)
+	}
+	second := waitTerminal(t, st, run.ID)
+	if second.ID != run.ID {
+		t.Fatal("reopening must not mint a new run")
+	}
+	if second.Status != model.RunSucceeded {
+		t.Fatalf("reopened session should reach a verdict again, got %s (%s)", second.Status, second.Error)
+	}
+	if len(second.Tasks) <= tasksBefore {
+		t.Fatalf("the reopened session should have delegated more work on the same ledger (%d → %d tasks)",
+			tasksBefore, len(second.Tasks))
+	}
+	if second.Coordinator.Rounds <= roundsBefore {
+		t.Fatalf("rounds should continue, not reset (%d → %d)", roundsBefore, second.Coordinator.Rounds)
+	}
+	found := false
+	for _, m := range second.Chat {
+		if m.From == "user" && m.Text == "在同一会话里再推进一步" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the reopening message must be part of the session's chat")
+	}
+	if second.Chat[0].Text != "build the thing" {
+		t.Fatal("the original conversation must be preserved")
+	}
+}
+
+func TestReopenRefusedWhileActive(t *testing.T) {
+	eng, st, wf := dynSetup(t, noApproval())
+	run, err := eng.StartRun(wf, "build the thing", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.ReopenRun(run.ID, "hello"); err == nil {
+		t.Fatal("reopening an active run must be refused")
+	}
+	waitTerminal(t, st, run.ID)
+}
+
 func TestResumeRefusedForNonInterrupted(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
 	run, err := eng.StartRun(wf, "build the thing", true)

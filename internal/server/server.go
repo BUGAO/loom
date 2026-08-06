@@ -296,9 +296,10 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 }
 
 // chatWorkflow is the conversational entry point: a message to a workflow's
-// main agent. With an active dynamic run it continues that conversation;
-// otherwise the message becomes the goal of a fresh run. Static workflows have
-// no conversational coordinator, so each message simply starts a run.
+// main agent. A session IS a run: messages continue the addressed session —
+// reopening it if it had finished — and only new_session (or a workflow with
+// no session yet) starts a fresh one. Static workflows have no conversational
+// coordinator, so each message simply starts a run.
 func (s *Server) chatWorkflow(w http.ResponseWriter, r *http.Request) {
 	wf, err := s.store.LoadWorkflow(r.PathValue("id"))
 	if err != nil {
@@ -306,8 +307,10 @@ func (s *Server) chatWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body, ok := readBody[struct {
-		Text   string `json:"text"`
-		DryRun bool   `json:"dry_run"`
+		Text       string `json:"text"`
+		DryRun     bool   `json:"dry_run"`
+		RunID      string `json:"run_id"`      // the session to continue; empty = active or latest
+		NewSession bool   `json:"new_session"` // force a fresh session
 	}](w, r)
 	if !ok {
 		return
@@ -316,24 +319,54 @@ func (s *Server) chatWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, fmt.Errorf("text is required"))
 		return
 	}
-	if wf.EffectiveMode() == model.ModeDynamic {
-		if runID := s.engine.ActiveDynamicRun(wf.ID); runID != "" {
-			if err := s.engine.ChatToRun(runID, body.Text); err != nil {
-				writeErr(w, 400, err)
-				return
+	if wf.EffectiveMode() != model.ModeDynamic || body.NewSession {
+		run, err := s.engine.StartRun(wf, body.Text, body.DryRun)
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, 200, run)
+		return
+	}
+
+	target := body.RunID
+	if target == "" {
+		target = s.engine.ActiveDynamicRun(wf.ID)
+	}
+	if target == "" {
+		// No addressed session and none active: continue the latest one, so a
+		// conversation survives the coordinator finishing (or dying) between
+		// messages. Only a workflow with no history starts fresh implicitly.
+		if runs, err := s.store.ListRuns(); err == nil {
+			for _, run := range runs { // newest first
+				if run.WorkflowID == wf.ID && run.EffectiveMode() == model.ModeDynamic {
+					target = run.ID
+					break
+				}
 			}
-			run, err := s.store.LoadRun(runID)
-			if err != nil {
-				writeErr(w, statusFor(err), err)
-				return
-			}
-			writeJSON(w, 200, run)
+		}
+	}
+	if target == "" {
+		run, err := s.engine.StartRun(wf, body.Text, body.DryRun)
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, 200, run)
+		return
+	}
+
+	// Continue the session: live runs get the message directly; finished ones
+	// are reopened by it.
+	if err := s.engine.ChatToRun(target, body.Text); err != nil {
+		if _, rerr := s.engine.ReopenRun(target, body.Text); rerr != nil {
+			writeErr(w, 400, fmt.Errorf("cannot continue session %s: %v", target, rerr))
 			return
 		}
 	}
-	run, err := s.engine.StartRun(wf, body.Text, body.DryRun)
+	run, err := s.store.LoadRun(target)
 	if err != nil {
-		writeErr(w, 400, err)
+		writeErr(w, statusFor(err), err)
 		return
 	}
 	writeJSON(w, 200, run)

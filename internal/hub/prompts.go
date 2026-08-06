@@ -141,6 +141,14 @@ func RoundPrompt(run *model.Run, rs *RunSession, round int, changed, userMsgs []
 		b.WriteString("You have no memory of previous rounds beyond your notes and the ledger below.\n")
 	}
 
+	// A reopened session carries its last verdict: the coordinator must treat
+	// new messages as the next iteration on delivered work, not a fresh start.
+	if run.Coordinator != nil && run.Coordinator.Decision != "" {
+		fmt.Fprintf(&b, "\n## Previous verdict of this session\n%s\n"+
+			"The session has been reopened since. Build on the delivered work in the exchange directory; "+
+			"do not redo what was already accepted.\n", run.Coordinator.Decision)
+	}
+
 	if len(userMsgs) > 0 {
 		b.WriteString("\n## New messages from the user\n")
 		for _, m := range userMsgs {

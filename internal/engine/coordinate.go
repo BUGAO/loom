@@ -27,9 +27,11 @@ import (
 // no conversation history across rounds — the ledger is the state, which is
 // also what makes a dynamic run resumable after a process restart.
 
-// coordinate drives a dynamic run from coordinator start to verdict.
+// coordinate drives a dynamic run from coordinator start to verdict. opening
+// carries user messages that triggered this activation (a reopened session's
+// first message), delivered into the first round.
 func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, run *model.Run,
-	pool []*model.Agent, dryRun bool) {
+	pool []*model.Agent, dryRun bool, opening []string) {
 
 	budget := wf.EffectiveBudget()
 
@@ -79,6 +81,9 @@ func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, 
 	})
 	d.rs = rs
 	h.setRunSession(rs)
+	for _, m := range opening {
+		rs.UserChat(m) // recorded, audited, and queued for the first round
+	}
 
 	e.event(run, "run_status", "", fmt.Sprintf("coordinator started (%s)", coordModel))
 	err = d.runCoordinator(ctx, rs, pool, budget)
@@ -117,10 +122,22 @@ func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, 
 }
 
 // ResumeRun restarts an interrupted dynamic run from its persisted ledger.
-// Completed (accepted) tasks are preserved; a fresh coordinator round picks up
-// from the task tree — possible precisely because the coordinator carries no
-// session state between rounds.
 func (e *Engine) ResumeRun(runID string) (*model.Run, error) {
+	return e.reactivate(runID, "", true)
+}
+
+// ReopenRun continues a finished dynamic session: the run IS the session, and
+// a verdict is a milestone, not the end of the conversation. The new message
+// wakes a fresh coordinator round over the same ledger, notes and chat.
+func (e *Engine) ReopenRun(runID, text string) (*model.Run, error) {
+	return e.reactivate(runID, text, false)
+}
+
+// reactivate brings a non-active dynamic run back to life. Completed
+// (accepted) tasks are preserved; a fresh coordinator round picks up from the
+// task tree — possible precisely because the coordinator carries no session
+// state between rounds: the persisted run file is the whole session.
+func (e *Engine) reactivate(runID, text string, requireInterrupted bool) (*model.Run, error) {
 	e.mu.Lock()
 	if e.active[runID] != nil {
 		e.mu.Unlock()
@@ -135,8 +152,11 @@ func (e *Engine) ResumeRun(runID string) (*model.Run, error) {
 	if run.EffectiveMode() != model.ModeDynamic {
 		return nil, fmt.Errorf("run %s is not a dynamic run; use retry-from-node instead", runID)
 	}
-	if run.Status != model.RunInterrupted {
+	if requireInterrupted && run.Status != model.RunInterrupted {
 		return nil, fmt.Errorf("run %s is %s; only interrupted runs can be resumed", runID, run.Status)
+	}
+	if !run.Terminal() {
+		return nil, fmt.Errorf("run %s is %s; it is not in a reopenable state", runID, run.Status)
 	}
 	wf, err := e.store.LoadWorkflow(run.WorkflowID)
 	if err != nil {
@@ -151,9 +171,9 @@ func (e *Engine) ResumeRun(runID string) (*model.Run, error) {
 		return nil, err
 	}
 
-	// Any task that was in flight when the process died has lost its session;
-	// it is failed as blocked (rework-eligible) so the coordinator can decide
-	// whether to redo it.
+	// Any task that was in flight when the previous activation died has lost
+	// its session; it is failed as blocked (rework-eligible) so the
+	// coordinator can decide whether to redo it.
 	for _, t := range run.Tasks {
 		if !model.TaskTerminal(t.Status) {
 			t.Status = model.TaskFailed
@@ -165,7 +185,11 @@ func (e *Engine) ResumeRun(runID string) (*model.Run, error) {
 	run.Status = model.RunRunning
 	run.Error = ""
 	run.EndedAt = time.Time{}
-	run.Events = append(run.Events, model.Event{Ts: time.Now(), Type: "info", Msg: "run resumed from the task ledger"})
+	msg := "run resumed from the task ledger"
+	if !requireInterrupted {
+		msg = "session reopened by a user message"
+	}
+	run.Events = append(run.Events, model.Event{Ts: time.Now(), Type: "info", Msg: msg})
 	e.store.SaveRun(run)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -173,7 +197,11 @@ func (e *Engine) ResumeRun(runID string) (*model.Run, error) {
 	e.mu.Lock()
 	e.active[run.ID] = h
 	e.mu.Unlock()
-	go e.coordinate(ctx, h, wf, run, pool, dryRun)
+	var opening []string
+	if text != "" {
+		opening = []string{text}
+	}
+	go e.coordinate(ctx, h, wf, run, pool, dryRun, opening)
 	return run, nil
 }
 

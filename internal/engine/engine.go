@@ -154,7 +154,7 @@ func (e *Engine) StartRun(wf *model.Workflow, goal string, dryRun bool) (*model.
 	e.active[run.ID] = h
 	e.mu.Unlock()
 	if wf.EffectiveMode() == model.ModeDynamic {
-		go e.coordinate(ctx, h, wf, run, pool, dryRun)
+		go e.coordinate(ctx, h, wf, run, pool, dryRun, nil)
 	} else {
 		go e.drive(ctx, h, wf, run, pool, dryRun, true)
 	}

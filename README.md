@@ -155,8 +155,9 @@ goal 是对话的第一条消息;用户随时追加,下一个轮次送达,每轮
 coordinator 的会话没有任何文件工具:它读产物的唯一通道是 hub 的 `inspect` 工具——有审计、有计数,
 这也是「验收实读门槛」能成为机制而非期望的原因。
 
-状态全部外置的直接收益:**dynamic run 可恢复**。进程死掉后 run 标记 `interrupted`,已验收任务原样保留、
-在途任务判 failed(blocked,可返工),`POST /api/runs/{id}/resume` 从台账续跑。
+状态全部外置的直接收益:**会话可恢复、可重开**。进程死掉后 run 标记 `interrupted`,已验收任务原样保留、
+在途任务判 failed(blocked,可返工),`POST /api/runs/{id}/resume` 从台账续跑;已交付的会话被新消息
+重新唤醒时同理——重开的轮次带着上次 verdict 与全部台账,在已交付成果上继续,而不是从头再来。
 
 **agent 之间的交互形态**
 
@@ -193,7 +194,7 @@ acp 适配器缺失时 `claude` runtime 降级为 CLI 单发——static 仍可�
 
 ## Web UI
 
-- **工作流(对话式)**:左侧 workflow 列表,右侧「运行状态 + 与 main agent 的聊天窗」。对 main agent 说出目标,它自行拆解并派发 agent;运行中随时追加消息(下一个决策轮次送达并回复);审批卡片、最终回复都在聊天流里。run 结束后继续发消息即开启新一轮对话(新 run)。设置入口进编辑器——mode 单选,static 显示 planner/replan 表单,dynamic 显示 coordinator 与预算表单
+- **工作流(对话式)**:左侧 workflow 列表,右侧「运行状态 + 与 main agent 的聊天窗」。**会话 = run**:对 main agent 说出目标即开启会话,它自行拆解并派发 agent;运行中随时追加消息(下一个决策轮次送达并回复);审批卡片、最终回复都在聊天流里。交付(finish_run)只是里程碑——继续发消息会在**同一会话**唤醒 main agent 接着做(同一台账、同一份便签、上次 verdict 作为上下文);顶部会话下拉可切换历史会话,「+ 新会话」才开新 run。会话全文落在本地 run.json,coordinator 挂了也能从会话原地 wrap up。设置入口进编辑器——mode 单选,static 显示 planner/replan 表单,dynamic 显示 coordinator 与预算表单
 - **运行详情(static)**:DAG 实时可视化(SSE 推送)——节点按依赖深度自动布局,状态着色,replan 世代同图呈现;点节点看指令/摘要/错误/产物/完整输出;审批、取消、从节点重试
 - **运行详情(dynamic)**:**任务树**取代 DAG——按血缘缩进的实时列表(handoff 子任务嵌在父任务下),coordinator 常驻置顶卡片(状态/当前工具/最近决策/transcript);点任务看完整消息往来(指令、进度、反问、答复、结果、同伴消息)与 token 细分;可对在途任务人工插话;审批视图展示首批任务清单与新 agent 提案
 - **运行记录**:全部 run 列表,mode 标签、进度(dynamic 显示 `完成/总数+`,因为树还在长)、est. 成本、耗时
@@ -205,7 +206,9 @@ acp 适配器缺失时 `claude` runtime 降级为 CLI 单发——static 仍可�
 GET/POST   /api/agents            GET/DELETE /api/agents/{name}
 GET/POST   /api/workflows         GET/DELETE /api/workflows/{id}
 POST       /api/workflows/{id}/runs        {goal, backend?}
-POST       /api/workflows/{id}/chat        {text, dry_run?}  对话入口:有活跃 dynamic run 则续聊,否则以 text 为 goal 起新 run
+POST       /api/workflows/{id}/chat        {text, dry_run?, run_id?, new_session?}
+                                           对话入口。会话 = run:消息发给指定(或最近的)会话,
+                                           会话已结束则被重新唤醒;new_session 才开新会话
 POST       /api/runs/{id}/chat             {text}            向活跃 run 的 main agent 追加消息(下一轮送达)
 GET        /api/runs[?workflow_id=]        GET /api/runs/{id}
 POST       /api/runs/{id}/approve|reject|cancel

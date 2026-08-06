@@ -130,20 +130,31 @@ async function wfListPage() {
   const wfs = await api("/workflows");
   let selId = sessionStorage.getItem("wfSel");
   if (!wfs.some((w) => w.id === selId)) selId = wfs[0]?.id || null;
-  let run = null; // the selected workflow's active (or latest) run
+  let sessions = []; // the selected workflow's runs, newest first — each IS a session
+  let sesId = null;  // selected session; null = compose a new one
+  let run = null;    // the selected session, fully loaded
   let es = null;
 
   const terminalRun = (r) => ["succeeded", "failed", "canceled", "interrupted"].includes(r.status);
   const selWf = () => wfs.find((w) => w.id === selId);
+  const sesKey = () => "wfSes:" + selId;
 
   const loadRun = async () => {
     run = null;
+    sessions = [];
     if (!selId) return;
     try {
-      const runs = await api("/runs?workflow_id=" + selId); // newest first
-      const pick = runs.find((r) => !terminalRun(r)) || runs[0];
-      if (pick) run = await api("/runs/" + pick.id);
+      sessions = await api("/runs?workflow_id=" + selId); // newest first
     } catch { /* no runs yet */ }
+    const stored = sessionStorage.getItem(sesKey());
+    if (stored === "new") { sesId = null; return; }
+    const pick = sessions.find((r) => r.id === stored)
+      || sessions.find((r) => !terminalRun(r))
+      || sessions[0];
+    sesId = pick ? pick.id : null;
+    if (pick) {
+      try { run = await api("/runs/" + pick.id); } catch { run = null; }
+    }
   };
 
   const resub = () => {
@@ -179,18 +190,44 @@ async function wfListPage() {
     const wf = selWf();
     if (!head) return;
     if (!wf) { head.innerHTML = ""; return; }
+    const sesLabel = (r) => {
+      const t = new Date(r.created_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+      const goal = (r.goal || "").slice(0, 18);
+      return `${t} · ${goal}${(r.goal || "").length > 18 ? "…" : ""} · ${RUN_LABEL[r.status] || r.status}`;
+    };
     head.innerHTML = `
       <h2 style="margin:0">${esc(wf.name)}</h2>
       <span class="badge">${wf.mode === "dynamic" ? "dynamic · main agent 对话式编排" : "static · planner 组装 DAG"}</span>
       <span style="flex:1"></span>
+      ${sessions.length ? `
+        <select id="wf-session" title="会话 = 一个 run:切换查看,发消息续聊(结束的会话会被重新唤醒)">
+          ${sessions.map((r) => `<option value="${esc(r.id)}" ${r.id === sesId ? "selected" : ""}>${esc(sesLabel(r))}</option>`).join("")}
+          ${sesId === null ? '<option value="" selected>(新会话)</option>' : ""}
+        </select>` : ""}
+      ${wf.mode === "dynamic" ? '<button class="small" id="wf-new-session" title="开始一个全新会话(新 run)">+ 新会话</button>' : ""}
       <button class="small" onclick="location.hash='#/workflows/${esc(wf.id)}/edit'">设置</button>
       <a class="btn small" href="#/runs" onclick="sessionStorage.setItem('wfFilter','${esc(wf.id)}')">历史</a>`;
+    const sel = head.querySelector("#wf-session");
+    if (sel) sel.addEventListener("change", async () => {
+      sesId = sel.value || null;
+      sessionStorage.setItem(sesKey(), sesId || "new");
+      run = null;
+      if (sesId) { try { run = await api("/runs/" + sesId); } catch {} }
+      renderRight(); resub();
+    });
+    const nb = head.querySelector("#wf-new-session");
+    if (nb) nb.addEventListener("click", () => {
+      sesId = null;
+      run = null;
+      sessionStorage.setItem(sesKey(), "new");
+      renderHead(); renderRight(); resub();
+    });
   };
 
   // Status zone: the selected run's live shape, compact. Deep inspection stays
   // on the run page — every element here links into it.
   const renderStatus = () => {
-    if (!run) return '<div class="empty" style="padding:18px">还没有运行 — 在下面对 main agent 说出你的目标,它会拆解并派发 agent 开始干活。</div>';
+    if (!run) return '<div class="empty" style="padding:18px">新会话 — 在下面对 main agent 说出你的目标,它会拆解并派发 agent 开始干活。会话保存在本地,随时可以回来继续。</div>';
     const dyn = run.mode === "dynamic";
     const header = `
       <div class="wf-run-head">
@@ -238,6 +275,10 @@ async function wfListPage() {
         <div class="cbody">${esc(m.text)}</div>
       </div>`).join("");
     let tail = "";
+    if (terminalRun(run) && run.mode === "dynamic") {
+      const label = run.status === "succeeded" ? "已交付" : RUN_LABEL[run.status] || run.status;
+      tail = `<div class="cmsg agent"><div class="cwho">系统</div><div class="cbody" style="color:var(--muted)">会话${label}${run.status === "failed" && run.error ? ":" + esc(run.error) : ""}。继续发消息会在同一会话唤醒 main agent 接着做。</div></div>`;
+    }
     if (run.status === "awaiting_approval" && run.proposal) {
       tail = `
         <div class="cmsg agent">
@@ -254,8 +295,6 @@ async function wfListPage() {
         </div>`;
     } else if (!terminalRun(run) && run.mode === "dynamic") {
       tail = `<div class="cmsg agent typing"><div class="cbody">⋯ main agent 工作中(${esc(run.coordinator?.activity || "等待任务推进")})</div></div>`;
-    } else if (run.status === "failed" && run.error) {
-      tail = `<div class="cmsg agent"><div class="cwho">系统</div><div class="cbody" style="color:var(--bad)">${esc(run.error)}</div></div>`;
     }
     return msgs + tail;
   };
@@ -268,8 +307,10 @@ async function wfListPage() {
     const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
     log.innerHTML = renderChat();
     if (atBottom) log.scrollTop = log.scrollHeight;
+    // Dry-run is a property fixed at session birth; the toggle only applies
+    // to a session being composed, so it only shows then.
     const dryWrap = $main.querySelector("#wf-dry-wrap");
-    if (dryWrap) dryWrap.style.display = !run || terminalRun(run) ? "" : "none";
+    if (dryWrap) dryWrap.style.display = !run ? "" : "none";
     st.querySelectorAll("[data-act]").forEach(wireAct);
     log.querySelectorAll("[data-act]").forEach(wireAct);
   };
@@ -291,15 +332,27 @@ async function wfListPage() {
     if (!wf) return;
     box.value = "";
     try {
+      const dry = $main.querySelector("#wf-dry")?.checked || false;
+      let r;
       if (wf.mode === "dynamic") {
-        const dry = $main.querySelector("#wf-dry")?.checked || false;
-        const r = await api(`/workflows/${wf.id}/chat`, { method: "POST", body: { text, dry_run: dry } });
-        if (!run || r.id !== run.id) { run = r; resub(); }
+        // The message goes to the selected session; with none selected it
+        // opens a new one. Finished sessions are reopened server-side.
+        r = await api(`/workflows/${wf.id}/chat`, {
+          method: "POST",
+          body: { text, dry_run: dry, run_id: sesId || "", new_session: sesId === null },
+        });
       } else {
-        const dry = $main.querySelector("#wf-dry")?.checked || false;
-        run = await api(`/workflows/${wf.id}/runs`, { method: "POST", body: { goal: text, dry_run: dry } });
-        resub();
+        r = await api(`/workflows/${wf.id}/runs`, { method: "POST", body: { goal: text, dry_run: dry } });
       }
+      const isNew = !run || r.id !== run.id;
+      run = r;
+      sesId = r.id;
+      sessionStorage.setItem(sesKey(), sesId);
+      if (isNew || !sessions.some((s) => s.id === r.id)) {
+        try { sessions = await api("/runs?workflow_id=" + selId); } catch {}
+        renderHead();
+      }
+      resub();
       renderRight();
     } catch (e) { toast("发送失败:" + e.message); }
   };
@@ -328,9 +381,9 @@ async function wfListPage() {
         </div>
       </div>
     </div>`;
-  renderLeft(); renderHead();
+  renderLeft();
   await loadRun();
-  renderRight(); resub();
+  renderHead(); renderRight(); resub();
   $main.querySelector("#wf-send").addEventListener("click", send);
   $main.querySelector("#wf-input").addEventListener("keydown", (e) => {
     // An Enter that is confirming an IME composition (pinyin etc.) belongs to
