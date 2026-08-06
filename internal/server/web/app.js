@@ -333,6 +333,10 @@ async function wfListPage() {
   renderRight(); resub();
   $main.querySelector("#wf-send").addEventListener("click", send);
   $main.querySelector("#wf-input").addEventListener("keydown", (e) => {
+    // An Enter that is confirming an IME composition (pinyin etc.) belongs to
+    // the IME, not to us: isComposing covers the standard case, keyCode 229
+    // covers engines that fire the key event before composition ends.
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   });
 }
