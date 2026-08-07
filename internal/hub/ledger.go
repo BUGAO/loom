@@ -1302,11 +1302,24 @@ func (rs *RunSession) CoordinatorReply(text string) {
 	rs.mu.Unlock()
 }
 
+// InjectNotice queues a one-shot system notice for the coordinator and wakes
+// the round driver, exactly like the stall watcher does. The engine uses it to
+// give a quiet round one prompt correction before parking the loop.
+func (rs *RunSession) InjectNotice(text string) {
+	rs.mu.Lock()
+	rs.pendingNotice = text
+	rs.notifyLocked()
+	rs.mu.Unlock()
+}
+
 // AwaitRound blocks until there is something a fresh coordinator round should
 // act on: a task settled into a state the previous round has not seen, a new
-// user message, a pending system notice, or an idle ledger (nothing in
-// flight). It returns the reason, or "" when the run ended or ctx expired.
-// seen maps task id → the SettledFingerprint the previous round observed.
+// user message, or a pending system notice. It returns the reason, or "" when
+// the run ended or ctx expired. There is deliberately no "nothing happened"
+// wake: a coordinator that ends its round without moving the ledger parks
+// here until the user, the stall watcher, or a worker gives it a reason to
+// think — never a hot loop of empty rounds. seen maps task id → the
+// SettledFingerprint the previous round observed.
 func (rs *RunSession) AwaitRound(ctx context.Context, seen map[string]string) string {
 	for {
 		ch := rs.waitChange()
@@ -1319,19 +1332,11 @@ func (rs *RunSession) AwaitRound(ctx context.Context, seen map[string]string) st
 		if len(rs.pendingChat) > 0 {
 			reason = "user"
 		}
-		inFlight := false
 		for _, id := range rs.run.TaskOrder {
 			t := rs.run.Tasks[id]
-			if fp := settledFingerprintLocked(t); fp != "" {
-				if seen[id] != fp {
-					reason = "settled"
-				}
-			} else {
-				inFlight = true
+			if fp := settledFingerprintLocked(t); fp != "" && seen[id] != fp {
+				reason = "settled"
 			}
-		}
-		if reason == "" && !inFlight {
-			reason = "idle"
 		}
 		closed := rs.closed
 		rs.mu.Unlock()

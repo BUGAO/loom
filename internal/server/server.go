@@ -56,6 +56,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/runs", s.listRuns)
 	mux.HandleFunc("GET /api/runs/{id}", s.getRun)
+	mux.HandleFunc("DELETE /api/runs/{id}", s.deleteRun)
 	mux.HandleFunc("POST /api/runs/{id}/approve", s.approveRun)
 	mux.HandleFunc("POST /api/runs/{id}/reject", s.rejectRun)
 	mux.HandleFunc("POST /api/runs/{id}/cancel", s.cancelRun)
@@ -421,6 +422,19 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, run)
+}
+
+func (s *Server) deleteRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.engine.IsActive(id) {
+		writeErr(w, 400, fmt.Errorf("run %s is active; cancel it before deleting", id))
+		return
+	}
+	if err := s.store.DeleteRun(id); err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
 func (s *Server) approveRun(w http.ResponseWriter, r *http.Request) {

@@ -121,6 +121,14 @@ function router() {
 }
 window.addEventListener("hashchange", router);
 
+// openSession jumps to the workflow page with a specific session selected —
+// the bridge from run records back into the conversation.
+function openSession(wfId, runId) {
+  sessionStorage.setItem("wfSel", wfId);
+  sessionStorage.setItem("wfSes:" + wfId, runId);
+  location.hash = "#/workflows";
+}
+
 // ---------- workflows: list + conversation ----------
 
 // The workflow page is a conversation surface: pick a workflow on the left,
@@ -161,7 +169,12 @@ async function wfListPage() {
     if (es) { es.close(); es = null; }
     if (!run) return;
     es = new EventSource(`/api/runs/${run.id}/events`);
-    es.onmessage = (m) => { run = JSON.parse(m.data); renderRight(); };
+    es.onmessage = (m) => {
+      run = JSON.parse(m.data);
+      const s = sessions.find((x) => x.id === run.id);
+      if (s && s.status !== run.status) { s.status = run.status; renderSessions(); }
+      renderRight();
+    };
   };
   cleanup = () => es && es.close();
 
@@ -181,7 +194,7 @@ async function wfListPage() {
         selId = el.dataset.wf;
         sessionStorage.setItem("wfSel", selId);
         await loadRun();
-        renderLeft(); renderHead(); renderRight(); resub();
+        renderLeft(); renderHead(); renderSessions(); renderRight(); resub();
       }));
   };
 
@@ -190,38 +203,71 @@ async function wfListPage() {
     const wf = selWf();
     if (!head) return;
     if (!wf) { head.innerHTML = ""; return; }
-    const sesLabel = (r) => {
-      const t = new Date(r.created_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-      const goal = (r.goal || "").slice(0, 18);
-      return `${t} · ${goal}${(r.goal || "").length > 18 ? "…" : ""} · ${RUN_LABEL[r.status] || r.status}`;
-    };
     head.innerHTML = `
       <h2 style="margin:0">${esc(wf.name)}</h2>
       <span class="badge">${wf.mode === "dynamic" ? "dynamic · main agent 对话式编排" : "static · planner 组装 DAG"}</span>
       <span style="flex:1"></span>
-      ${sessions.length ? `
-        <select id="wf-session" title="会话 = 一个 run:切换查看,发消息续聊(结束的会话会被重新唤醒)">
-          ${sessions.map((r) => `<option value="${esc(r.id)}" ${r.id === sesId ? "selected" : ""}>${esc(sesLabel(r))}</option>`).join("")}
-          ${sesId === null ? '<option value="" selected>(新会话)</option>' : ""}
-        </select>` : ""}
       ${wf.mode === "dynamic" ? '<button class="small" id="wf-new-session" title="开始一个全新会话(新 run)">+ 新会话</button>' : ""}
       <button class="small" onclick="location.hash='#/workflows/${esc(wf.id)}/edit'">设置</button>
       <a class="btn small" href="#/runs" onclick="sessionStorage.setItem('wfFilter','${esc(wf.id)}')">历史</a>`;
-    const sel = head.querySelector("#wf-session");
-    if (sel) sel.addEventListener("change", async () => {
-      sesId = sel.value || null;
-      sessionStorage.setItem(sesKey(), sesId || "new");
-      run = null;
-      if (sesId) { try { run = await api("/runs/" + sesId); } catch {} }
-      renderRight(); resub();
-    });
     const nb = head.querySelector("#wf-new-session");
     if (nb) nb.addEventListener("click", () => {
       sesId = null;
       run = null;
       sessionStorage.setItem(sesKey(), "new");
-      renderHead(); renderRight(); resub();
+      renderSessions(); renderRight(); resub();
     });
+  };
+
+  // Sessions are first-class and visible: one chip per run, click to continue
+  // the conversation (finished ones get reopened by the next message), × to
+  // delete it for good.
+  const renderSessions = () => {
+    const box = $main.querySelector("#wf-sessions");
+    const wf = selWf();
+    if (!box) return;
+    if (!wf || !sessions.length) { box.innerHTML = ""; box.style.display = "none"; return; }
+    box.style.display = "";
+    const label = (r) => {
+      const t = new Date(r.created_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+      const goal = (r.goal || "").replace(/\s+/g, " ").slice(0, 14);
+      return `${t} · ${goal}${(r.goal || "").length > 14 ? "…" : ""}`;
+    };
+    box.innerHTML = sessions.map((r) => `
+      <div class="ses-chip ${esc(r.status)} ${r.id === sesId ? "selected" : ""}" data-ses="${esc(r.id)}"
+           title="${esc(r.goal || "")} · ${esc(RUN_LABEL[r.status] || r.status)}">
+        <span class="tdot"></span>
+        <span class="ses-label">${esc(label(r))}</span>
+        <span class="ses-x" data-del="${esc(r.id)}" title="删除该会话(含其任务台账与产物记录)">×</span>
+      </div>`).join("");
+    box.querySelectorAll("[data-ses]").forEach((chip) =>
+      chip.addEventListener("click", async (e) => {
+        if (e.target.dataset.del) return;
+        sesId = chip.dataset.ses;
+        sessionStorage.setItem(sesKey(), sesId);
+        run = null;
+        try { run = await api("/runs/" + sesId); } catch {}
+        renderSessions(); renderRight(); resub();
+      }));
+    box.querySelectorAll("[data-del]").forEach((x) =>
+      x.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const id = x.dataset.del;
+        const ses = sessions.find((r) => r.id === id);
+        if (!confirm(`删除会话「${(ses?.goal || id).slice(0, 40)}」?对话、任务台账与记录将被移除,不可恢复。`)) return;
+        try {
+          await api("/runs/" + id, { method: "DELETE" });
+          sessions = sessions.filter((r) => r.id !== id);
+          if (sesId === id) {
+            sesId = sessions[0]?.id || null;
+            sessionStorage.setItem(sesKey(), sesId || "new");
+            run = null;
+            if (sesId) { try { run = await api("/runs/" + sesId); } catch {} }
+            resub();
+          }
+          renderSessions(); renderRight();
+        } catch (err) { toast("删除失败:" + err.message); }
+      }));
   };
 
   // Status zone: the selected run's live shape, compact. Deep inspection stays
@@ -350,8 +396,8 @@ async function wfListPage() {
       sessionStorage.setItem(sesKey(), sesId);
       if (isNew || !sessions.some((s) => s.id === r.id)) {
         try { sessions = await api("/runs?workflow_id=" + selId); } catch {}
-        renderHead();
       }
+      renderSessions();
       resub();
       renderRight();
     } catch (e) { toast("发送失败:" + e.message); }
@@ -368,6 +414,7 @@ async function wfListPage() {
       </div>
       <div class="wf-right">
         <div class="wf-head" id="wf-head"></div>
+        <div class="wf-sessions" id="wf-sessions"></div>
         <div class="wf-status" id="wf-status"></div>
         <div class="wf-chat-log" id="wf-chat-log"></div>
         <div class="wf-chat-input">
@@ -383,7 +430,7 @@ async function wfListPage() {
     </div>`;
   renderLeft();
   await loadRun();
-  renderHead(); renderRight(); resub();
+  renderHead(); renderSessions(); renderRight(); resub();
   $main.querySelector("#wf-send").addEventListener("click", send);
   $main.querySelector("#wf-input").addEventListener("keydown", (e) => {
     // An Enter that is confirming an IME composition (pinyin etc.) belongs to
@@ -617,19 +664,28 @@ async function runsListPage() {
         <td class="mono">${r.dry_run || r.backend === "mock" ? "dry-run" : esc(r.backend)}</td>
         <td class="mono">${fmtCost(r.cost_usd)}</td>
         <td class="mono">${fmtTime(r.created_at)}</td>
+        <td>${r.mode === "dynamic"
+          ? `<button class="small" data-open-ses="${esc(r.workflow_id)}|${esc(r.id)}" title="回到该会话继续对话">打开会话</button>`
+          : ""}</td>
       </tr>`;
     }).join("");
     $main.innerHTML = `
       <div class="page-head"><h1>运行记录${wfFilter ? '<span class="muted">(已过滤)</span>' : ""}</h1></div>
       <div class="panel" style="padding:4px 8px">
         <table>
-          <thead><tr><th>Run</th><th>工作流</th><th>目标</th><th>状态</th><th>进度</th><th>运行时</th><th>est. 成本</th><th>发起时间</th></tr></thead>
+          <thead><tr><th>Run</th><th>工作流</th><th>目标</th><th>状态</th><th>进度</th><th>运行时</th><th>est. 成本</th><th>发起时间</th><th></th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
         ${runs.length ? "" : '<div class="empty">还没有运行记录</div>'}
       </div>`;
     $main.querySelectorAll("[data-run]").forEach((tr) =>
       tr.addEventListener("click", () => (location.hash = "#/runs/" + tr.dataset.run)));
+    $main.querySelectorAll("[data-open-ses]").forEach((btn) =>
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const [wfId, runId] = btn.dataset.openSes.split("|");
+        openSession(wfId, runId);
+      }));
   };
   await load();
   const timer = setInterval(load, 5000);
@@ -661,6 +717,9 @@ async function runPage(id) {
     }
     if (dyn && run.status === "interrupted") {
       controls.push('<button class="primary" data-act="resume">▶ 从台账恢复</button>');
+    }
+    if (dyn) {
+      controls.push(`<button onclick="openSession('${esc(run.workflow_id)}','${esc(run.id)}')" title="回到工作流页,在此会话继续与 main agent 对话">💬 打开会话</button>`);
     }
     $main.innerHTML = `
       <div class="page-head">

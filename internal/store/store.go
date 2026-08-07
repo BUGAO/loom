@@ -342,6 +342,21 @@ func (s *Store) LoadRun(id string) (*model.Run, error) {
 	return &r, nil
 }
 
+// DeleteRun removes a run — its record, transcripts and workspace — for good.
+// The cost ledger keeps its entries: spend happened whether or not the session
+// is kept.
+func (s *Store) DeleteRun(id string) error {
+	if err := safeName(id); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := os.Stat(filepath.Join(s.runDir(id), "run.json")); err != nil {
+		return fmt.Errorf("run %s not found", id)
+	}
+	return os.RemoveAll(s.runDir(id))
+}
+
 func (s *Store) ListRuns() ([]*model.Run, error) {
 	entries, err := os.ReadDir(filepath.Join(s.dir, "runs"))
 	if err != nil {

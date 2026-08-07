@@ -531,3 +531,29 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
 /* When the row genuinely cannot fit, whole controls wrap to a second line —
    never squeezed button text, never clipped controls. */
 .wf-head { flex-wrap: wrap; }
+
+/* Session chips: every conversation of the workflow, visible and clickable. */
+.wf-sessions {
+  display: flex; gap: 8px; overflow-x: auto; flex-shrink: 0;
+  padding: 2px 2px 6px;
+}
+.ses-chip {
+  display: flex; align-items: center; gap: 7px; padding: 6px 8px 6px 11px;
+  border: 1px solid var(--border); border-radius: 999px; cursor: pointer;
+  background: rgba(255, 255, 255, 0.025); white-space: nowrap; flex-shrink: 0;
+  font-size: 12px; transition: border-color .15s;
+}
+.ses-chip:hover { border-color: rgba(139, 92, 246, 0.45); }
+.ses-chip.selected {
+  border: 1.5px solid transparent; padding: 5.5px 7.5px 5.5px 10.5px;
+  background: linear-gradient(#1a2138, #1a2138) padding-box, var(--grad-full) border-box;
+}
+.ses-chip .tdot { width: 7px; height: 7px; border-radius: 50%; background: var(--idle); flex-shrink: 0; }
+.ses-chip.running .tdot, .ses-chip.planning .tdot { background: #67e8f9; animation: pulse 1.2s infinite; }
+.ses-chip.succeeded .tdot { background: #86efac; }
+.ses-chip.failed .tdot { background: #fda4af; }
+.ses-chip.awaiting_approval .tdot { background: var(--warn); box-shadow: 0 0 8px rgba(251, 191, 36, 0.5); }
+.ses-chip .ses-x {
+  color: var(--muted); padding: 0 4px; border-radius: 50%; line-height: 1;
+}
+.ses-chip .ses-x:hover { color: #fda4af; }

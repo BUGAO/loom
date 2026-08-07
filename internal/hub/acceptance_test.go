@@ -359,6 +359,44 @@ func TestUserChatRefusedAfterClose(t *testing.T) {
 	}
 }
 
+// A quiet ledger parks the round driver: no "nothing happened" wake, no hot
+// loop of empty rounds, and no round-count death sentence. It wakes only for
+// a reason — here, an injected system notice.
+func TestAwaitRoundParksUntilNotice(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	task := mustDelegate(t, rs, "alpha")
+	rs.TaskStarted(task.ID)
+	rs.CompleteTask(task.ID, "done", nil, nil)
+
+	seen := map[string]string{}
+	for _, v := range rs.Views(nil) {
+		if fp := SettledFingerprint(v); fp != "" {
+			seen[v.ID] = fp
+		}
+	}
+
+	woke := make(chan string, 1)
+	go func() { woke <- rs.AwaitRound(context.Background(), seen) }()
+	select {
+	case r := <-woke:
+		t.Fatalf("AwaitRound must park on a fully-seen quiet ledger, returned %q", r)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	rs.InjectNotice("SYSTEM: act or finish")
+	select {
+	case r := <-woke:
+		if r != "notice" {
+			t.Fatalf("wake reason should be notice, got %q", r)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an injected notice did not wake the round driver")
+	}
+	if n := rs.TakeNotice(); n == "" {
+		t.Fatal("the notice should be deliverable to the next round")
+	}
+}
+
 // ---- round context reconstruction (D2) ----
 
 // The round prompt is rebuilt from the ledger: for the same ledger state its

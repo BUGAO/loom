@@ -230,6 +230,13 @@ func (e *Engine) SendToTask(runID, taskID, text string) error {
 	return err
 }
 
+// IsActive reports whether a run is currently being driven by this process.
+func (e *Engine) IsActive(runID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.active[runID] != nil
+}
+
 // Cancel stops an active run.
 func (e *Engine) Cancel(runID string) error {
 	e.mu.Lock()

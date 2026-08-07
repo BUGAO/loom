@@ -149,7 +149,8 @@ worker 信封里的 `"status":"ok"` 只是**声明**;引擎在 worker 收尾后�
 coordinator 不是一条越长越糊的会话:引擎按**轮**驱动它,每轮开一个全新会话,上下文由
 「目标 + 自存便签 + 用户新消息 + 任务台账快照 + 上轮以来的落定变化 + 预算余量」重建——单轮上下文随任务树大小走,
 **不随轮数增长**。跨轮记忆走 `record_note`(外置到 run,限 20 条)。轮与轮之间由台账事件唤醒
-(任务落定/新反问/**用户消息**/系统通知);连续两轮台账零变化且无 verdict,判 coordinator 卡死,run failed。
+(任务落定/新反问/**用户消息**/系统通知)。**轮数不设上限**——终止保证是墙钟;一轮结束时台账零变化,
+引擎注入一次纠正提示(常见于 delegate 被拒后模型放弃重试),再安静就挂起等事件,不空转、不判死。
 goal 是对话的第一条消息;用户随时追加,下一个轮次送达,每轮的收尾文本作为 main agent 的聊天回复
 展示给用户。对话持久化在 run 里,用户消息同时进审计事件流。
 coordinator 的会话没有任何文件工具:它读产物的唯一通道是 hub 的 `inspect` 工具——有审计、有计数,
@@ -194,7 +195,7 @@ acp 适配器缺失时 `claude` runtime 降级为 CLI 单发——static 仍可�
 
 ## Web UI
 
-- **工作流(对话式)**:左侧 workflow 列表,右侧「运行状态 + 与 main agent 的聊天窗」。**会话 = run**:对 main agent 说出目标即开启会话,它自行拆解并派发 agent;运行中随时追加消息(下一个决策轮次送达并回复);审批卡片、最终回复都在聊天流里。交付(finish_run)只是里程碑——继续发消息会在**同一会话**唤醒 main agent 接着做(同一台账、同一份便签、上次 verdict 作为上下文);顶部会话下拉可切换历史会话,「+ 新会话」才开新 run。会话全文落在本地 run.json,coordinator 挂了也能从会话原地 wrap up。设置入口进编辑器——mode 单选,static 显示 planner/replan 表单,dynamic 显示 coordinator 与预算表单
+- **工作流(对话式)**:左侧 workflow 列表,右侧「运行状态 + 与 main agent 的聊天窗」。**会话 = run**:对 main agent 说出目标即开启会话,它自行拆解并派发 agent;运行中随时追加消息(下一个决策轮次送达并回复);审批卡片、最终回复都在聊天流里。交付(finish_run)只是里程碑——继续发消息会在**同一会话**唤醒 main agent 接着做(同一台账、同一份便签、上次 verdict 作为上下文);会话以 chips 列表可见:点击切换续聊、× 删除,「+ 新会话」才开新 run;多个会话可并行活跃。运行记录页与 run 详情页都有「打开会话」直达续聊入口。会话全文落在本地 run.json,coordinator 挂了也能从会话原地 wrap up。设置入口进编辑器——mode 单选,static 显示 planner/replan 表单,dynamic 显示 coordinator 与预算表单
 - **运行详情(static)**:DAG 实时可视化(SSE 推送)——节点按依赖深度自动布局,状态着色,replan 世代同图呈现;点节点看指令/摘要/错误/产物/完整输出;审批、取消、从节点重试
 - **运行详情(dynamic)**:**任务树**取代 DAG——按血缘缩进的实时列表(handoff 子任务嵌在父任务下),coordinator 常驻置顶卡片(状态/当前工具/最近决策/transcript);点任务看完整消息往来(指令、进度、反问、答复、结果、同伴消息)与 token 细分;可对在途任务人工插话;审批视图展示首批任务清单与新 agent 提案
 - **运行记录**:全部 run 列表,mode 标签、进度(dynamic 显示 `完成/总数+`,因为树还在长)、est. 成本、耗时
@@ -211,6 +212,7 @@ POST       /api/workflows/{id}/chat        {text, dry_run?, run_id?, new_session
                                            会话已结束则被重新唤醒;new_session 才开新会话
 POST       /api/runs/{id}/chat             {text}            向活跃 run 的 main agent 追加消息(下一轮送达)
 GET        /api/runs[?workflow_id=]        GET /api/runs/{id}
+DELETE     /api/runs/{id}                  删除会话(活跃中的需先取消;成本台账保留)
 POST       /api/runs/{id}/approve|reject|cancel
 POST       /api/runs/{id}/retry/{node}     static 专用
 POST       /api/runs/{id}/resume           dynamic 专用:interrupted run 从台账恢复续跑

@@ -208,10 +208,6 @@ func (e *Engine) reactivate(runID, text string, requireInterrupted bool) (*model
 // coordinatorAgentName is how the coordinator appears in the cost ledger.
 const coordinatorAgentName = "(coordinator)"
 
-// maxCoordinatorRounds is an absolute guard against a coordinator that keeps
-// producing rounds without converging; the wall clock is the real ceiling.
-const maxCoordinatorRounds = 200
-
 // dynamicRun holds the engine-side state of one dynamic run and implements
 // hub.Executor.
 type dynamicRun struct {
@@ -231,9 +227,11 @@ type workerHandle struct {
 	cancel context.CancelFunc
 }
 
-// runCoordinator drives decision rounds until a verdict, an error, or the
-// no-progress guard trips. Each round is a fresh session: the coordinator's
-// only state is the ledger and its recorded notes.
+// runCoordinator drives decision rounds until a verdict or an error. Each
+// round is a fresh session: the coordinator's only state is the ledger and its
+// recorded notes. There is no round limit — the run's wall clock is the
+// termination guarantee; a coordinator that stops moving the ledger gets one
+// corrective notice and then simply parks until something real happens.
 func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, pool []*model.Agent, budget model.BudgetConfig) error {
 	e := d.engine
 	token := e.hub.IssueCoordinatorToken(d.run.ID)
@@ -245,16 +243,12 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 	var transcript strings.Builder
 	seen := map[string]string{}
 	var changed []string
-	noProgress := 0
+	quiet := 0                             // consecutive rounds without a ledger transition
 	startRound := d.run.Coordinator.Rounds // > 0 when resuming
 	userMsgs := rs.TakeUserChat()          // messages queued before the first round
 
 	for i := 1; ; i++ {
 		round := startRound + i
-		if round > maxCoordinatorRounds {
-			d.run.Coordinator.Status = "failed"
-			return fmt.Errorf("coordinator exceeded %d decision rounds without a verdict", maxCoordinatorRounds)
-		}
 		d.run.Coordinator.Rounds = round
 		seqBefore := rs.Seq()
 
@@ -317,16 +311,20 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 			}
 		}
 
-		// A round that neither finished nor touched the ledger, twice in a row,
-		// is a wedged coordinator — stop burning sessions on it.
+		// A round that neither finished nor touched the ledger gets exactly one
+		// immediate corrective round; if that one is quiet too, the loop parks
+		// in AwaitRound until the user, a worker, or the stall watcher speaks.
+		// Failing the run here would kill sessions over a recoverable slip
+		// (e.g. a refused delegate the model didn't retry).
 		if rs.Seq() == seqBefore {
-			noProgress++
+			quiet++
 		} else {
-			noProgress = 0
+			quiet = 0
 		}
-		if noProgress >= 2 {
-			d.run.Coordinator.Status = "failed"
-			return fmt.Errorf("coordinator made no progress for %d consecutive rounds and delivered no verdict", noProgress)
+		if quiet == 1 {
+			rs.InjectNotice("SYSTEM: your last round ended without delegating, messaging, or finishing. " +
+				"If a tool call was refused, fix it per the error and retry. Delegate the next piece of work, " +
+				"answer what is pending, or call finish_run — do not end another round without acting.")
 		}
 
 		e.event(d.run, "round", "", fmt.Sprintf("round %d ended without a verdict; waiting for the ledger", round))
