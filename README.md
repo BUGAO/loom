@@ -56,7 +56,7 @@ data/agents/<name>/
     .claude/skills/      该 agent 的私有 skills(SKILL.md,会话自动加载)
 ```
 
-节点执行时 ACP 会话在 agent 自己的 home 中启动——AGENTS.md 和私有 skills 被运行时原生加载(实测:agent 会在任务中显式调用自己的 skill)。跨节点协作走 run 的**交换目录** `data/runs/<id>/workspace/`:节点 prompt 中给出其绝对路径,上游产物在此,交付物必须写到此;agent 自己的 home 用于草稿和跨 run 积累。skills 可在 UI 的 agent 编辑器中直接增删改。
+节点执行时 ACP 会话在 agent 自己的 home 中启动——AGENTS.md 和私有 skills 被运行时原生加载(实测:agent 会在任务中显式调用自己的 skill)。工具白名单**双重强制**:除了应答权限请求,loom 在每次开会话前把白名单编译成 Claude Code 原生 `permissions.deny` 规则写入会话 cwd 的 `.claude/settings.local.json`(loom 托管,勿手改)——只读工具与 Task 默认不发权限请求,deny 规则是对它们唯一有效的机制层拦截;coordinator 白名单为空,因此除 hub 工具外一切被禁,派活是它唯一能做的事。跨节点协作走 run 的**交换目录** `data/runs/<id>/workspace/`:节点 prompt 中给出其绝对路径,上游产物在此,交付物必须写到此;agent 自己的 home 用于草稿和跨 run 积累。skills 可在 UI 的 agent 编辑器中直接增删改。
 
 ## 运行生命周期(static)
 

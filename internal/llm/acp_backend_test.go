@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -90,5 +91,66 @@ func TestACPPromptRejected(t *testing.T) {
 	}
 	if !strings.Contains(res.Text, "not permitted") {
 		t.Fatalf("expected rejection path, got: %s", res.Text)
+	}
+}
+
+// The tool jail: permission answers alone cannot stop read-only tools or Task
+// (Claude Code never asks), so the allowlist must also materialize as deny
+// rules the runtime core enforces.
+func TestDenyListFor(t *testing.T) {
+	has := func(list []string, name string) bool {
+		for _, n := range list {
+			if n == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Empty allowlist (the coordinator): everything is denied, Task included.
+	deny := denyListFor("")
+	for _, name := range []string{"Task", "Read", "Grep", "Glob", "Bash", "Write", "Edit", "WebFetch", "WebSearch"} {
+		if !has(deny, name) {
+			t.Errorf("empty allowlist should deny %s", name)
+		}
+	}
+
+	// A worker allowlist keeps exactly what it grants — and never Task.
+	deny = denyListFor("Read,Write,Edit,Bash")
+	for _, name := range []string{"Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput"} {
+		if has(deny, name) {
+			t.Errorf("allowlist Read,Write,Edit,Bash should not deny %s", name)
+		}
+	}
+	for _, name := range []string{"Task", "Grep", "Glob", "WebFetch", "WebSearch"} {
+		if !has(deny, name) {
+			t.Errorf("allowlist Read,Write,Edit,Bash should still deny %s", name)
+		}
+	}
+}
+
+func TestOpenWritesToolJail(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeToolJail(dir, "Read"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(dir + "/.claude/settings.local.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Permissions struct {
+			Deny []string `json:"deny"`
+		} `json:"permissions"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	deny := strings.Join(cfg.Permissions.Deny, ",")
+	if strings.Contains(deny, "Read") {
+		t.Fatalf("granted Read must not be denied: %s", deny)
+	}
+	if !strings.Contains(deny, "Task") || !strings.Contains(deny, "Bash") {
+		t.Fatalf("jail must deny Task and Bash: %s", deny)
 	}
 }

@@ -336,3 +336,18 @@ ACP 走订阅,真实扣费为零。设计稿要求按 API 牌价折算。这个�
   researcher(sonnet, 无工具)/ architect(opus, RW)/ implementer(sonnet, RWEB,实现+自测合并,原 tester 并入)/
   reviewer(opus, R, independent)/ doc-writer(haiku, RW)。原 poet / literary-translator / prosody-auditor
   等仅 prompt 差异的名义拆分随数据清空移除。
+
+## D23 `[补洞]` 工具白名单曾对只读工具与 Task 失效;用 deny 规则封死
+
+**来源**:真实 run 中 coordinator(工具白名单为空)被观察到调用 `Task`(Claude Code 自带子agent)与
+`Bash find` 自行探索代码仓库。
+
+**根因**:loom 的白名单靠回答 ACP `session/request_permission` 实现,但 Claude Code 对只读工具
+(Read/Grep/Glob)与 Task **默认不发权限请求**——询问面拦截对它们是空集。A2 的"机制层隔离"在这条路径上
+名不副实(此前的线级测试用的是显式请求权限的假 agent,恰好没覆盖这个缺口)。
+
+**改法**:ACP 会话 spawn 前,按 agent 白名单生成 Claude Code 原生 `permissions.deny` 规则,写入会话 cwd 的
+`.claude/settings.local.json`(loom 托管、每次开会话重写、写失败则拒绝开会话)。deny 由 Claude Code 内核强制,
+不走询问、提示词不可绕过。`Task` 无条件在 deny 列表——台账之外的子agent 编排永远不是可授予的能力。
+loom 的 MCP 工具(mcp__loom__*)不受影响;原有的权限应答白名单保留作第二道。
+coordinator 白名单为空 → 全部能力被禁,只剩 hub 工具:**派活成为它唯一能做的事**。

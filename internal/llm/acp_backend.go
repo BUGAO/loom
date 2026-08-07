@@ -3,11 +3,13 @@ package llm
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -69,6 +71,74 @@ func allowedFn(tools string) func(title, kind string) bool {
 // orchestration channel, not a capability the agent was granted.
 func isHubTool(title string) bool {
 	return strings.Contains(strings.ToLower(title), loomToolPrefix)
+}
+
+// ---- tool jail ----
+//
+// Answering permission requests is not enough: Claude Code never asks
+// permission for read-only tools or for Task (its own subagent spawner), so an
+// allowlist enforced only at the request_permission surface leaves a session
+// free to explore the filesystem and orchestrate outside the ledger. The jail
+// closes that hole with the runtime's own permissions.deny rules, written to
+// the session cwd before spawn — enforced by Claude Code core, immune to
+// prompting.
+
+// capabilityGrants maps loom allowlist tokens onto the Claude Code tools they
+// legitimize.
+var capabilityGrants = map[string][]string{
+	"read":      {"Read"},
+	"grep":      {"Grep"},
+	"glob":      {"Glob"},
+	"write":     {"Write", "NotebookEdit"},
+	"edit":      {"Edit", "MultiEdit", "NotebookEdit"},
+	"bash":      {"Bash", "BashOutput", "KillShell"},
+	"webfetch":  {"WebFetch"},
+	"websearch": {"WebSearch"},
+}
+
+// capabilityTools is every capability-granting Claude Code tool the jail
+// manages. Task is here unconditionally: subagents spawned outside the ledger
+// are never a granted capability, whatever the allowlist says. Skills and
+// TodoWrite are deliberately absent — they act within the session and their
+// tool calls hit these same rules.
+var capabilityTools = []string{
+	"Task", "Bash", "BashOutput", "KillShell", "Read", "Write", "Edit",
+	"MultiEdit", "NotebookEdit", "Grep", "Glob", "WebFetch", "WebSearch",
+}
+
+// denyListFor computes the deny rules implied by an agent's tool allowlist.
+func denyListFor(tools string) []string {
+	keep := map[string]bool{}
+	for _, t := range strings.Split(tools, ",") {
+		for _, name := range capabilityGrants[strings.ToLower(strings.TrimSpace(t))] {
+			keep[name] = true
+		}
+	}
+	var deny []string
+	for _, name := range capabilityTools {
+		if !keep[name] {
+			deny = append(deny, name)
+		}
+	}
+	return deny
+}
+
+// writeToolJail materializes the deny rules into the session cwd's
+// .claude/settings.local.json. The file is loom-managed and rewritten on
+// every session open, so an agent's jail always reflects its current
+// allowlist.
+func writeToolJail(workDir, tools string) error {
+	dir := filepath.Join(workDir, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(map[string]any{
+		"permissions": map[string]any{"deny": denyListFor(tools)},
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "settings.local.json"), data, 0o644)
 }
 
 // loomToolPrefix is the MCP server name the hub registers under; tool titles
@@ -215,6 +285,10 @@ type acpSession struct {
 var _ Session = (*acpSession)(nil)
 
 func (a *ACP) Open(ctx context.Context, req SessionRequest) (Session, error) {
+	// Fail closed: without the jail on disk, the allowlist is advisory.
+	if err := writeToolJail(req.WorkDir, req.Tools); err != nil {
+		return nil, fmt.Errorf("write tool jail: %w", err)
+	}
 	cmd := exec.Command(a.Command, a.Args...)
 	cmd.Dir = req.WorkDir
 	cmd.Env = scrubEnv(req.Model)
