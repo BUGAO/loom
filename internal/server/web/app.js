@@ -30,6 +30,53 @@ function toast(msg) {
   setTimeout(() => el.remove(), 4200);
 }
 
+// modalDialog replaces the browser's native confirm()/prompt() with the app's
+// own centered modal. Resolves to null on cancel; to true (or the input's
+// value when inputPlaceholder is given) on confirm.
+function modalDialog({ title, body, inputPlaceholder, confirmText = "确定", danger = false }) {
+  return new Promise((resolve) => {
+    const hasInput = inputPlaceholder !== undefined;
+    // Own host element, stacked above whatever is already open (including the
+    // agent editor, which lives in $overlay) — a dialog must never destroy
+    // the surface that asked for it.
+    const host = document.createElement("div");
+    host.innerHTML = `
+      <div class="modal-bg" style="z-index:60">
+        <div class="modal" style="width:440px">
+          ${title ? `<h2>${esc(title)}</h2>` : ""}
+          ${body ? `<div style="font-size:13px;color:var(--muted);line-height:1.65;margin-bottom:14px;word-break:break-word">${esc(body)}</div>` : ""}
+          ${hasInput ? `<textarea id="md-input" rows="2" placeholder="${esc(inputPlaceholder)}" style="margin-bottom:14px"></textarea>` : ""}
+          <div class="row modal-foot">
+            <button id="md-cancel">取消</button>
+            <button class="${danger ? "danger" : "primary"}" id="md-ok">${esc(confirmText)}</button>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(host);
+    const onKey = (e) => { if (e.key === "Escape") done(null); };
+    const done = (v) => {
+      document.removeEventListener("keydown", onKey);
+      host.remove();
+      resolve(v);
+    };
+    document.addEventListener("keydown", onKey);
+    host.querySelector("#md-cancel").onclick = () => done(null);
+    host.querySelector(".modal-bg").addEventListener("click", (e) => {
+      if (e.target.classList.contains("modal-bg")) done(null);
+    });
+    host.querySelector("#md-ok").onclick = () => {
+      const inp = host.querySelector("#md-input");
+      done(inp ? inp.value : true);
+    };
+    (host.querySelector("#md-input") || host.querySelector("#md-ok")).focus();
+  });
+}
+
+// confirmModal is the yes/no form: resolves to a boolean.
+async function confirmModal(title, body, confirmText = "确定") {
+  return (await modalDialog({ title, body, confirmText, danger: true })) !== null;
+}
+
 const RUN_LABEL = {
   planning: "规划中", awaiting_approval: "待审批", running: "运行中",
   replanning: "重规划", succeeded: "成功", failed: "失败",
@@ -254,7 +301,8 @@ async function wfListPage() {
         e.stopPropagation();
         const id = x.dataset.del;
         const ses = sessions.find((r) => r.id === id);
-        if (!confirm(`删除会话「${(ses?.goal || id).slice(0, 40)}」?对话、任务台账与记录将被移除,不可恢复。`)) return;
+        if (!(await confirmModal("删除会话",
+          `「${(ses?.goal || id).slice(0, 40)}」的对话、任务台账与记录将被移除,不可恢复。`, "删除"))) return;
         try {
           await api("/runs/" + id, { method: "DELETE" });
           sessions = sessions.filter((r) => r.id !== id);
@@ -363,7 +411,15 @@ async function wfListPage() {
 
   const wireAct = (btn) => btn.addEventListener("click", async () => {
     const act = btn.dataset.act;
-    const body = act === "reject" ? { reason: prompt("拒绝理由(会告知 main agent):") || "" } : {};
+    let body = {};
+    if (act === "reject") {
+      const reason = await modalDialog({
+        title: "拒绝该计划", inputPlaceholder: "拒绝理由(会告知 main agent)…",
+        confirmText: "拒绝", danger: true,
+      });
+      if (reason === null) return;
+      body = { reason };
+    }
     try {
       await api(`/runs/${run.id}/${act}`, { method: "POST", body });
       if (act === "resume") { await loadRun(); resub(); }
@@ -586,7 +642,7 @@ async function wfEditPage(id) {
     };
     const del = $main.querySelector("#wf-del");
     if (del) del.onclick = async () => {
-      if (!confirm("删除该工作流?运行记录会保留。")) return;
+      if (!(await confirmModal("删除工作流", "运行记录会保留,仅删除工作流定义。", "删除"))) return;
       await api("/workflows/" + id, { method: "DELETE" });
       location.hash = "#/workflows";
     };
@@ -776,7 +832,15 @@ async function runPage(id) {
     $main.querySelectorAll("[data-act]").forEach((btn) =>
       btn.addEventListener("click", async () => {
         const act = btn.dataset.act;
-        const body = act === "reject" ? { reason: prompt("拒绝理由(会告知 coordinator):") || "" } : {};
+        let body = {};
+        if (act === "reject") {
+          const reason = await modalDialog({
+            title: "拒绝该计划", inputPlaceholder: "拒绝理由(会告知 coordinator)…",
+            confirmText: "拒绝", danger: true,
+          });
+          if (reason === null) return;
+          body = { reason };
+        }
         try { await api(`/runs/${run.id}/${act}`, { method: "POST", body }); }
         catch (e) { toast(e.message); }
       }));
@@ -1087,7 +1151,7 @@ async function agentsPage() {
     b.addEventListener("click", () => agentModal(agents.find((a) => a.name === b.dataset.edit), agents)));
   $main.querySelectorAll("[data-del]").forEach((b) =>
     b.addEventListener("click", async () => {
-      if (!confirm(`删除 agent「${b.dataset.del}」?`)) return;
+      if (!(await confirmModal("删除 Agent", `agent「${b.dataset.del}」将从池中移除。`, "删除"))) return;
       await api("/agents/" + b.dataset.del, { method: "DELETE" });
       agentsPage();
     }));
@@ -1141,7 +1205,7 @@ function agentModal(agent, _all) {
       el.addEventListener("click", () => skillEditor(a.name, el.dataset.skillEdit)));
     $overlay.querySelectorAll("[data-skill-del]").forEach((el) =>
       el.addEventListener("click", async () => {
-        if (!confirm(`删除 skill「${el.dataset.skillDel}」?`)) return;
+        if (!(await confirmModal("删除 Skill", `skill「${el.dataset.skillDel}」将从该 agent 的私有目录移除。`, "删除"))) return;
         await api(`/agents/${a.name}/skills/${el.dataset.skillDel}`, { method: "DELETE" });
         reopenAgent(a.name);
       }));
