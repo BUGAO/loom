@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -69,15 +70,15 @@ func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, 
 	d := &dynamicRun{engine: e, run: run, wf: wf, dryRun: dryRun, sessions: sessions, workers: map[string]*workerHandle{}}
 
 	rs := e.hub.OpenRun(ctx, hub.RunConfig{
-		Run:       run,
-		Workflow:  wf,
-		Pool:      pool,
-		Workspace: e.store.RunWorkspace(run.ID),
-		Exec:      d,
-		OnChange:  func(r *model.Run) { e.store.SaveRun(r); e.publish(r) },
-		OnEvent:   func(typ, taskID, msg string) { e.event(run, typ, taskID, msg) },
-		OnCost:    func(entry store.CostEntry) { e.store.AppendCost(entry) },
-		SaveAgent: func(a *model.Agent) error { return e.materializeOne(wf, run, a) },
+		Run:        run,
+		Workflow:   wf,
+		Pool:       pool,
+		Workspace:  e.store.RunWorkspace(run.ID),
+		OutputRoot: e.outputRoot,
+		Exec:       d,
+		OnChange:   func(r *model.Run) { e.store.SaveRun(r); e.publish(r) },
+		OnCost:     func(entry store.CostEntry) { e.store.AppendCost(entry) },
+		SaveAgent:  func(a *model.Agent) error { return e.materializeOne(wf, run, a) },
 	})
 	d.rs = rs
 	h.setRunSession(rs)
@@ -85,7 +86,7 @@ func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, 
 		rs.UserChat(m) // recorded, audited, and queued for the first round
 	}
 
-	e.event(run, "run_status", "", fmt.Sprintf("coordinator started (%s)", coordModel))
+	rs.AppendEvent("run_status", "", fmt.Sprintf("coordinator started (%s)", coordModel))
 	err = d.runCoordinator(ctx, rs, pool, budget)
 
 	// The coordinator is done talking. Everything still in flight is now
@@ -238,9 +239,19 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 	defer e.hub.RevokeToken(token)
 
 	workspace := e.store.RunWorkspace(d.run.ID)
-	sysPrompt := hub.CoordinatorPrompt(d.run, d.wf, budget, workspace, pool)
+	outDir := ""
+	if dir, named := rs.OutputInfo(); named {
+		outDir = dir
+	}
+	sysPrompt := hub.CoordinatorPrompt(d.run, d.wf, budget, e.outputRoot, outDir, pool)
 
+	// The transcript survives reopens: earlier activations' rounds are the
+	// audit trail of this session, not scratch to overwrite.
 	var transcript strings.Builder
+	if prev, err := os.ReadFile(e.store.NodeOutputPath(d.run.ID, "coordinator")); err == nil {
+		transcript.Write(prev)
+	}
+
 	seen := map[string]string{}
 	var changed []string
 	quiet := 0                             // consecutive rounds without a ledger transition
@@ -249,7 +260,7 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 
 	for i := 1; ; i++ {
 		round := startRound + i
-		d.run.Coordinator.Rounds = round
+		rs.UpdateCoordinator(func(c *model.CoordinatorState) { c.Rounds = round })
 		seqBefore := rs.Seq()
 
 		sess, err := d.sessions.Open(ctx, llm.SessionRequest{
@@ -266,21 +277,18 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 			OnActivity: func(text string) { rs.CoordinatorActivity(text) },
 		})
 		if err != nil {
-			d.run.Coordinator.Status = "failed"
+			rs.UpdateCoordinator(func(c *model.CoordinatorState) { c.Status = "failed" })
 			return fmt.Errorf("open coordinator session: %w", err)
 		}
 		start := time.Now()
 		res, perr := sess.Prompt(ctx, hub.RoundPrompt(d.run, rs, round, changed, userMsgs))
 		sess.Close()
 		if res != nil {
-			d.run.Coordinator.DurationMs += time.Since(start).Milliseconds()
-			d.run.Coordinator.CostUSD += res.CostUSD
-			d.run.Coordinator.Usage.Add(res.Usage)
 			modelID := res.Model
 			if modelID == "" {
 				modelID = d.run.Coordinator.Model
 			}
-			e.recordCost(d.run, "coordinator", "coordinator", coordinatorAgentName, modelID, res.Usage, res.CostUSD)
+			rs.RecordCoordinatorCost(coordinatorAgentName, modelID, res.Usage, res.CostUSD, time.Since(start).Milliseconds())
 			body := res.Transcript
 			if body == "" {
 				body = res.Text
@@ -290,17 +298,17 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 			// The round's final text is the coordinator's chat reply.
 			rs.CoordinatorReply(res.Text)
 		}
-		d.run.Coordinator.Activity = ""
+		rs.UpdateCoordinator(func(c *model.CoordinatorState) { c.Activity = "" })
 		if perr != nil {
-			d.run.Coordinator.Status = "failed"
+			rs.UpdateCoordinator(func(c *model.CoordinatorState) { c.Status = "failed" })
 			return perr
 		}
 		if rs.Verdict() != nil {
-			d.run.Coordinator.Status = "done"
+			rs.UpdateCoordinator(func(c *model.CoordinatorState) { c.Status = "done" })
 			return nil
 		}
 		if ctx.Err() != nil {
-			d.run.Coordinator.Status = "failed"
+			rs.UpdateCoordinator(func(c *model.CoordinatorState) { c.Status = "failed" })
 			return nil // outer switch reports cancellation/timeout
 		}
 
@@ -327,9 +335,9 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 				"answer what is pending, or call finish_run — do not end another round without acting.")
 		}
 
-		e.event(d.run, "round", "", fmt.Sprintf("round %d ended without a verdict; waiting for the ledger", round))
+		rs.AppendEvent("round", "", fmt.Sprintf("round %d ended without a verdict; waiting for the ledger", round))
 		if reason := rs.AwaitRound(ctx, seen); reason == "" {
-			d.run.Coordinator.Status = "failed"
+			rs.UpdateCoordinator(func(c *model.CoordinatorState) { c.Status = "failed" })
 			return nil // run closed or ctx done; outer switch decides
 		}
 
@@ -452,7 +460,8 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 		rs.CompleteTask(taskID, "", nil, err)
 		return
 	}
-	workspace := e.store.RunWorkspace(d.run.ID)
+	// The exchange directory is frozen by the dispatch that started this task.
+	workspace := rs.Workspace()
 	sess, err := llm.Sessions(workerBackend).Open(taskCtx, llm.SessionRequest{
 		Kind:         llm.KindWorker,
 		SystemPrompt: agent.SystemPrompt,
@@ -475,8 +484,11 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 		return
 	}
 
-	task := rs.Run().Tasks[taskID]
-	prompt := hub.WorkerPrompt(task, agent, d.run, workspace, budget.AllowPeerHandoff)
+	task, ok := rs.TaskSnapshot(taskID)
+	if !ok {
+		return
+	}
+	prompt := hub.WorkerPrompt(&task, agent, d.run, workspace, budget.AllowPeerHandoff)
 
 	var transcript strings.Builder
 	var lastEnv envelope
@@ -491,7 +503,7 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 			}
 			rs.RecordTaskCost(taskID, modelID, res.Usage, res.CostUSD, res.DurationMs)
 			if res.Usage.Empty() && res.CostUSD == 0 && workerBackend.Name() == "acp" {
-				e.event(d.run, "cost_unavailable", taskID, "token usage could not be read from the session transcript; cost recorded as 0")
+				rs.AppendEvent("cost_unavailable", taskID, "token usage could not be read from the session transcript; cost recorded as 0")
 			}
 			body := res.Transcript
 			if body == "" {
@@ -540,8 +552,9 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 			rs.CompleteTaskWith(taskID, lastEnv.Summary, lastEnv.Artifacts,
 				fmt.Errorf("agent reported error: %s", lastEnv.Summary), kind, nil)
 		default:
-			// The claim is "ok"; the verdict is the acceptance contract's.
-			results, pass := hub.RunChecks(taskCtx, workspace, task.Acceptance)
+			// The claim is "ok"; the verdict is the acceptance contract's —
+			// read at completion time, so an amended contract judges the work.
+			results, pass := hub.RunChecks(taskCtx, workspace, rs.AcceptanceOf(taskID))
 			if pass {
 				rs.CompleteTaskWith(taskID, lastEnv.Summary, lastEnv.Artifacts, nil, "", results)
 			} else {

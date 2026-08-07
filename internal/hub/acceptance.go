@@ -58,6 +58,31 @@ func ValidateChecks(checks []model.AcceptanceCheck) error {
 	return nil
 }
 
+// ChecksFeasibleFor rejects a contract the assigned agent cannot possibly
+// satisfy: artifact checks demand a file the worker must write, so an agent
+// without write capability is being set up to fail — the exact trap a real
+// run walked into when a read-only reviewer was contracted to produce
+// design-review.md.
+func ChecksFeasibleFor(agent *model.Agent, checks []model.AcceptanceCheck) error {
+	needsWrite := false
+	for _, c := range checks {
+		if c.Kind == model.CheckArtifactExists || c.Kind == model.CheckArtifactContains {
+			needsWrite = true
+		}
+	}
+	if !needsWrite {
+		return nil
+	}
+	for _, tok := range strings.Split(agent.Tools, ",") {
+		switch strings.ToLower(strings.TrimSpace(tok)) {
+		case "write", "edit":
+			return nil
+		}
+	}
+	return fmt.Errorf("impossible contract: agent %q has no write capability (tools: %q) and can never produce an "+
+		"artifact. Use command checks, or assign an agent that can write files", agent.Name, agent.Tools)
+}
+
 func checkPathOK(p string) error {
 	p = strings.TrimSpace(p)
 	if p == "" {

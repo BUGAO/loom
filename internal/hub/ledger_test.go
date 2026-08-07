@@ -40,11 +40,11 @@ func testSession(t *testing.T, budget model.BudgetConfig) (*RunSession, *fakeExe
 		Pool: []*model.Agent{
 			{Name: "alpha", Description: "a"},
 			{Name: "beta", Description: "b"},
+			{Name: "writer", Description: "w", Tools: "Read,Write"},
 		},
 		Workspace: t.TempDir(),
 		Exec:      exec,
 		OnChange:  func(*model.Run) {},
-		OnEvent:   func(string, string, string) {},
 	})
 	t.Cleanup(rs.Close)
 	return rs, exec
@@ -418,6 +418,10 @@ func TestCancelReleasesWaitingWorker(t *testing.T) {
 	}
 }
 
+// The approval gate is asynchronous state, not a blocked tool call. The
+// regression this pins: delegation must stay refused through the whole
+// propose→decide window — including after propose_plan has already returned —
+// and only flip on an explicit human Approve.
 func TestApprovalGateBlocksDelegate(t *testing.T) {
 	b := openBudget()
 	b.ApprovalPolicy = model.ApprovalInitial
@@ -431,16 +435,60 @@ func TestApprovalGateBlocksDelegate(t *testing.T) {
 		t.Fatalf("the refusal must be identifiable as the approval gate, got: %v", err)
 	}
 
-	go func() {
-		waitForNoT(func() bool { return rs.AwaitingApproval() })
-		rs.Approve()
-	}()
-	if err := rs.Propose(context.Background(), &model.Proposal{Summary: "plan"}); err != nil {
+	if err := rs.Propose(&model.Proposal{Summary: "plan"}); err != nil {
 		t.Fatal(err)
+	}
+	if !rs.AwaitingApproval() {
+		t.Fatal("run should be awaiting a human decision after propose")
+	}
+	// The leak observed in the wild: tasks created while the decision was
+	// still pending. Propose has returned; the gate must still hold.
+	if _, err := rs.Delegate(DelegateRequest{Agent: "alpha", Instruction: "x", Constraints: "none",
+		Acceptance: okChecks(), CreatedBy: RoleCoordinator, Depth: 1}); !errors.Is(err, ErrApprovalPending) {
+		t.Fatalf("delegation between propose and decision must stay gated, got: %v", err)
+	}
+
+	if err := rs.Approve(); err != nil {
+		t.Fatal(err)
+	}
+	if n := rs.TakeNotice(); !strings.Contains(n, "APPROVED") {
+		t.Fatalf("approval must wake the coordinator with a notice, got %q", n)
 	}
 	if _, err := rs.Delegate(DelegateRequest{Agent: "alpha", Instruction: "x", Constraints: "none",
 		Acceptance: okChecks(), CreatedBy: RoleCoordinator, Depth: 1}); err != nil {
 		t.Fatalf("delegation after approval should be allowed: %v", err)
+	}
+}
+
+// Rejection keeps the gate closed and tells the coordinator what to do next;
+// a revised re-propose is legal.
+func TestApprovalRejectionAllowsRepropose(t *testing.T) {
+	b := openBudget()
+	b.ApprovalPolicy = model.ApprovalInitial
+	rs, _ := testSession(t, b)
+
+	if err := rs.Propose(&model.Proposal{Summary: "plan v1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.Reject("wrong direction"); err != nil {
+		t.Fatal(err)
+	}
+	if n := rs.TakeNotice(); !strings.Contains(n, "REJECTED") || !strings.Contains(n, "wrong direction") {
+		t.Fatalf("rejection notice must carry the reason, got %q", n)
+	}
+	if _, err := rs.Delegate(DelegateRequest{Agent: "alpha", Instruction: "x", Constraints: "none",
+		Acceptance: okChecks(), CreatedBy: RoleCoordinator, Depth: 1}); !errors.Is(err, ErrApprovalPending) {
+		t.Fatalf("delegation after rejection must stay gated, got: %v", err)
+	}
+	if err := rs.Propose(&model.Proposal{Summary: "plan v2"}); err != nil {
+		t.Fatalf("re-proposing after rejection should be legal: %v", err)
+	}
+	if err := rs.Approve(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rs.Delegate(DelegateRequest{Agent: "alpha", Instruction: "x", Constraints: "none",
+		Acceptance: okChecks(), CreatedBy: RoleCoordinator, Depth: 1}); err != nil {
+		t.Fatalf("delegation after approved re-propose should pass: %v", err)
 	}
 }
 

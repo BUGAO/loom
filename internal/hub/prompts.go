@@ -18,7 +18,9 @@ import (
 // CoordinatorPrompt is the system prompt for a run's coordinator. It is
 // deliberately state-free: everything that changes between rounds arrives in
 // the round prompt, rebuilt from the ledger each time.
-func CoordinatorPrompt(run *model.Run, wf *model.Workflow, budget model.BudgetConfig, workspace string, pool []*model.Agent) string {
+// outputDir is the already-resolved deliverable folder ("" when unnamed) —
+// resolved by the caller under the session lock, never read raw here.
+func CoordinatorPrompt(run *model.Run, wf *model.Workflow, budget model.BudgetConfig, outputRoot, outputDir string, pool []*model.Agent) string {
 	var b strings.Builder
 	b.WriteString(`You are the coordinator of a loom workflow run. You do not do the work yourself: you decompose the
 goal, delegate to executor agents, follow up, converge, and deliver the final verdict.
@@ -63,8 +65,12 @@ re-scope running tasks via send_message, or delegate anew. Do not silently ignor
   command checks that the engine executes itself when the worker finishes. A task passes only if its
   checks pass — the worker's own report never decides. Write checks that would actually catch a bad
   result, not checks that always pass.
+- Contracts must be FEASIBLE for the assigned agent: artifact checks on an agent without Write/Edit
+  are refused at delegation. You can NEVER waive a contract — telling a worker to "ignore the checks"
+  is a lie the engine will expose. If a contract turns out wrong, fix it with amend_acceptance.
 - Deliverables go in the shared exchange directory. Tell each worker which upstream artifacts to read
-  and what to write.
+  and what to write. Messages are for coordination only: never ask a worker to paste report content
+  into a message, and never accept it as delivery — content belongs in files.
 - Prefer an existing pool agent. Only create one when the goal needs expertise none of them has.
 - Parallelize independent work. Sequence only what genuinely depends on something.
 
@@ -81,6 +87,15 @@ inspect is your only read access to the work, and it is audited. Machine checks 
 inspect is how you catch "correct but off-course" — read at least one substantial deliverable per
 milestone, and always before declaring success (the engine refuses success with zero inspections).
 
+## Facts discipline
+- Your tool list is complete. Never search for additional tools; there are none you may use.
+- When the goal references external paths, repos or facts you cannot see, delegate ONE cheap
+  verification task first (confirm the path, the language, the layout) and fan out only after the
+  facts are confirmed — three workers independently discovering the same wrong path is pure waste.
+- A worker's on-the-ground report OUTRANKS the goal text and your own assumptions. When a worker
+  corrects a fact (path, language, framework), record_note it immediately and relay exactly that to
+  every other task — never restate the goal's unverified version as an answer.
+
 ## Convergence discipline
 - After each round, ask one question: did the last batch move the overall goal forward?
 - If a task has gone two rounds without real progress, CHANGE STRATEGY — different agent, smaller
@@ -95,7 +110,18 @@ cannot be. Attach the final artifact list. If the goal was not met, say precisel
 why — an honest failure is worth more than a summary that papers over a gap.
 `)
 
-	fmt.Fprintf(&b, "\n## Shared exchange directory\n%s\nAll deliverables of this run live here.\n", workspace)
+	b.WriteString("\n## Deliverable folder\n")
+	if outputDir != "" {
+		fmt.Fprintf(&b, "This run's exchange directory is %s — upstream artifacts live there and every deliverable "+
+			"must be written there.\n", outputDir)
+	} else if outputRoot != "" {
+		fmt.Fprintf(&b, "Deliverables land in %s/<name> — FIRST, before delegating, name the folder by topic with "+
+			"name_output (or propose_plan's output_name): a short kebab-case name like \"trading-health-check\". "+
+			"An unnamed run gets an automatic, unreadable name at first dispatch. The resolved path appears in "+
+			"your round prompt; tell every worker to write deliverables to the exchange directory.\n", outputRoot)
+	} else {
+		b.WriteString("Deliverables go to the run's shared exchange directory; its path appears in your round prompt.\n")
+	}
 
 	fmt.Fprintf(&b, `
 ## Budget (enforced by the engine, not by you)
@@ -110,7 +136,9 @@ why — an honest failure is worth more than a summary that papers over a gap.
 
 	if budget.ApprovalPolicy == model.ApprovalInitial {
 		b.WriteString("\n## Approval gate\nThis workflow requires human approval of your initial plan. Call propose_plan " +
-			"BEFORE your first delegate and wait for it to return. Delegations are refused until then.\n")
+			"BEFORE your first delegate, then END YOUR TURN — the decision may take minutes or hours, and it will " +
+			"wake you as a system notice. Delegations are refused until approval; a rejection notice means revise " +
+			"and re-propose, or finish_run as failed.\n")
 	}
 	if budget.AllowPeerHandoff {
 		b.WriteString("\n## Peer handoff\nWorkers may hand sub-tasks to each other directly. You will see those tasks in " +
@@ -143,12 +171,14 @@ why — an honest failure is worth more than a summary that papers over a gap.
 // RoundPrompt is the coordinator's one user turn per round: the goal, its own
 // notes, new user messages, and the current ledger — rebuilt from scratch
 // every time, so its size tracks the task tree, never the number of rounds
-// that came before.
+// that came before. Every read of mutable run state goes through the session's
+// locked accessors: peer handoffs and external A2A submissions mutate the same
+// object while this builds.
 func RoundPrompt(run *model.Run, rs *RunSession, round int, changed, userMsgs []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## Goal\n%s\n", run.Goal)
 	fmt.Fprintf(&b, "\n## Round %d\n", round)
-	if round == 1 && len(run.Tasks) == 0 {
+	if round == 1 && rs.TaskCount() == 0 {
 		b.WriteString("This is the first round: decompose the goal and delegate.\n")
 	} else {
 		b.WriteString("You have no memory of previous rounds beyond your notes and the ledger below.\n")
@@ -156,10 +186,10 @@ func RoundPrompt(run *model.Run, rs *RunSession, round int, changed, userMsgs []
 
 	// A reopened session carries its last verdict: the coordinator must treat
 	// new messages as the next iteration on delivered work, not a fresh start.
-	if run.Coordinator != nil && run.Coordinator.Decision != "" {
+	if decision := rs.CoordinatorDecision(); decision != "" {
 		fmt.Fprintf(&b, "\n## Previous verdict of this session\n%s\n"+
 			"The session has been reopened since. Build on the delivered work in the exchange directory; "+
-			"do not redo what was already accepted.\n", run.Coordinator.Decision)
+			"do not redo what was already accepted.\n", decision)
 	}
 
 	if len(userMsgs) > 0 {
@@ -170,9 +200,9 @@ func RoundPrompt(run *model.Run, rs *RunSession, round int, changed, userMsgs []
 		b.WriteString("Address these this round; your reply text will be shown to the user.\n")
 	}
 
-	if len(run.CoordinatorNotes) > 0 {
+	if notes := rs.Notes(); len(notes) > 0 {
 		b.WriteString("\n## Your notes from previous rounds\n")
-		for _, n := range run.CoordinatorNotes {
+		for _, n := range notes {
 			fmt.Fprintf(&b, "- %s\n", n)
 		}
 	}
@@ -188,6 +218,10 @@ func RoundPrompt(run *model.Run, rs *RunSession, round int, changed, userMsgs []
 	if len(changed) > 0 {
 		fmt.Fprintf(&b, "\n## Settled since your last round\n%s\n", strings.Join(changed, ", "))
 	}
+
+	outDir, named := rs.OutputInfo()
+	fmt.Fprintf(&b, "\n## Exchange directory\n%s%s\n", outDir,
+		map[bool]string{true: "", false: " (unnamed — call name_output before delegating)"}[named])
 
 	bs := rs.BudgetStatus()
 	data, _ := json.Marshal(bs)
@@ -243,6 +277,8 @@ You also have loom coordination tools:
 - report_progress — tell the coordinator where you are on a long task. Does not end your task.
 - ask_coordinator — ask when the task is genuinely ambiguous and a wrong guess would waste the work.
   It blocks until you get an answer. Use it instead of inventing an assumption.
+Messages are for COORDINATION, not delivery: keep them short, and never paste report or artifact
+content into a message — deliverables are files in the exchange directory, nothing else counts.
 `, toolNote)
 	if peerHandoff {
 		b.WriteString("- handoff — give a sub-task to another agent when it is clearly outside your remit.\n" +

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -34,17 +35,20 @@ type Executor interface {
 
 // RunConfig wires one dynamic run.
 type RunConfig struct {
-	Run       *model.Run
-	Workflow  *model.Workflow
-	Pool      []*model.Agent
+	Run      *model.Run
+	Workflow *model.Workflow
+	Pool     []*model.Agent
+	// Workspace is the internal fallback exchange directory; once the run's
+	// output folder is named (by the coordinator or the auto-freeze), the
+	// output folder IS the exchange directory.
 	Workspace string
-	Exec      Executor
+	// OutputRoot is where named output folders live (~/workflow-output).
+	OutputRoot string
+	Exec       Executor
 
 	// OnChange persists and publishes a run snapshot. It is called with the
 	// session lock held, so it must not call back into the RunSession.
 	OnChange func(*model.Run)
-	// OnEvent appends to the run's audit log; same locking contract.
-	OnEvent func(typ, taskID, msg string)
 	// OnCost records a priced unit into the global ledger.
 	OnCost func(store.CostEntry)
 	// SaveAgent persists a coordinator-created agent into the shared pool.
@@ -112,14 +116,23 @@ type RunSession struct {
 
 	ctrl map[string]*taskCtrl
 
-	// approval gate
-	approvalNeeded bool
-	approvalDone   bool
-	approvalCh     chan approvalResult
+	// approval gate. Deliberately channel-free: the human may take minutes or
+	// hours, and a tool call blocked that long gets killed by the MCP client's
+	// timeout — with the approval then lost into a dead channel (observed in a
+	// real run). The gate is plain state; the decision arrives as an injected
+	// notice that wakes the next round.
+	approvalNeeded  bool
+	approvalDone    bool
+	approvalPending bool
+	rejectedReason  string
 
 	// coordinator liveness / stall detection
 	lastTransition time.Time
 	pendingNotice  string
+
+	// outputFrozen pins the exchange directory once the first task has been
+	// dispatched: prompts and contracts reference the path from then on.
+	outputFrozen bool
 
 	// inspections counts the coordinator's audited reads of run deliverables.
 	// finish_run(succeeded) is refused while it is zero and artifacts exist:
@@ -146,11 +159,6 @@ type RunSession struct {
 	cancel   context.CancelFunc
 }
 
-type approvalResult struct {
-	approved bool
-	reason   string
-}
-
 // taskCtrl is the per-task control block: how the hub talks to a running
 // worker without reaching into the engine's goroutine.
 type taskCtrl struct {
@@ -173,8 +181,100 @@ func (rs *RunSession) newTaskCtrl() *taskCtrl {
 // Run returns the live run object. Callers must not mutate it.
 func (rs *RunSession) Run() *model.Run { return rs.run }
 
-// Workspace is the run's shared exchange directory.
-func (rs *RunSession) Workspace() string { return rs.workspace }
+// Workspace is the run's shared exchange directory: the named output folder
+// once one exists, the internal fallback until then.
+func (rs *RunSession) Workspace() string {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.run.OutputDir != "" {
+		return rs.run.OutputDir
+	}
+	return rs.workspace
+}
+
+// outputNameRe is the shape of a deliverable folder name: short, kebab, no
+// path tricks.
+var outputNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
+
+// SetOutputName names the run's deliverable folder under the output root.
+// Refused once frozen (first task dispatched): workers already received the
+// old path in their prompts, and a contract's artifact paths must not move
+// under a running task.
+func (rs *RunSession) SetOutputName(name string) error {
+	name = strings.TrimSpace(name)
+	if !outputNameRe.MatchString(name) {
+		return fmt.Errorf("output name %q is invalid: use a short kebab-case topic name, e.g. \"trading-health-check\"", name)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.outputFrozen {
+		return fmt.Errorf("the output folder is already %s and tasks have been dispatched against it; it cannot be renamed", rs.run.OutputDir)
+	}
+	if rs.cfg.OutputRoot == "" {
+		return fmt.Errorf("no output root is configured for this run")
+	}
+	dir, finalName, err := claimOutputDir(rs.cfg.OutputRoot, name)
+	if err != nil {
+		return err
+	}
+	rs.run.OutputName = finalName
+	rs.run.OutputDir = dir
+	rs.appendEventLocked("info", "", "output folder named: "+dir)
+	rs.notifyLocked()
+	return nil
+}
+
+// claimOutputDir creates root/name, suffixing -2, -3… when the name is taken.
+// The claim is os.Mkdir itself — atomic at the filesystem, so two sessions (or
+// two loom processes) racing for the same topic cannot both win: the loser
+// sees EEXIST and moves to the next suffix.
+func claimOutputDir(root, name string) (dir, finalName string, err error) {
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return "", "", err
+	}
+	for i := 0; i < 50; i++ {
+		candidate := name
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%d", name, i+1)
+		}
+		dir := filepath.Join(root, candidate)
+		switch err := os.Mkdir(dir, 0o755); {
+		case err == nil:
+			return dir, candidate, nil
+		case errors.Is(err, os.ErrExist):
+			continue // taken; try the next suffix
+		default:
+			return "", "", err
+		}
+	}
+	return "", "", fmt.Errorf("could not find a free output folder name for %q", name)
+}
+
+// freezeOutputLocked pins the exchange directory before the first dispatch,
+// auto-naming when the coordinator never did. Must hold rs.mu.
+func (rs *RunSession) freezeOutputLocked() {
+	if rs.outputFrozen {
+		return
+	}
+	if rs.run.OutputDir == "" && rs.cfg.OutputRoot != "" {
+		auto := fmt.Sprintf("%s-%s", time.Now().Format("0102"), shortRunID(rs.run.ID))
+		if dir, finalName, err := claimOutputDir(rs.cfg.OutputRoot, auto); err == nil {
+			rs.run.OutputName = finalName
+			rs.run.OutputDir = dir
+			rs.appendEventLocked("info", "", "output folder auto-named: "+dir)
+		} else {
+			rs.appendEventLocked("error", "", "output folder could not be created ("+err.Error()+"); using the internal exchange directory")
+		}
+	}
+	rs.outputFrozen = true
+}
+
+func shortRunID(id string) string {
+	if len(id) > 8 {
+		return id[len(id)-8:]
+	}
+	return id
+}
 
 // Budget is the effective budget for this run.
 func (rs *RunSession) Budget() model.BudgetConfig { return rs.budget }
@@ -202,13 +302,6 @@ func (rs *RunSession) Close() {
 	for _, t := range rs.run.Tasks {
 		if !model.TaskTerminal(t.Status) {
 			toCancel = append(toCancel, t.ID)
-		}
-	}
-	// Unblock anything parked in the approval gate.
-	if rs.approvalCh != nil {
-		select {
-		case rs.approvalCh <- approvalResult{approved: false, reason: "run ended"}:
-		default:
 		}
 	}
 	rs.mu.Unlock()
@@ -255,9 +348,61 @@ func (rs *RunSession) Seq() uint64 {
 	return rs.seq
 }
 
+// event appends to the run's audit log under the session lock and republishes.
+// The session lock is the ONLY lock guarding a dynamic run's state — events,
+// tasks, chat, coordinator card, costs — so every mutation and every marshal
+// happens under it, and nothing can tear.
 func (rs *RunSession) event(typ, taskID, msg string) {
-	if rs.cfg.OnEvent != nil {
-		rs.cfg.OnEvent(typ, taskID, msg)
+	rs.mu.Lock()
+	rs.appendEventLocked(typ, taskID, msg)
+	rs.mu.Unlock()
+}
+
+func (rs *RunSession) appendEventLocked(typ, taskID, msg string) {
+	rs.run.Events = append(rs.run.Events, model.Event{Ts: time.Now(), Type: typ, Node: taskID, Msg: msg})
+	if rs.cfg.OnChange != nil {
+		rs.cfg.OnChange(rs.run)
+	}
+}
+
+// AppendEvent is the engine's path into the audit log while the run is live.
+func (rs *RunSession) AppendEvent(typ, taskID, msg string) {
+	rs.event(typ, taskID, msg)
+}
+
+// UpdateCoordinator mutates the coordinator card under the session lock.
+func (rs *RunSession) UpdateCoordinator(fn func(*model.CoordinatorState)) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.run.Coordinator != nil {
+		fn(rs.run.Coordinator)
+		if rs.cfg.OnChange != nil {
+			rs.cfg.OnChange(rs.run)
+		}
+	}
+}
+
+// RecordCoordinatorCost prices one coordinator round into the run and the
+// global cost ledger — same lock as every other run mutation.
+func (rs *RunSession) RecordCoordinatorCost(agent, modelID string, usage model.TokenUsage, cost float64, durMs int64) {
+	rs.mu.Lock()
+	if c := rs.run.Coordinator; c != nil {
+		c.CostUSD += cost
+		c.Usage.Add(usage)
+		c.DurationMs += durMs
+	}
+	rs.run.CostUSD += cost
+	rs.run.Usage.Add(usage)
+	if rs.cfg.OnChange != nil {
+		rs.cfg.OnChange(rs.run)
+	}
+	rs.mu.Unlock()
+
+	if rs.cfg.OnCost != nil && (cost != 0 || !usage.Empty()) {
+		rs.cfg.OnCost(store.CostEntry{
+			WorkflowID: rs.run.WorkflowID, RunID: rs.run.ID, Unit: "coordinator", UnitID: "coordinator",
+			Agent: agent, Model: modelID, Usage: usage, CostUSD: cost,
+		})
 	}
 }
 
@@ -367,6 +512,10 @@ func (rs *RunSession) Delegate(req DelegateRequest) (*model.Task, error) {
 			rs.mu.Unlock()
 			return nil, err
 		}
+		if err := ChecksFeasibleFor(agent, req.Acceptance); err != nil {
+			rs.mu.Unlock()
+			return nil, err
+		}
 	}
 	if agent.Independent && strings.TrimSpace(req.ContextHint) != "" {
 		rs.mu.Unlock()
@@ -467,6 +616,7 @@ func (rs *RunSession) schedule() {
 		rs.mu.Unlock()
 		return
 	}
+	rs.freezeOutputLocked() // the first dispatch pins the exchange directory
 	occupied := 0
 	var queue []string
 	for _, id := range rs.run.TaskOrder {
@@ -895,6 +1045,133 @@ func (rs *RunSession) viewLocked(t *model.Task) TaskView {
 	return v
 }
 
+// AmendAcceptance replaces an in-flight task's acceptance contract. The
+// coordinator can never waive a contract — but a contract that was wrong at
+// delegation time (the trap: artifact checks on a read-only agent) can be
+// corrected, audited, with the worker told at its next turn boundary.
+func (rs *RunSession) AmendAcceptance(taskID string, checks []model.AcceptanceCheck) error {
+	if err := ValidateChecks(checks); err != nil {
+		return err
+	}
+	rs.mu.Lock()
+	t := rs.run.Tasks[taskID]
+	if t == nil {
+		rs.mu.Unlock()
+		return fmt.Errorf("unknown task %s", taskID)
+	}
+	if model.TaskTerminal(t.Status) {
+		st := t.Status
+		rs.mu.Unlock()
+		return fmt.Errorf("task %s is already %s; its contract has been judged and cannot be amended", taskID, st)
+	}
+	agent := rs.pool[t.Agent]
+	if agent != nil {
+		if err := ChecksFeasibleFor(agent, checks); err != nil {
+			rs.mu.Unlock()
+			return err
+		}
+	} else {
+		// Unknown agent (e.g. a resumed run whose creator wasn't re-pooled):
+		// feasibility can't be verified, so artifact checks are refused rather
+		// than risked — the trap this feature exists to close.
+		for _, c := range checks {
+			if c.Kind == model.CheckArtifactExists || c.Kind == model.CheckArtifactContains {
+				rs.mu.Unlock()
+				return fmt.Errorf("agent %q is not in this run's pool, so artifact-check feasibility cannot be verified; use command checks", t.Agent)
+			}
+		}
+	}
+	t.Acceptance = checks
+	note := "The acceptance contract of your task was AMENDED. Your work now passes only if the new checks pass:\n" +
+		describeChecks(checks)
+	t.Messages = append(t.Messages, model.TaskMessage{
+		Ts: time.Now(), From: RoleCoordinator, Role: model.MsgFollowup, Text: note,
+	})
+	if ctrl := rs.ctrl[taskID]; ctrl != nil {
+		ctrl.inbox = append(ctrl.inbox, note) // delivered at the next turn boundary
+	}
+	rs.appendEventLocked("acceptance_amended", taskID, fmt.Sprintf("contract amended to %d check(s)", len(checks)))
+	rs.notifyLocked()
+	rs.mu.Unlock()
+	return nil
+}
+
+// describeChecks renders a contract for human/worker consumption.
+func describeChecks(checks []model.AcceptanceCheck) string {
+	var b strings.Builder
+	for _, c := range checks {
+		switch c.Kind {
+		case model.CheckArtifactExists:
+			fmt.Fprintf(&b, "- artifact exists: %s\n", c.Path)
+		case model.CheckArtifactContains:
+			fmt.Fprintf(&b, "- artifact %s matches pattern: %s\n", c.Path, c.Pattern)
+		case model.CheckCommand:
+			fmt.Fprintf(&b, "- command exits 0: %s\n", c.Command)
+		}
+	}
+	return b.String()
+}
+
+// OutputInfo reports the current exchange directory and whether it carries a
+// coordinator-chosen name — the locked read the round prompt builds from.
+func (rs *RunSession) OutputInfo() (dir string, named bool) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.run.OutputDir != "" {
+		return rs.run.OutputDir, true
+	}
+	return rs.workspace, false
+}
+
+// Notes returns a copy of the coordinator's persisted notes.
+func (rs *RunSession) Notes() []string {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return append([]string(nil), rs.run.CoordinatorNotes...)
+}
+
+// TaskCount reports how many tasks the ledger holds.
+func (rs *RunSession) TaskCount() int {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return len(rs.run.Tasks)
+}
+
+// CoordinatorDecision returns the last recorded verdict summary, if any.
+func (rs *RunSession) CoordinatorDecision() string {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.run.Coordinator == nil {
+		return ""
+	}
+	return rs.run.Coordinator.Decision
+}
+
+// AcceptanceOf reads a task's current acceptance contract under the session
+// lock. The engine calls it at completion time rather than using a stale
+// snapshot, so an amended contract is the one that judges the work.
+func (rs *RunSession) AcceptanceOf(taskID string) []model.AcceptanceCheck {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	t := rs.run.Tasks[taskID]
+	if t == nil {
+		return nil
+	}
+	return append([]model.AcceptanceCheck(nil), t.Acceptance...)
+}
+
+// TaskSnapshot returns a copy of one task under the session lock — the safe
+// way for engine goroutines to read task fields while the ledger is live.
+func (rs *RunSession) TaskSnapshot(taskID string) (model.Task, bool) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	t := rs.run.Tasks[taskID]
+	if t == nil {
+		return model.Task{}, false
+	}
+	return *t, true
+}
+
 // View returns the summary of one task.
 func (rs *RunSession) View(taskID string) (TaskView, bool) {
 	rs.mu.Lock()
@@ -1048,6 +1325,15 @@ func (rs *RunSession) takeNoticeLocked() string {
 	return n
 }
 
+// joinNotice accumulates notices instead of overwriting: a stall warning must
+// never erase an approval decision that landed a moment earlier.
+func joinNotice(old, add string) string {
+	if old == "" {
+		return add
+	}
+	return old + "\n\n" + add
+}
+
 // peekNotice reports a pending notice without consuming it (tests only).
 func (rs *RunSession) peekNotice() string {
 	rs.mu.Lock()
@@ -1094,10 +1380,10 @@ func (rs *RunSession) watchStall(ctx context.Context) {
 			stalled := idle > time.Duration(rs.budget.StallSec)*time.Second && last.After(warned)
 			if stalled {
 				warned = time.Now()
-				rs.pendingNotice = fmt.Sprintf(
+				rs.pendingNotice = joinNotice(rs.pendingNotice, fmt.Sprintf(
 					"SYSTEM: no task has changed state for %s. Assess progress now: either report where each "+
 						"in-flight task stands and change strategy, or call finish_run with what has been achieved.",
-					idle.Round(time.Second))
+					idle.Round(time.Second)))
 			}
 			rs.mu.Unlock()
 			if stalled {
@@ -1112,9 +1398,11 @@ func (rs *RunSession) watchStall(ctx context.Context) {
 
 // ---- approval gate ----
 
-// Propose parks the run at the approval gate with the coordinator's initial
-// plan and blocks until a human decides.
-func (rs *RunSession) Propose(ctx context.Context, p *model.Proposal) error {
+// Propose submits the coordinator's initial plan for human approval and
+// returns immediately: the coordinator ends its round, and the human's
+// decision arrives as a notice that wakes the next one. Re-proposing after a
+// rejection is legal — that is what "revise the plan" means.
+func (rs *RunSession) Propose(p *model.Proposal) error {
 	rs.mu.Lock()
 	if rs.approvalDone {
 		rs.mu.Unlock()
@@ -1122,68 +1410,57 @@ func (rs *RunSession) Propose(ctx context.Context, p *model.Proposal) error {
 	}
 	rs.run.Proposal = p
 	rs.run.Status = model.RunAwaitingApproval
+	rs.approvalPending = true
+	rs.rejectedReason = ""
 	if rs.run.Coordinator != nil {
 		rs.run.Coordinator.Status = "awaiting_approval"
 	}
-	ch := make(chan approvalResult, 1)
-	rs.approvalCh = ch
+	rs.appendEventLocked("run_status", "", fmt.Sprintf("awaiting approval of initial plan (%d tasks)", len(p.Tasks)))
 	rs.notifyLocked()
 	rs.mu.Unlock()
-
-	rs.event("run_status", "", fmt.Sprintf("awaiting approval of initial plan (%d tasks)", len(p.Tasks)))
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case res := <-ch:
-		rs.mu.Lock()
-		rs.approvalCh = nil
-		if res.approved {
-			rs.approvalDone = true
-			rs.run.PlanApproved = true // persisted, so a resumed run never re-asks
-			rs.run.Status = model.RunRunning
-			if rs.run.Coordinator != nil {
-				rs.run.Coordinator.Status = "working"
-			}
-		}
-		rs.notifyLocked()
-		rs.mu.Unlock()
-		if !res.approved {
-			rs.event("run_status", "", "plan rejected: "+res.reason)
-			return fmt.Errorf("the plan was rejected: %s. Stop and call finish_run with status failed", res.reason)
-		}
-		rs.event("info", "", "initial plan approved")
-		return nil
-	}
-}
-
-// Approve releases the approval gate.
-func (rs *RunSession) Approve() error {
-	rs.mu.Lock()
-	ch := rs.approvalCh
-	rs.mu.Unlock()
-	if ch == nil {
-		return fmt.Errorf("run is not awaiting approval")
-	}
-	select {
-	case ch <- approvalResult{approved: true}:
-	default:
-	}
 	return nil
 }
 
-// Reject refuses the proposed plan.
-func (rs *RunSession) Reject(reason string) error {
+// Approve releases the approval gate and wakes the coordinator with the news.
+func (rs *RunSession) Approve() error {
 	rs.mu.Lock()
-	ch := rs.approvalCh
-	rs.mu.Unlock()
-	if ch == nil {
+	if !rs.approvalPending {
+		rs.mu.Unlock()
 		return fmt.Errorf("run is not awaiting approval")
 	}
-	select {
-	case ch <- approvalResult{approved: false, reason: reason}:
-	default:
+	rs.approvalPending = false
+	rs.approvalDone = true
+	rs.run.PlanApproved = true // persisted, so a resumed run never re-asks
+	rs.run.Status = model.RunRunning
+	if rs.run.Coordinator != nil {
+		rs.run.Coordinator.Status = "working"
 	}
+	rs.pendingNotice = joinNotice(rs.pendingNotice, "SYSTEM: the human APPROVED your plan. Delegate the proposed tasks now.")
+	rs.appendEventLocked("info", "", "initial plan approved")
+	rs.notifyLocked()
+	rs.mu.Unlock()
+	return nil
+}
+
+// Reject refuses the proposed plan. Delegation stays gated; the coordinator is
+// woken to either revise and re-propose, or finish the run as failed.
+func (rs *RunSession) Reject(reason string) error {
+	rs.mu.Lock()
+	if !rs.approvalPending {
+		rs.mu.Unlock()
+		return fmt.Errorf("run is not awaiting approval")
+	}
+	rs.approvalPending = false
+	rs.rejectedReason = reason
+	rs.run.Status = model.RunRunning
+	if rs.run.Coordinator != nil {
+		rs.run.Coordinator.Status = "working"
+	}
+	rs.pendingNotice = joinNotice(rs.pendingNotice, "SYSTEM: the human REJECTED your plan: "+reason+
+		". Either revise it and call propose_plan again, or call finish_run with status failed.")
+	rs.appendEventLocked("run_status", "", "plan rejected: "+reason)
+	rs.notifyLocked()
+	rs.mu.Unlock()
 	return nil
 }
 
@@ -1191,7 +1468,7 @@ func (rs *RunSession) Reject(reason string) error {
 func (rs *RunSession) AwaitingApproval() bool {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	return rs.approvalCh != nil
+	return rs.approvalPending
 }
 
 // ---- coordinator round support ----
@@ -1206,7 +1483,7 @@ func (rs *RunSession) Inspect(path string) (string, error) {
 	if err := checkPathOK(path); err != nil {
 		return "", err
 	}
-	data, err := os.ReadFile(filepath.Join(rs.workspace, path))
+	data, err := os.ReadFile(filepath.Join(rs.Workspace(), path))
 	if err != nil {
 		return "", fmt.Errorf("cannot read %q: %v. Inspect paths are relative to the exchange directory; "+
 			"check the artifact list of the task that claimed to produce it", path, err)
@@ -1307,7 +1584,7 @@ func (rs *RunSession) CoordinatorReply(text string) {
 // give a quiet round one prompt correction before parking the loop.
 func (rs *RunSession) InjectNotice(text string) {
 	rs.mu.Lock()
-	rs.pendingNotice = text
+	rs.pendingNotice = joinNotice(rs.pendingNotice, text)
 	rs.notifyLocked()
 	rs.mu.Unlock()
 }
@@ -1428,9 +1705,15 @@ func (rs *RunSession) BudgetStatus() BudgetStatus {
 	}
 	state := "not required"
 	if rs.approvalNeeded {
-		state = "pending"
-		if rs.approvalDone {
+		switch {
+		case rs.approvalDone:
 			state = "approved"
+		case rs.approvalPending:
+			state = "awaiting_decision"
+		case rs.rejectedReason != "":
+			state = "rejected"
+		default:
+			state = "pending" // propose_plan has not been called yet
 		}
 	}
 	return BudgetStatus{

@@ -106,7 +106,10 @@ func (h *Hub) OpenRun(ctx context.Context, cfg RunConfig) *RunSession {
 	if rs.run.Tasks == nil {
 		rs.run.Tasks = map[string]*model.Task{}
 	}
-	// Resume: tasks carried over from a previous process need control blocks.
+	// Resume: tasks carried over from a previous process need control blocks,
+	// and a session that already dispatched work keeps its exchange directory
+	// — named or not — rather than moving deliverables mid-conversation.
+	rs.outputFrozen = cfg.Run.OutputDir != "" || len(cfg.Run.Tasks) > 0
 	for id, t := range rs.run.Tasks {
 		if !model.TaskTerminal(t.Status) {
 			rs.ctrl[id] = rs.newTaskCtrl()

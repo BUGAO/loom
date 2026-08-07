@@ -76,9 +76,23 @@ func defaultDataDir() string {
 	return "./data"
 }
 
+// defaultOutputRoot is where dynamic runs deliver: a stable, user-visible
+// folder, so artifacts never hide inside loom's internal run directories.
+func defaultOutputRoot() string {
+	if d := os.Getenv("LOOM_OUTPUT"); d != "" {
+		return d
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "./workflow-output"
+	}
+	return filepath.Join(home, "workflow-output")
+}
+
 func main() {
 	addr := flag.String("addr", ":7333", "listen address (all interfaces by default; use 127.0.0.1:7333 for loopback only)")
 	dataDir := flag.String("data", defaultDataDir(), "data directory (env: LOOM_DATA)")
+	outputRoot := flag.String("output", defaultOutputRoot(), "deliverable folder root for dynamic runs (env: LOOM_OUTPUT)")
 	dryDefault := flag.Bool("dry-run", false, "pre-check the dry-run switch for new runs (zero-cost demo mode)")
 	backendFlag := flag.String("backend", "", "deprecated: 'mock' means -dry-run; other values are ignored (how an agent runs is the agent's runtime field)")
 	acpCmd := flag.String("acp-cmd", "", "ACP agent command (default: autodetect claude-code-acp; env: LOOM_ACP_CMD)")
@@ -119,6 +133,7 @@ func main() {
 	broker := engine.NewBroker()
 	orchestration := hub.New(baseURL(*addr), st.ListAgents)
 	eng := engine.New(st, backends, broker, orchestration)
+	eng.SetOutputRoot(*outputRoot)
 	eng.RecoverInterrupted()
 
 	srv := server.New(st, eng, broker, orchestration.Handler(), *dryDefault)

@@ -11,6 +11,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
+
+	acp "github.com/coder/acp-go-sdk"
 )
 
 var (
@@ -152,5 +155,157 @@ func TestOpenWritesToolJail(t *testing.T) {
 	}
 	if !strings.Contains(deny, "Task") || !strings.Contains(deny, "Bash") {
 		t.Fatalf("jail must deny Task and Bash: %s", deny)
+	}
+}
+
+// ---- terminal support (the channel Bash actually rides on) ----
+
+func termClient(tools string) *acpClient {
+	return &acpClient{allow: allowedFn(tools)}
+}
+
+func TestTerminalRunsCommandToExit(t *testing.T) {
+	c := termClient("Bash")
+	res, err := c.CreateTerminal(context.Background(), acp.CreateTerminalRequest{
+		Command: "sh", Args: []string{"-c", "echo hello-loom; exit 0"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait, err := c.WaitForTerminalExit(context.Background(), acp.WaitForTerminalExitRequest{TerminalId: res.TerminalId})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wait.ExitCode == nil || *wait.ExitCode != 0 {
+		t.Fatalf("want exit 0, got %+v", wait)
+	}
+	out, err := c.TerminalOutput(context.Background(), acp.TerminalOutputRequest{TerminalId: res.TerminalId})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Output, "hello-loom") {
+		t.Fatalf("output missing: %q", out.Output)
+	}
+	if out.ExitStatus == nil || out.ExitStatus.ExitCode == nil || *out.ExitStatus.ExitCode != 0 {
+		t.Fatalf("output should carry the exit status: %+v", out.ExitStatus)
+	}
+	if _, err := c.ReleaseTerminal(context.Background(), acp.ReleaseTerminalRequest{TerminalId: res.TerminalId}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.TerminalOutput(context.Background(), acp.TerminalOutputRequest{TerminalId: res.TerminalId}); err == nil {
+		t.Fatal("released terminal should be unknown")
+	}
+}
+
+func TestTerminalReportsNonZeroExit(t *testing.T) {
+	c := termClient("Bash")
+	res, err := c.CreateTerminal(context.Background(), acp.CreateTerminalRequest{
+		Command: "sh", Args: []string{"-c", "echo boom >&2; exit 3"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait, _ := c.WaitForTerminalExit(context.Background(), acp.WaitForTerminalExitRequest{TerminalId: res.TerminalId})
+	if wait.ExitCode == nil || *wait.ExitCode != 3 {
+		t.Fatalf("want exit 3, got %+v", wait)
+	}
+	out, _ := c.TerminalOutput(context.Background(), acp.TerminalOutputRequest{TerminalId: res.TerminalId})
+	if !strings.Contains(out.Output, "boom") {
+		t.Fatalf("stderr should be captured: %q", out.Output)
+	}
+}
+
+func TestTerminalKill(t *testing.T) {
+	c := termClient("Bash")
+	res, err := c.CreateTerminal(context.Background(), acp.CreateTerminalRequest{
+		Command: "sh", Args: []string{"-c", "sleep 30"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.KillTerminal(context.Background(), acp.KillTerminalRequest{TerminalId: res.TerminalId}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		c.WaitForTerminalExit(context.Background(), acp.WaitForTerminalExitRequest{TerminalId: res.TerminalId})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("killed terminal never reported exit")
+	}
+}
+
+func TestTerminalOutputBounded(t *testing.T) {
+	c := termClient("Bash")
+	limit := 200
+	res, err := c.CreateTerminal(context.Background(), acp.CreateTerminalRequest{
+		Command: "sh", Args: []string{"-c", "i=0; while [ $i -lt 200 ]; do echo 0123456789; i=$((i+1)); done"},
+		OutputByteLimit: &limit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.WaitForTerminalExit(context.Background(), acp.WaitForTerminalExitRequest{TerminalId: res.TerminalId})
+	out, _ := c.TerminalOutput(context.Background(), acp.TerminalOutputRequest{TerminalId: res.TerminalId})
+	if len(out.Output) > limit {
+		t.Fatalf("output exceeds the byte limit: %d > %d", len(out.Output), limit)
+	}
+	if !out.Truncated {
+		t.Fatal("truncation must be reported")
+	}
+}
+
+// A session whose allowlist grants no shell gets no terminal — the second
+// line of defense behind the settings jail.
+func TestTerminalRefusedWithoutBash(t *testing.T) {
+	c := termClient("") // the coordinator's allowlist
+	if _, err := c.CreateTerminal(context.Background(), acp.CreateTerminalRequest{
+		Command: "sh", Args: []string{"-c", "true"},
+	}); err == nil {
+		t.Fatal("terminal without Bash in the allowlist must be refused")
+	}
+}
+
+// Truncation must cut on a UTF-8 boundary: the retained output stays a valid
+// string even when the cut lands mid-rune.
+func TestTerminalTruncationKeepsValidUTF8(t *testing.T) {
+	c := termClient("Bash")
+	limit := 100
+	res, err := c.CreateTerminal(context.Background(), acp.CreateTerminalRequest{
+		Command: "sh", Args: []string{"-c", `i=0; while [ $i -lt 50 ]; do printf '中文字符串测试'; i=$((i+1)); done`},
+		OutputByteLimit: &limit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.WaitForTerminalExit(context.Background(), acp.WaitForTerminalExitRequest{TerminalId: res.TerminalId})
+	out, _ := c.TerminalOutput(context.Background(), acp.TerminalOutputRequest{TerminalId: res.TerminalId})
+	if !out.Truncated {
+		t.Fatal("truncation must be reported")
+	}
+	if !utf8.ValidString(out.Output) {
+		t.Fatalf("truncated output is not valid UTF-8: %q", out.Output[:20])
+	}
+	if len(out.Output) > limit {
+		t.Fatalf("output exceeds limit: %d", len(out.Output))
+	}
+}
+
+// A session without a requested limit still gets a bounded buffer.
+func TestTerminalDefaultOutputBound(t *testing.T) {
+	c := termClient("Bash")
+	res, err := c.CreateTerminal(context.Background(), acp.CreateTerminalRequest{
+		Command: "sh", Args: []string{"-c", "true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.WaitForTerminalExit(context.Background(), acp.WaitForTerminalExitRequest{TerminalId: res.TerminalId})
+	tp := c.terminal(res.TerminalId)
+	if tp == nil || tp.limit != defaultTermOutputLimit {
+		t.Fatalf("default output bound not applied: %+v", tp)
 	}
 }

@@ -124,6 +124,10 @@ stateDiagram-v2
 worker 信封里的 `"status":"ok"` 只是**声明**;引擎在 worker 收尾后亲自执行验收检查,全过才 completed,
 任一失败则任务 failed 并把检查输出记为证据。worker 从机制上无权判定自己通过。
 
+契约必须**可行**:artifact 类检查要求目标 agent 具备 Write/Edit,否则派单即拒(只读 agent 永远写不出产物)。
+契约**不可豁免、但可修约**:`amend_acceptance` 可替换在途任务的契约(同样校验、不允许空契约、入审计,
+worker 下一轮收到通知),引擎按修订后的契约判定。
+
 **失败类型与返工路由(Go 硬执行)**
 
 失败信封必须带 `failure_kind`:`spec-unclear` | `blocked` | `missing-dependency` | `conflict`(缺失记 `unspecified`)。
@@ -141,7 +145,7 @@ worker 信封里的 `"status":"ok"` 只是**声明**;引擎在 worker 收尾后�
 | 单任务返工 `max_reworks_per_task` | 拒绝再次 `retry_of`,强制改计划或诚实收尾 |
 | 单任务超时 / 整体墙钟 | 会话 cancel;整体墙钟是 DAG 无环性消失后**唯一**的终止兜底 |
 | 停滞检测 `stall_sec` | 打 `stall_warning` 事件 + 把系统提示挂到下一次工具返回值上;若 coordinator 正卡在 await 则让它提前返回 |
-| 审批点 `approval_policy=initial` | 首次 delegate 前必须先 `propose_plan`,否则一律拒绝;放行持久化,恢复运行不再重复审批 |
+| 审批点 `approval_policy=initial` | 首次 delegate 前必须先 `propose_plan`(**异步**:提交即返回、结束回合,人工决定以 notice 唤醒下一轮;拒绝可修订重提);放行持久化,恢复运行不再重复审批 |
 | 验收实读门槛 | 有产出的 run,coordinator 零 `inspect` 就 `finish_run(succeeded)` 会被硬拒 |
 
 **coordinator 按轮驱动(无状态决策),同时是用户的对话界面**
@@ -174,6 +178,17 @@ coordinator 的会话没有任何文件工具:它读产物的唯一通道是 hub
 Agent 可标记 `independent`(种子池的 reviewer 即是):对它派单时 `context_hint` 被机制拒绝,
 static 模式的节点 prompt 只给它上游**产物路径**、不给上游自述摘要——评审者的价值来自未被作者叙述污染的新鲜视角,
 这不能靠提示词自觉,只能靠输入侧裁剪。
+
+**产物目录:`~/workflow-output/<主题名>/`**
+
+dynamic run 的交换目录本体就在输出根下(`-output` flag / `LOOM_OUTPUT`,默认 `~/workflow-output`),
+产物外部实时可见。短名由 main agent 按主题起:`name_output` 工具或 `propose_plan.output_name`
+(kebab-case ≤40 字符,重名自动 `-2` 后缀);**首个任务派发时冻结**,没起名自动兜底 `MMDD-<runid短>`。
+删除会话不删产物目录。static 模式维持内部交换目录。
+
+**Bash 走真实 terminal**:loom 的 ACP client 实现了 terminal capability(claude-code-acp 用它执行 Bash)——
+每个 terminal 一个真实 OS 进程、有界输出缓冲、诚实退出码,会话结束统一收割;白名单无 Bash 的会话在
+CreateTerminal 即拒(jail 之外的第二道)。
 
 ## 执行方式:runtime 与 dry-run
 

@@ -45,9 +45,9 @@ finishing; never claim success you have not seen pass. List every file you creat
 	},
 	{
 		Name:        "reviewer",
-		Description: "独立评审:仅凭产物与需求评审,产出按严重度排序的问题清单。只读,不受作者叙述影响。",
+		Description: "独立评审:仅凭产物与需求评审,产出按严重度排序的问题清单。只读(可自行发现文件),不受作者叙述影响。",
 		Model:       "claude-opus-5",
-		Tools:       "Read",
+		Tools:       "Read,Grep,Glob",
 		MaxTurns:    20,
 		Independent: true,
 		SystemPrompt: `You are an independent reviewer with fresh eyes. You receive ONLY the requirement, the

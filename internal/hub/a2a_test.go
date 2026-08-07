@@ -40,7 +40,6 @@ func a2aSetup(t *testing.T) (*Hub, *RunSession, *httptest.Server, *fakeExec) {
 		Workspace: t.TempDir(),
 		Exec:      exec,
 		OnChange:  func(*model.Run) {},
-		OnEvent:   func(string, string, string) {},
 	})
 	t.Cleanup(rs.Close)
 	return h, rs, srv, exec
@@ -212,7 +211,7 @@ func TestExternalMessageObeysBudget(t *testing.T) {
 	rs := h.OpenRun(context.Background(), RunConfig{
 		Run: run, Workflow: &model.Workflow{Mode: model.ModeDynamic, Budget: &budget},
 		Pool: agents, Workspace: t.TempDir(), Exec: newFakeExec(),
-		OnChange: func(*model.Run) {}, OnEvent: func(string, string, string) {},
+		OnChange: func(*model.Run) {},
 	})
 	defer rs.Close()
 

@@ -130,7 +130,12 @@ type proposePlanIn struct {
 		Title string `json:"title"`
 		Why   string `json:"why,omitempty"`
 	} `json:"tasks"`
-	Agents []createAgentIn `json:"agents,omitempty" jsonschema:"new agents you intend to create, if any"`
+	Agents     []createAgentIn `json:"agents,omitempty" jsonschema:"new agents you intend to create, if any"`
+	OutputName string          `json:"output_name,omitempty" jsonschema:"short kebab-case topic name for the deliverable folder under the output root, e.g. trading-health-check"`
+}
+
+type nameOutputIn struct {
+	Name string `json:"name" jsonschema:"short kebab-case topic name for the deliverable folder, e.g. trading-health-check"`
 }
 
 type finishRunIn struct {
@@ -141,6 +146,11 @@ type finishRunIn struct {
 
 type inspectIn struct {
 	Path string `json:"path" jsonschema:"file path relative to the exchange directory"`
+}
+
+type amendAcceptanceIn struct {
+	TaskID     string              `json:"task_id"`
+	Acceptance []acceptanceCheckIn `json:"acceptance" jsonschema:"the corrected machine-checkable criteria; at least one — a contract cannot be waived"`
 }
 
 type recordNoteIn struct {
@@ -168,7 +178,8 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "propose_plan",
 		Description: "Submit your initial plan for human approval. Required before the first delegate when this " +
-			"workflow gates on approval. Blocks until a human approves or rejects.",
+			"workflow gates on approval. Returns immediately: END YOUR TURN after calling it — you will be " +
+			"woken with the human's decision.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in proposePlanIn) (*mcp.CallToolResult, any, error) {
 		activity("propose_plan")
 		p := &model.Proposal{Summary: in.Summary}
@@ -181,10 +192,27 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 				Tools: a.Tools, MaxTurns: a.MaxTurns, SystemPrompt: a.SystemPrompt,
 			})
 		}
-		if err := rs.Propose(ctx, p); err != nil {
+		if in.OutputName != "" {
+			if err := rs.SetOutputName(in.OutputName); err != nil {
+				return toolErr("%v", err), nil, nil
+			}
+		}
+		if err := rs.Propose(p); err != nil {
 			return toolErr("%v", err), nil, nil
 		}
-		return okf(rs, "Plan approved. You may now delegate."), nil, nil
+		return okf(rs, "Plan submitted for human approval. End your turn now — you will be woken when the human decides."), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "name_output",
+		Description: "Name this run's deliverable folder under the output root, by topic (short kebab-case). Do this " +
+			"BEFORE delegating — the name freezes at the first dispatch, and an unnamed run gets an automatic one.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in nameOutputIn) (*mcp.CallToolResult, any, error) {
+		activity("name_output " + in.Name)
+		if err := rs.SetOutputName(in.Name); err != nil {
+			return toolErr("%v", err), nil, nil
+		}
+		return okf(rs, "Deliverable folder: %s — every artifact of this run lands there.", rs.Workspace()), nil, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -269,6 +297,19 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 			return toolErr("%v", err), nil, nil
 		}
 		return okf(rs, "Agent %q created and added to the pool. You can delegate to it now.", a.Name), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "amend_acceptance",
+		Description: "Replace an in-flight task's acceptance contract when the original was wrong (e.g. it demanded " +
+			"an artifact from an agent that cannot write). You can NEVER waive acceptance — only correct it; the " +
+			"engine still executes the checks itself. The worker is notified at its next turn.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in amendAcceptanceIn) (*mcp.CallToolResult, any, error) {
+		activity("amend_acceptance " + in.TaskID)
+		if err := rs.AmendAcceptance(in.TaskID, toChecks(in.Acceptance)); err != nil {
+			return toolErr("%v", err), nil, nil
+		}
+		return okf(rs, "Contract of %s amended; the engine will judge the task by the new checks.", in.TaskID), nil, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{

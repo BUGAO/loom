@@ -188,8 +188,15 @@ func (s *mockSession) coordinate(ctx context.Context, goal string, call callFn, 
 	}
 	agent := s.pickAgent(ctx)
 
+	// The approval gate is asynchronous: propose ends the round; the human's
+	// decision wakes the next one. Each round re-reads the gate state, exactly
+	// as a real coordinator is instructed to.
 	progress, _ := call("progress", nil)
-	if strings.Contains(progress, `"approval_state":"pending"`) || strings.Contains(progress, `"approval_state": "pending"`) {
+	stateOf := func(s, name string) bool {
+		return strings.Contains(s, `"approval_state":"`+name+`"`) || strings.Contains(s, `"approval_state": "`+name+`"`)
+	}
+	switch {
+	case stateOf(progress, "pending"):
 		if _, err := call("propose_plan", map[string]any{
 			"summary": "(mock) split the goal into two parallel tasks",
 			"tasks": []map[string]any{
@@ -199,6 +206,11 @@ func (s *mockSession) coordinate(ctx context.Context, goal string, call callFn, 
 		}); err != nil {
 			return "", err
 		}
+		return "(mock) plan submitted; ending the round to wait for the human decision", nil
+	case stateOf(progress, "awaiting_decision"):
+		return "(mock) still waiting for the human decision", nil
+	case stateOf(progress, "rejected"):
+		return s.finish(call, "failed", "(mock) the human rejected the plan")
 	}
 
 	// simulate-budget: keep delegating until the policy engine refuses, then
@@ -224,6 +236,11 @@ func (s *mockSession) coordinate(ctx context.Context, goal string, call callFn, 
 		call("await", map[string]any{"mode": "all", "timeout_sec": 30})
 		return s.finish(call, "succeeded", "(mock) converged after the task budget refused further delegation")
 	}
+
+	// Name the deliverable folder by topic before delegating, like a
+	// disciplined coordinator; on a reopened session the name is frozen and
+	// the refusal is expected.
+	call("name_output", map[string]any{"name": "mock-run"})
 
 	instrA := "MOCK_QUICK MOCK_WRITE mock-a.txt part A of the goal"
 	if marker("simulate-fail") {

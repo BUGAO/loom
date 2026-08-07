@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -197,6 +199,36 @@ func TestReopenRefusedWhileActive(t *testing.T) {
 	waitTerminal(t, st, run.ID)
 }
 
+// The workflow-output convention end to end: the coordinator names the
+// folder, artifacts land inside it, and deleting the session leaves the
+// deliverables alone.
+func TestOutputDirConvention(t *testing.T) {
+	eng, st, wf := dynSetup(t, noApproval())
+	run, err := eng.StartRun(wf, "build the thing", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := waitTerminal(t, st, run.ID)
+	if final.Status != model.RunSucceeded {
+		t.Fatalf("setup run failed: %s (%s)", final.Status, final.Error)
+	}
+	if final.OutputName != "mock-run" && !strings.HasPrefix(final.OutputName, "mock-run-") {
+		t.Fatalf("coordinator-chosen output name missing: %q", final.OutputName)
+	}
+	artifact := filepath.Join(final.OutputDir, "mock-a.txt")
+	if _, err := os.Stat(artifact); err != nil {
+		t.Fatalf("deliverable should be in the named output folder: %v", err)
+	}
+
+	// Deleting the session removes the run record but never the deliverables.
+	if err := st.DeleteRun(run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(artifact); err != nil {
+		t.Fatal("deleting the session must not delete the deliverables")
+	}
+}
+
 func TestResumeRefusedForNonInterrupted(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
 	run, err := eng.StartRun(wf, "build the thing", true)
@@ -252,5 +284,40 @@ func TestIndependentNodePromptOmitsUpstreamSummaries(t *testing.T) {
 	prompt = eng.buildNodePrompt(run, run.Plan.Nodes[1], regular, nodeByID)
 	if !strings.Contains(prompt, "AUTHOR-SELF-REPORT") {
 		t.Fatal("a regular agent should still receive upstream summaries")
+	}
+}
+
+// P6: the coordinator transcript survives reopens — earlier activations'
+// rounds are audit trail, not scratch.
+func TestReopenAppendsCoordinatorTranscript(t *testing.T) {
+	eng, st, wf := dynSetup(t, noApproval())
+	run, err := eng.StartRun(wf, "build the thing", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := waitTerminal(t, st, run.ID); r.Status != model.RunSucceeded {
+		t.Fatalf("setup run failed: %s (%s)", r.Status, r.Error)
+	}
+	first, err := os.ReadFile(st.NodeOutputPath(run.ID, "coordinator"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(first), "## Round 1") {
+		t.Fatalf("first activation transcript missing round 1:\n%s", first)
+	}
+
+	if _, err := eng.ReopenRun(run.ID, "继续"); err != nil {
+		t.Fatal(err)
+	}
+	waitTerminal(t, st, run.ID)
+	second, err := os.ReadFile(st.NodeOutputPath(run.ID, "coordinator"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(second), "## Round 1") {
+		t.Fatal("reopen overwrote the first activation's transcript")
+	}
+	if strings.Count(string(second), "## Round ") <= strings.Count(string(first), "## Round ") {
+		t.Fatal("reopen did not append new rounds to the transcript")
 	}
 }

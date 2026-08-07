@@ -23,7 +23,9 @@ func dynSetup(t *testing.T, budget model.BudgetConfig) (*Engine, *store.Store, *
 		t.Fatal(err)
 	}
 	for _, name := range []string{"researcher", "builder"} {
-		if err := st.SaveAgent(&model.Agent{Name: name, Description: "test agent", Model: "claude-haiku-4-5"}); err != nil {
+		// The mock workers genuinely write artifacts, so the pool honestly
+		// declares write capability — contract feasibility checks demand it.
+		if err := st.SaveAgent(&model.Agent{Name: name, Description: "test agent", Model: "claude-haiku-4-5", Tools: "Read,Write"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -35,6 +37,7 @@ func dynSetup(t *testing.T, budget model.BudgetConfig) (*Engine, *store.Store, *
 	srv.Config.Handler = h.Handler()
 
 	eng := New(st, map[string]llm.Backend{"mock": &llm.Mock{NodeDelay: 10 * time.Millisecond}}, NewBroker(), h)
+	eng.SetOutputRoot(t.TempDir())
 	wf := &model.Workflow{
 		Name: "dynamic test", Mode: model.ModeDynamic,
 		Coordinator: &model.CoordinatorConfig{Model: "claude-haiku-4-5"},

@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,7 +81,6 @@ func TestIndependentAgentRejectsContextHint(t *testing.T) {
 		Workspace: t.TempDir(),
 		Exec:      exec,
 		OnChange:  func(*model.Run) {},
-		OnEvent:   func(string, string, string) {},
 	})
 	t.Cleanup(rs.Close)
 
@@ -144,6 +144,78 @@ func TestAcceptanceResultRecordedOnCompletion(t *testing.T) {
 	}
 	if !strings.Contains(v.Acceptance, "1/1") {
 		t.Fatalf("view should carry the executed-check summary, got %q", v.Acceptance)
+	}
+}
+
+// ---- contract feasibility and amendment (P2/P3) ----
+
+// An artifact contract on an agent that cannot write is refused at delegation
+// — the trap a real run walked into with a read-only reviewer.
+func TestArtifactContractRequiresWriter(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	_, err := rs.Delegate(DelegateRequest{
+		Agent: "alpha" /* no tools */, Instruction: "review and write a report", Constraints: "none",
+		Acceptance: []model.AcceptanceCheck{{Kind: model.CheckArtifactExists, Path: "report.md"}},
+		CreatedBy:  RoleCoordinator, Depth: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "impossible contract") {
+		t.Fatalf("artifact contract on a writeless agent must be refused, got: %v", err)
+	}
+	if _, err := rs.Delegate(DelegateRequest{
+		Agent: "writer", Instruction: "write the report", Constraints: "none",
+		Acceptance: []model.AcceptanceCheck{{Kind: model.CheckArtifactExists, Path: "report.md"}},
+		CreatedBy:  RoleCoordinator, Depth: 1,
+	}); err != nil {
+		t.Fatalf("the same contract on a writing agent should pass: %v", err)
+	}
+}
+
+func TestAmendAcceptance(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	task, err := rs.Delegate(DelegateRequest{
+		Agent: "writer", Title: "amendable", Instruction: "do", Constraints: "none",
+		Acceptance: okChecks(), CreatedBy: RoleCoordinator, Depth: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs.TaskStarted(task.ID)
+
+	newContract := []model.AcceptanceCheck{{Kind: model.CheckArtifactExists, Path: "final.md"}}
+	if err := rs.AmendAcceptance(task.ID, newContract); err != nil {
+		t.Fatal(err)
+	}
+	// The engine judges by the amended contract…
+	got := rs.AcceptanceOf(task.ID)
+	if len(got) != 1 || got[0].Path != "final.md" {
+		t.Fatalf("amended contract not in effect: %+v", got)
+	}
+	// …and the worker hears about it at its next turn boundary.
+	inbox := rs.TakeInbox(task.ID)
+	if len(inbox) != 1 || !strings.Contains(inbox[0], "AMENDED") || !strings.Contains(inbox[0], "final.md") {
+		t.Fatalf("worker was not notified of the amendment: %v", inbox)
+	}
+}
+
+func TestAmendRefusals(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	task := mustDelegate(t, rs, "alpha")
+	rs.TaskStarted(task.ID)
+
+	// Empty contract = waiving; never allowed.
+	if err := rs.AmendAcceptance(task.ID, nil); err == nil {
+		t.Fatal("amending to an empty contract must be refused")
+	}
+	// Infeasible for the task's (writeless) agent.
+	if err := rs.AmendAcceptance(task.ID, []model.AcceptanceCheck{
+		{Kind: model.CheckArtifactExists, Path: "x.md"},
+	}); err == nil || !strings.Contains(err.Error(), "impossible contract") {
+		t.Fatalf("infeasible amendment must be refused, got: %v", err)
+	}
+	// Terminal task: the contract has already judged.
+	rs.CompleteTask(task.ID, "done", nil, nil)
+	if err := rs.AmendAcceptance(task.ID, okChecks()); err == nil {
+		t.Fatal("amending a terminal task must be refused")
 	}
 }
 
@@ -397,6 +469,73 @@ func TestAwaitRoundParksUntilNotice(t *testing.T) {
 	}
 }
 
+// ---- deliverable folder naming (workflow-output) ----
+
+func outputSession(t *testing.T, root string) (*RunSession, *fakeExec) {
+	t.Helper()
+	h := New("http://test", func() ([]*model.Agent, error) { return nil, nil })
+	exec := newFakeExec()
+	budget := openBudget()
+	run := &model.Run{ID: "run_out_" + fmt.Sprint(delegateN.Add(1)), Mode: model.ModeDynamic, Tasks: map[string]*model.Task{}}
+	rs := h.OpenRun(context.Background(), RunConfig{
+		Run:      run,
+		Workflow: &model.Workflow{Mode: model.ModeDynamic, Budget: &budget},
+		Pool: []*model.Agent{
+			{Name: "alpha", Description: "a"},
+		},
+		Workspace:  t.TempDir(),
+		OutputRoot: root,
+		Exec:       exec,
+		OnChange:   func(*model.Run) {},
+	})
+	t.Cleanup(rs.Close)
+	return rs, exec
+}
+
+func TestOutputNameValidatedAndClaimed(t *testing.T) {
+	root := t.TempDir()
+	rs, _ := outputSession(t, root)
+
+	for _, bad := range []string{"", "UPPER", "has space", "../escape", "-lead", strings.Repeat("x", 60)} {
+		if err := rs.SetOutputName(bad); err == nil {
+			t.Errorf("name %q should be refused", bad)
+		}
+	}
+	if err := rs.SetOutputName("trading-health-check"); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, "trading-health-check")
+	if rs.Workspace() != want {
+		t.Fatalf("workspace should be the named folder, got %s", rs.Workspace())
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Fatal("the folder must exist on naming")
+	}
+
+	// A second run with the same topic gets a suffixed folder, not a collision.
+	rs2, _ := outputSession(t, root)
+	if err := rs2.SetOutputName("trading-health-check"); err != nil {
+		t.Fatal(err)
+	}
+	if got := rs2.Workspace(); got != filepath.Join(root, "trading-health-check-2") {
+		t.Fatalf("colliding name should be suffixed, got %s", got)
+	}
+}
+
+func TestOutputFreezesOnFirstDispatch(t *testing.T) {
+	root := t.TempDir()
+	rs, _ := outputSession(t, root)
+	mustDelegate(t, rs, "alpha") // dispatch → auto-name + freeze
+
+	ws := rs.Workspace()
+	if filepath.Dir(ws) != root {
+		t.Fatalf("auto-named workspace should live under the output root, got %s", ws)
+	}
+	if err := rs.SetOutputName("late-name"); err == nil {
+		t.Fatal("renaming after the first dispatch must be refused")
+	}
+}
+
 // ---- round context reconstruction (D2) ----
 
 // The round prompt is rebuilt from the ledger: for the same ledger state its
@@ -414,5 +553,34 @@ func TestRoundPromptDoesNotGrowWithRounds(t *testing.T) {
 	p50 := RoundPrompt(run, rs, 50, nil, nil)
 	if diff := len(p50) - len(p5); diff < -2 || diff > 2 {
 		t.Fatalf("round prompt size changed by %d bytes between round 5 and 50 on an identical ledger", diff)
+	}
+}
+
+// A legacy session (tasks exist, no named folder) keeps its internal exchange
+// directory: deliverables must not move mid-conversation.
+func TestLegacyRunKeepsInternalWorkspace(t *testing.T) {
+	root := t.TempDir()
+	h := New("http://test", func() ([]*model.Agent, error) { return nil, nil })
+	internalWS := t.TempDir()
+	run := &model.Run{ID: "run_legacy", Mode: model.ModeDynamic, Tasks: map[string]*model.Task{
+		"task_old": {ID: "task_old", Agent: "alpha", Status: model.TaskCompleted},
+	}, TaskOrder: []string{"task_old"}}
+	budget := openBudget()
+	rs := h.OpenRun(context.Background(), RunConfig{
+		Run:        run,
+		Workflow:   &model.Workflow{Mode: model.ModeDynamic, Budget: &budget},
+		Pool:       []*model.Agent{{Name: "alpha", Description: "a"}},
+		Workspace:  internalWS,
+		OutputRoot: root,
+		Exec:       newFakeExec(),
+		OnChange:   func(*model.Run) {},
+	})
+	t.Cleanup(rs.Close)
+
+	if rs.Workspace() != internalWS {
+		t.Fatalf("legacy run should keep the internal workspace, got %s", rs.Workspace())
+	}
+	if err := rs.SetOutputName("late"); err == nil {
+		t.Fatal("naming a legacy run with dispatched tasks must be refused")
 	}
 }

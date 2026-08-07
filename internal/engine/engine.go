@@ -32,9 +32,16 @@ type Engine struct {
 	broker   *Broker
 	hub      *hub.Hub
 
+	// outputRoot is where dynamic runs' named deliverable folders live.
+	outputRoot string
+
 	mu     sync.Mutex
 	active map[string]*handle
 }
+
+// SetOutputRoot points dynamic-run deliverables at dir (~/workflow-output by
+// default at the CLI).
+func (e *Engine) SetOutputRoot(dir string) { e.outputRoot = dir }
 
 // handle is the control surface of one active run. static runs are released
 // through approveCh; dynamic runs have no plan to approve up front, so their

@@ -137,8 +137,10 @@ type ledgerHandler struct {
 
 var _ a2asrv.RequestHandler = (*ledgerHandler)(nil)
 
-// findTask locates a task across every active run.
-func (lh *ledgerHandler) findTask(id a2a.TaskID) (*RunSession, *model.Task) {
+// findSession locates the active run session holding a task. Task state is
+// never returned from here: callers take a locked snapshot, because worker
+// goroutines mutate live tasks under rs.mu while A2A clients poll.
+func (lh *ledgerHandler) findSession(id a2a.TaskID) *RunSession {
 	lh.hub.mu.Lock()
 	runs := make([]*RunSession, 0, len(lh.hub.runs))
 	for _, rs := range lh.hub.runs {
@@ -146,26 +148,25 @@ func (lh *ledgerHandler) findTask(id a2a.TaskID) (*RunSession, *model.Task) {
 	}
 	lh.hub.mu.Unlock()
 	for _, rs := range runs {
-		rs.mu.Lock()
-		t := rs.run.Tasks[string(id)]
-		rs.mu.Unlock()
-		if t != nil {
-			return rs, t
+		if _, ok := rs.TaskSnapshot(string(id)); ok {
+			return rs
 		}
 	}
-	return nil, nil
+	return nil
 }
 
-// locate resolves a task in an active run or, failing that, in a finished one.
-// Reads work either way; only mutations require the run to still be live.
-func (lh *ledgerHandler) locate(id a2a.TaskID) (runID string, t *model.Task) {
-	if rs, task := lh.findTask(id); task != nil {
-		return rs.run.ID, task
+// locate resolves a task as a safe-to-marshal copy: a locked snapshot from an
+// active run, or the (no longer mutated) record of a finished one.
+func (lh *ledgerHandler) locate(id a2a.TaskID) (runID string, t model.Task, ok bool) {
+	if rs := lh.findSession(id); rs != nil {
+		if snap, ok := rs.TaskSnapshot(string(id)); ok {
+			return rs.run.ID, snap, true
+		}
 	}
 	if run, task := lh.hub.retiredTask(string(id)); task != nil {
-		return run.ID, task
+		return run.ID, *task, true
 	}
-	return "", nil
+	return "", model.Task{}, false
 }
 
 // toA2A projects a ledger task onto the A2A wire type. The lifecycle states
@@ -220,11 +221,11 @@ func timePtr(primary, fallback time.Time) *time.Time {
 }
 
 func (lh *ledgerHandler) OnGetTask(_ context.Context, q *a2a.TaskQueryParams) (*a2a.Task, error) {
-	runID, t := lh.locate(q.ID)
-	if t == nil {
+	runID, t, ok := lh.locate(q.ID)
+	if !ok {
 		return nil, a2a.ErrTaskNotFound
 	}
-	return toA2A(runID, t), nil
+	return toA2A(runID, &t), nil
 }
 
 func (lh *ledgerHandler) OnListTasks(_ context.Context, _ *a2a.ListTasksRequest) (*a2a.ListTasksResponse, error) {
@@ -258,12 +259,16 @@ func (lh *ledgerHandler) OnListTasks(_ context.Context, _ *a2a.ListTasksRequest)
 }
 
 func (lh *ledgerHandler) OnCancelTask(_ context.Context, p *a2a.TaskIDParams) (*a2a.Task, error) {
-	rs, t := lh.findTask(p.ID)
-	if t == nil {
+	rs := lh.findSession(p.ID)
+	if rs == nil {
 		// A task in a finished run is still readable, but nothing can act on it.
-		if _, retired := lh.locate(p.ID); retired != nil {
+		if _, _, ok := lh.locate(p.ID); ok {
 			return nil, a2a.ErrTaskNotCancelable
 		}
+		return nil, a2a.ErrTaskNotFound
+	}
+	t, ok := rs.TaskSnapshot(string(p.ID))
+	if !ok {
 		return nil, a2a.ErrTaskNotFound
 	}
 	if model.TaskTerminal(t.Status) {
@@ -272,11 +277,11 @@ func (lh *ledgerHandler) OnCancelTask(_ context.Context, p *a2a.TaskIDParams) (*
 	if err := rs.CancelTask(string(p.ID), "canceled over A2A"); err != nil {
 		return nil, clientErr(a2a.ErrInvalidRequest, "%v", err)
 	}
-	_, t = lh.findTask(p.ID)
-	if t == nil {
+	t, ok = rs.TaskSnapshot(string(p.ID))
+	if !ok {
 		return nil, a2a.ErrTaskNotFound
 	}
-	return toA2A(rs.run.ID, t), nil
+	return toA2A(rs.run.ID, &t), nil
 }
 
 // textOf flattens a message's text parts. Decoded parts arrive as values while
@@ -317,15 +322,18 @@ func (lh *ledgerHandler) OnSendMessage(_ context.Context, p *a2a.MessageSendPara
 		return nil, clientErr(a2a.ErrInvalidParams, "message has no text content")
 	}
 	if msg.TaskID != "" {
-		rs, t := lh.findTask(msg.TaskID)
-		if t == nil {
+		rs := lh.findSession(msg.TaskID)
+		if rs == nil {
 			return nil, a2a.ErrTaskNotFound
 		}
 		if _, err := rs.Send(string(msg.TaskID), "external", text); err != nil {
 			return nil, clientErr(a2a.ErrInvalidRequest, "%v", err)
 		}
-		_, t = lh.findTask(msg.TaskID)
-		return toA2A(rs.run.ID, t), nil
+		t, ok := rs.TaskSnapshot(string(msg.TaskID))
+		if !ok {
+			return nil, a2a.ErrTaskNotFound
+		}
+		return toA2A(rs.run.ID, &t), nil
 	}
 
 	rs := lh.hub.Run(msg.ContextID)
@@ -342,7 +350,11 @@ func (lh *ledgerHandler) OnSendMessage(_ context.Context, p *a2a.MessageSendPara
 		// so they must arrive as readable text, not as "internal error".
 		return nil, clientErr(a2a.ErrInvalidRequest, "%v", err)
 	}
-	return toA2A(rs.run.ID, t), nil
+	snap, ok := rs.TaskSnapshot(t.ID)
+	if !ok {
+		return nil, a2a.ErrTaskNotFound
+	}
+	return toA2A(rs.run.ID, &snap), nil
 }
 
 // OnSendMessageStream drives the same path and then streams the task's status
@@ -368,12 +380,17 @@ func (lh *ledgerHandler) OnSendMessageStream(ctx context.Context, p *a2a.Message
 
 func (lh *ledgerHandler) OnResubscribeToTask(ctx context.Context, p *a2a.TaskIDParams) iter.Seq2[a2a.Event, error] {
 	return func(yield func(a2a.Event, error) bool) {
-		rs, t := lh.findTask(p.ID)
-		if t == nil {
+		rs := lh.findSession(p.ID)
+		if rs == nil {
 			yield(nil, a2a.ErrTaskNotFound)
 			return
 		}
-		if !yield(toA2A(rs.run.ID, t), nil) {
+		t, ok := rs.TaskSnapshot(string(p.ID))
+		if !ok {
+			yield(nil, a2a.ErrTaskNotFound)
+			return
+		}
+		if !yield(toA2A(rs.run.ID, &t), nil) {
 			return
 		}
 		lh.streamTask(ctx, p.ID, yield)
@@ -382,29 +399,23 @@ func (lh *ledgerHandler) OnResubscribeToTask(ctx context.Context, p *a2a.TaskIDP
 
 // streamTask emits a status-update event on every transition until terminal.
 func (lh *ledgerHandler) streamTask(ctx context.Context, id a2a.TaskID, yield func(a2a.Event, error) bool) {
-	rs, _ := lh.findTask(id)
+	rs := lh.findSession(id)
 	if rs == nil {
 		return
 	}
 	last := ""
 	for {
 		ch := rs.waitChange()
-		rs.mu.Lock()
-		t := rs.run.Tasks[string(id)]
-		var status string
-		if t != nil {
-			status = t.Status
-		}
-		rs.mu.Unlock()
-		if t == nil {
+		t, ok := rs.TaskSnapshot(string(id))
+		if !ok {
 			return
 		}
-		if status != last {
-			last = status
-			final := model.TaskTerminal(status)
+		if t.Status != last {
+			last = t.Status
+			final := model.TaskTerminal(t.Status)
 			ev := &a2a.TaskStatusUpdateEvent{
 				TaskID: id, ContextID: rs.run.ID, Final: final,
-				Status: a2a.TaskStatus{State: a2a.TaskState(status), Timestamp: timePtr(t.EndedAt, t.CreatedAt)},
+				Status: a2a.TaskStatus{State: a2a.TaskState(t.Status), Timestamp: timePtr(t.EndedAt, t.CreatedAt)},
 			}
 			if !yield(ev, nil) || final {
 				return

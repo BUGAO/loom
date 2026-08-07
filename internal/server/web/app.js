@@ -332,6 +332,7 @@ async function wfListPage() {
         <span class="badge">${runDuration(run)}</span>
         ${terminalRun(run) ? "" : '<button class="small danger" data-act="cancel">取消</button>'}
         ${run.status === "interrupted" && dyn ? '<button class="small primary" data-act="resume">▶ 恢复</button>' : ""}
+        ${run.output_dir ? `<span class="mono" style="font-size:10.5px;color:var(--muted)" title="产物目录(删除会话不影响它)">📁 ${esc(run.output_dir)}</span>` : ""}
       </div>`;
     if (dyn) {
       const tasks = (run.task_order || []).map((id) => run.tasks[id]).filter(Boolean);
@@ -793,6 +794,7 @@ async function runPage(id) {
           <span class="mono">${fmtTokens(run.usage)}</span>
           ${dyn ? `<span>任务: <b class="mono">${Object.keys(run.tasks || {}).length}</b></span>`
                 : `<span>replan: <b class="mono">${run.replans}</b></span>`}
+          ${run.output_dir ? `<span title="产物目录">📁 <b class="mono">${esc(run.output_dir)}</b></span>` : ""}
           <span>耗时: <b class="mono">${runDuration(run)}</b></span>
           <span>${fmtTime(run.created_at)}</span>
         </div>

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	acp "github.com/coder/acp-go-sdk"
@@ -146,8 +147,9 @@ func writeToolJail(workDir, tools string) error {
 const loomToolPrefix = "loom"
 
 // acpClient implements acp.Client for one session: it streams session updates
-// into the collectors and answers permission requests by policy.
-// fs/terminal methods are never expected — we advertise those capabilities off.
+// into the collectors, answers permission requests by policy, and hosts the
+// session's terminals (the adapter runs Bash through them). fs methods are
+// never expected — that capability is advertised off.
 type acpClient struct {
 	allow func(title, kind string) bool
 
@@ -155,6 +157,11 @@ type acpClient struct {
 	onMessage  func(text string)
 	onThought  func(text string)
 	onToolCall func(title, kind string)
+
+	// terminals hosts the session's shell processes (see terminal support).
+	terminals   map[string]*termProc
+	termSeq     int
+	termsClosed bool
 }
 
 var _ acp.Client = (*acpClient)(nil)
@@ -226,24 +233,204 @@ func (c *acpClient) WriteTextFile(ctx context.Context, p acp.WriteTextFileReques
 	return acp.WriteTextFileResponse{}, fmt.Errorf("fs.writeTextFile capability not advertised")
 }
 
-func (c *acpClient) CreateTerminal(ctx context.Context, p acp.CreateTerminalRequest) (acp.CreateTerminalResponse, error) {
-	return acp.CreateTerminalResponse{}, fmt.Errorf("terminal capability not advertised")
+// ---- terminal support ----
+//
+// claude-code-acp executes Bash through the ACP terminal methods, so a client
+// without them silently kills every shell-using agent: the tool call dies,
+// the turn collapses, and the missing envelope fails the task. The client
+// therefore implements a real terminal: one OS process per terminal id, output
+// in a bounded buffer, exit status reported honestly.
+
+// termProc is one terminal-hosted process.
+type termProc struct {
+	mu        sync.Mutex
+	cmd       *exec.Cmd
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+	done      chan struct{}
+	exit      *acp.TerminalExitStatus
 }
 
-func (c *acpClient) KillTerminal(ctx context.Context, p acp.KillTerminalRequest) (acp.KillTerminalResponse, error) {
-	return acp.KillTerminalResponse{}, fmt.Errorf("terminal capability not advertised")
+// Write implements io.Writer, retaining at most limit bytes (newest kept),
+// which is the truncation direction the protocol specifies.
+func (t *termProc) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.buf.Write(p)
+	if t.limit > 0 && t.buf.Len() > t.limit {
+		over := t.buf.Len() - t.limit
+		b := t.buf.Bytes()[over:]
+		// Keep the cut on a UTF-8 boundary so the output stays a valid string.
+		for len(b) > 0 && b[0]&0xC0 == 0x80 {
+			b = b[1:]
+		}
+		trimmed := append([]byte(nil), b...)
+		t.buf.Reset()
+		t.buf.Write(trimmed)
+		t.truncated = true
+	}
+	return len(p), nil
+}
+
+func (t *termProc) snapshot() (string, bool, *acp.TerminalExitStatus) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.buf.String(), t.truncated, t.exit
+}
+
+func (c *acpClient) terminal(id string) *termProc {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.terminals[id]
+}
+
+// defaultTermOutputLimit caps a terminal's retained output when the agent
+// does not ask for a limit: the field is optional in the protocol, and an
+// unbounded buffer would let one chatty command grow loom's memory forever.
+const defaultTermOutputLimit = 1 << 20 // 1 MiB
+
+func (c *acpClient) CreateTerminal(ctx context.Context, p acp.CreateTerminalRequest) (acp.CreateTerminalResponse, error) {
+	// Second line of defense behind the settings jail: a session whose
+	// allowlist grants no shell gets no terminal, full stop.
+	if !c.allow("Terminal", "execute") {
+		return acp.CreateTerminalResponse{}, fmt.Errorf("terminal refused: this agent's tool allowlist does not include Bash")
+	}
+	c.mu.Lock()
+	if c.termsClosed {
+		c.mu.Unlock()
+		return acp.CreateTerminalResponse{}, fmt.Errorf("session is closing; no new terminals")
+	}
+	c.mu.Unlock()
+	t := &termProc{done: make(chan struct{}), limit: defaultTermOutputLimit}
+	if p.OutputByteLimit != nil && *p.OutputByteLimit > 0 {
+		t.limit = *p.OutputByteLimit
+	}
+	cmd := exec.Command(p.Command, p.Args...)
+	if p.Cwd != nil && *p.Cwd != "" {
+		cmd.Dir = *p.Cwd
+	}
+	if len(p.Env) > 0 {
+		env := os.Environ()
+		for _, ev := range p.Env {
+			env = append(env, ev.Name+"="+ev.Value)
+		}
+		cmd.Env = env
+	}
+	cmd.Stdout = t
+	cmd.Stderr = t
+	if err := cmd.Start(); err != nil {
+		return acp.CreateTerminalResponse{}, fmt.Errorf("start %s: %w", p.Command, err)
+	}
+	t.cmd = cmd
+
+	c.mu.Lock()
+	if c.terminals == nil {
+		c.terminals = map[string]*termProc{}
+	}
+	c.termSeq++
+	id := fmt.Sprintf("term_%d_%d", cmd.Process.Pid, c.termSeq)
+	c.terminals[id] = t
+	c.mu.Unlock()
+
+	go func() {
+		err := cmd.Wait()
+		status := &acp.TerminalExitStatus{}
+		if code := cmd.ProcessState.ExitCode(); code >= 0 {
+			status.ExitCode = &code
+		} else if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			sig := ws.Signal().String() // conventional name ("killed"), not Go's error text
+			status.Signal = &sig
+		} else if err != nil {
+			msg := err.Error()
+			status.Signal = &msg
+		}
+		t.mu.Lock()
+		t.exit = status
+		t.mu.Unlock()
+		close(t.done)
+	}()
+	return acp.CreateTerminalResponse{TerminalId: id}, nil
 }
 
 func (c *acpClient) TerminalOutput(ctx context.Context, p acp.TerminalOutputRequest) (acp.TerminalOutputResponse, error) {
-	return acp.TerminalOutputResponse{}, fmt.Errorf("terminal capability not advertised")
-}
-
-func (c *acpClient) ReleaseTerminal(ctx context.Context, p acp.ReleaseTerminalRequest) (acp.ReleaseTerminalResponse, error) {
-	return acp.ReleaseTerminalResponse{}, fmt.Errorf("terminal capability not advertised")
+	t := c.terminal(p.TerminalId)
+	if t == nil {
+		return acp.TerminalOutputResponse{}, fmt.Errorf("unknown terminal %s", p.TerminalId)
+	}
+	out, truncated, exit := t.snapshot()
+	return acp.TerminalOutputResponse{Output: out, Truncated: truncated, ExitStatus: exit}, nil
 }
 
 func (c *acpClient) WaitForTerminalExit(ctx context.Context, p acp.WaitForTerminalExitRequest) (acp.WaitForTerminalExitResponse, error) {
-	return acp.WaitForTerminalExitResponse{}, fmt.Errorf("terminal capability not advertised")
+	t := c.terminal(p.TerminalId)
+	if t == nil {
+		return acp.WaitForTerminalExitResponse{}, fmt.Errorf("unknown terminal %s", p.TerminalId)
+	}
+	select {
+	case <-ctx.Done():
+		return acp.WaitForTerminalExitResponse{}, ctx.Err()
+	case <-t.done:
+	}
+	_, _, exit := t.snapshot()
+	res := acp.WaitForTerminalExitResponse{}
+	if exit != nil {
+		res.ExitCode = exit.ExitCode
+		res.Signal = exit.Signal
+	}
+	return res, nil
+}
+
+func (c *acpClient) KillTerminal(ctx context.Context, p acp.KillTerminalRequest) (acp.KillTerminalResponse, error) {
+	t := c.terminal(p.TerminalId)
+	if t == nil {
+		return acp.KillTerminalResponse{}, fmt.Errorf("unknown terminal %s", p.TerminalId)
+	}
+	t.mu.Lock()
+	proc := t.cmd.Process
+	t.mu.Unlock()
+	if proc != nil {
+		proc.Kill()
+	}
+	return acp.KillTerminalResponse{}, nil
+}
+
+func (c *acpClient) ReleaseTerminal(ctx context.Context, p acp.ReleaseTerminalRequest) (acp.ReleaseTerminalResponse, error) {
+	c.mu.Lock()
+	t := c.terminals[p.TerminalId]
+	delete(c.terminals, p.TerminalId)
+	c.mu.Unlock()
+	if t != nil {
+		t.mu.Lock()
+		proc := t.cmd.Process
+		exited := t.exit != nil
+		t.mu.Unlock()
+		if proc != nil && !exited {
+			proc.Kill()
+		}
+	}
+	return acp.ReleaseTerminalResponse{}, nil
+}
+
+// killTerminals reaps every process still owned by this session; called on
+// session close so no agent shell outlives its task. It also latches the
+// session closed, so a CreateTerminal racing the close cannot register a
+// process after the reaping ran.
+func (c *acpClient) killTerminals() {
+	c.mu.Lock()
+	c.termsClosed = true
+	terms := c.terminals
+	c.terminals = nil
+	c.mu.Unlock()
+	for _, t := range terms {
+		t.mu.Lock()
+		proc := t.cmd.Process
+		exited := t.exit != nil
+		t.mu.Unlock()
+		if proc != nil && !exited {
+			proc.Kill()
+		}
+	}
 }
 
 // scrubEnv drops inherited Claude Code session markers: loom is a standalone
@@ -316,6 +503,10 @@ func (a *ACP) Open(ctx context.Context, req SessionRequest) (Session, error) {
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		ClientCapabilities: acp.ClientCapabilities{
 			Fs: acp.FileSystemCapabilities{ReadTextFile: false, WriteTextFile: false},
+			// Real terminal support: the adapter runs Bash through it, and it
+			// calls these methods whether or not we advertise them — so the
+			// honest capability is true, backed by a real implementation.
+			Terminal: true,
 		},
 	}); err != nil {
 		s.Close()
@@ -472,6 +663,7 @@ func (s *acpSession) Close() error {
 		return nil
 	}
 	s.closed = true
+	s.client.killTerminals() // no agent shell outlives its session
 	s.stdin.Close()
 	if s.cmd.Process != nil {
 		s.cmd.Process.Kill()

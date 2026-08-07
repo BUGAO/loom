@@ -396,6 +396,12 @@ type Run struct {
 	// PlanApproved persists the release of the initial approval gate, so a
 	// resumed run does not ask a human to approve a plan they already approved.
 	PlanApproved bool `json:"plan_approved,omitempty"`
+	// OutputName / OutputDir: dynamic runs deliver into a topic-named folder
+	// under the output root (~/workflow-output by default). The coordinator
+	// names it; an unnamed run gets an automatic name when the first task
+	// dispatches, and the name freezes from then on.
+	OutputName string `json:"output_name,omitempty"`
+	OutputDir  string `json:"output_dir,omitempty"`
 	// Chat is the running conversation between the user and the coordinator:
 	// the goal is its first message, later user messages wake new decision
 	// rounds, and each round's reply lands here. Persisted with the run, so a

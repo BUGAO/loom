@@ -351,3 +351,42 @@ ACP 走订阅,真实扣费为零。设计稿要求按 API 牌价折算。这个�
 不走询问、提示词不可绕过。`Task` 无条件在 deny 列表——台账之外的子agent 编排永远不是可授予的能力。
 loom 的 MCP 工具(mcp__loom__*)不受影响;原有的权限应答白名单保留作第二道。
 coordinator 白名单为空 → 全部能力被禁,只剩 hub 工具:**派活成为它唯一能做的事**。
+
+---
+
+## D24 `[补洞]` ACP terminal:Bash 的真实通道
+
+**来源**:真实 run 中所有带 Bash 的 worker 在 `[tool:execute] Terminal` 处无声死亡(无信封判失败)。
+claude-code-acp 通过 ACP terminal 方法执行 Bash,而 loom 的 client 只有报错 stub 且不看 capability 声明。
+
+**改法**:client 真实实现五个 terminal 方法(每 terminal 一个 OS 进程、有界输出缓冲按协议从头截断、
+诚实退出码/信号、会话关闭统一收割),`Initialize` 声明 terminal capability。第二道防线:白名单无 Bash
+的会话(coordinator)在 `CreateTerminal` 即拒。单测覆盖成功/非零退出/kill/截断/拒绝。
+
+## D25 `[补洞]` 审批门异步化 + dynamic run 单锁化
+
+**来源**:真实 run 时间线上任务创建早于"initial plan approved"事件 4.5 分钟。根因链:propose_plan 阻塞等人 →
+MCP 客户端超时切断工具调用 → 批准信号落入已死等待通道;并且 `run.Events` 多 goroutine 裸写(数据竞争)。
+
+**改法**:审批门改为纯状态机——propose 立即返回并要求结束回合,Approve/Reject 翻转状态 + 注入 notice 唤醒
+下一轮;拒绝后可修订重提。dynamic run 的全部状态(事件/任务/对话/协调器卡片/成本)统一收进 `rs.mu` 单锁,
+引擎经 `AppendEvent`/`UpdateCoordinator`/`RecordCoordinatorCost`/`TaskSnapshot`/`AcceptanceOf` 加锁访问;
+`-race` 全绿。回归测试钉死"propose 返回后、批准前,delegate 依旧被拒"。
+
+## D26 `[补洞]` 契约可行性校验与修约机制
+
+**来源**:coordinator 给只读 reviewer 派了 artifact_exists 契约(必败),发现后口头叫 worker"忽略验收"——
+它无权豁免,引擎照判失败,高价值产出淤积在消息流里。
+
+**改法**:派单与修约时校验可行性——artifact 类检查要求 agent 具备 Write/Edit,否则结构化拒绝;
+新工具 `amend_acceptance` 允许修订在途任务的契约(校验同派单、不允许空契约=不可豁免、入审计事件、
+worker 下一轮次边界收到通知);引擎判定时按修订后契约加锁读取。提示词明确:"你不能豁免,只能修约"。
+配套:reviewer 白名单放宽为 Read,Grep,Glob(可自主发现文件);消息通道仅用于协调、产物必须落文件;
+外部事实先派廉价核实任务;coordinator transcript 跨激活追加不覆盖。
+
+## D27 `[约定]` 产物目录:~/workflow-output/<主题名>/
+
+dynamic run 的交换目录本体就是 `<output根>/<短名>/`(`-output` flag / `LOOM_OUTPUT`,默认 ~/workflow-output)。
+短名由 coordinator 按主题起(`name_output` 工具或 `propose_plan.output_name`,kebab ≤40 字符,重名自动 -2 后缀);
+**首个任务派发时冻结**,未起名自动兜底 `MMDD-<runid短>`。产物外部实时可见;删除会话不删产物目录;
+旧会话(已有任务)保持原交换目录不迁移。static 模式维持内部交换目录不变。
