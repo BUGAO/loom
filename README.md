@@ -7,27 +7,29 @@
 
 两种模式共用同一个 agent 池、交换目录、UI 与执行层。**执行层走 ACP(Agent Client Protocol)**:每个 agent 是一个独立的 ACP 会话,拥有自己的 AGENTS.md、自己的持久 workspace 和自己的私有 skills。dynamic 模式下 agent 之间的委派/回报/反问走 **MCP 工具 → loom hub → A2A 任务台账**,全程可审计。
 
-Go 单二进制,内嵌 Web UI,文件存储。三个第三方 Go 依赖,全部是协议层:
+Go 单二进制,内嵌 Web UI,文件存储。第三方 Go 依赖:三个协议层——
 [coder/acp-go-sdk](https://github.com/coder/acp-go-sdk)(ACP)、
 [a2aproject/a2a-go](https://github.com/a2aproject/a2a-go)(A2A)、
-[modelcontextprotocol/go-sdk](https://github.com/modelcontextprotocol/go-sdk)(MCP)。
+[modelcontextprotocol/go-sdk](https://github.com/modelcontextprotocol/go-sdk)(MCP)——
+外加 CLI 框架 [spf13/cobra](https://github.com/spf13/cobra)。
 
 ## 快速开始
 
 ```bash
 cd loom
 npm install --prefix .acp @zed-industries/claude-code-acp   # ACP 适配器(一次性)
-go run ./cmd/loom                  # 默认 :7333
-go run ./cmd/loom -dry-run         # 零成本演示模式(UI 里 dry-run 开关默认打开)
+go run ./cmd/loom                  # 前台运行,默认 :7333
+go run ./cmd/loom --dry-run        # 零成本演示模式(UI 里 dry-run 开关默认打开)
 ```
 
-已安装(`./scripts/install.sh`)后,进程管理内建在二进制里:
+已安装(`./scripts/install.sh`)后,进程管理与体检内建在二进制里(`loom help <命令>` 看详情):
 
 ```bash
 loom start      # 后台启动(日志: <data>/loom.log)
 loom restart    # 改完代码重编译后,一条命令换新进程
 loom stop       # 优雅停止(SIGTERM;中断的 dynamic run 下次启动可恢复)
 loom status     # 在跑吗?pid / 地址 / 数据目录
+loom doctor     # 体检:claude CLI、node、ACP adapter + 真实握手、目录可写性
 ```
 
 打开 http://localhost:7333。首次启动自动写入 5 个种子 agent 和 4 个示例 workflow(3 个 static + 1 个 dynamic)。

@@ -79,4 +79,4 @@ case ":$PATH:" in
 esac
 
 info "done. Run:  loom start      (background, http://localhost:7333)"
-info "also:  loom restart | stop | status   |   loom (foreground)   |   flags: -dry-run -addr -data"
+info "also:  loom restart | stop | status | doctor   |   loom (foreground)   |   loom help <cmd>"
