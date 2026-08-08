@@ -21,6 +21,15 @@ go run ./cmd/loom                  # 默认 :7333
 go run ./cmd/loom -dry-run         # 零成本演示模式(UI 里 dry-run 开关默认打开)
 ```
 
+已安装(`./scripts/install.sh`)后,进程管理内建在二进制里:
+
+```bash
+loom start      # 后台启动(日志: <data>/loom.log)
+loom restart    # 改完代码重编译后,一条命令换新进程
+loom stop       # 优雅停止(SIGTERM;中断的 dynamic run 下次启动可恢复)
+loom status     # 在跑吗?pid / 地址 / 数据目录
+```
+
 打开 http://localhost:7333。首次启动自动写入 5 个种子 agent 和 4 个示例 workflow(3 个 static + 1 个 dynamic)。
 种子池保证任意两个 agent 的(模型, 工具白名单)有实质差异——只差 prompt 的名义拆分会被合并(实现与自测就是同一个 agent)。
 

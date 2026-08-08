@@ -79,7 +79,12 @@ func TestACPPromptAllowed(t *testing.T) {
 	}
 }
 
-func TestACPPromptRejected(t *testing.T) {
+// Permission prompts are granted even for tools outside the allowlist: a
+// rejection makes the runtime tell the model to stop and wait for a human,
+// which kills unattended tasks. What actually stops an ungranted tool is the
+// settings jail (TestDenyListFor) and the terminal allowlist check
+// (TestTerminalRefusedWithoutBash) — layers that fail as readable errors.
+func TestACPPromptPermissionAlwaysGranted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -87,13 +92,13 @@ func TestACPPromptRejected(t *testing.T) {
 		Kind:    KindNode,
 		Prompt:  "do the thing",
 		WorkDir: t.TempDir(),
-		Tools:   "Read", // execute NOT allowed → permission rejected
+		Tools:   "Read", // execute not in the allowlist — still granted here
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(res.Text, "not permitted") {
-		t.Fatalf("expected rejection path, got: %s", res.Text)
+	if !strings.Contains(res.Text, `"status":"ok"`) {
+		t.Fatalf("permission should be granted regardless of allowlist, got: %s", res.Text)
 	}
 }
 
@@ -155,6 +160,58 @@ func TestOpenWritesToolJail(t *testing.T) {
 	}
 	if !strings.Contains(deny, "Task") || !strings.Contains(deny, "Bash") {
 		t.Fatalf("jail must deny Task and Bash: %s", deny)
+	}
+}
+
+// ---- permission decisions ----
+
+// The responder allows EVERYTHING, by design: a permission rejection makes
+// Claude Code tell the model to "STOP and wait for the user", which kills an
+// unattended task with no envelope (five tasks of the 2026-08-08 review run
+// died that way). Enforcement lives in the layers that fail loudly instead —
+// the settings jail for built-ins and CreateTerminal's allowlist check for
+// shell (TestTerminalRefusedWithoutBash covers the latter).
+func TestRequestPermissionAlwaysAllows(t *testing.T) {
+	str := func(s string) *string { return &s }
+	decide := func(c *acpClient, title string, raw any, opts []acp.PermissionOption) string {
+		resp, err := c.RequestPermission(context.Background(), acp.RequestPermissionRequest{
+			Options:  opts,
+			ToolCall: acp.ToolCallUpdate{Title: str(title), RawInput: raw},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Outcome.Selected == nil {
+			return "cancelled"
+		}
+		return string(resp.Outcome.Selected.OptionId)
+	}
+	std := []acp.PermissionOption{
+		{OptionId: "always", Name: "Always Allow", Kind: acp.PermissionOptionKindAllowAlways},
+		{OptionId: "allow", Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},
+		{OptionId: "reject", Name: "Reject", Kind: acp.PermissionOptionKindRejectOnce},
+	}
+
+	// Even a tool-less agent's prompts are allowed here — the jail and the
+	// terminal check are what actually stop it, with readable errors.
+	none := termClient("")
+	if got := decide(none, "`npm install`", map[string]any{"command": "npm install"}, std); got != "allow" {
+		t.Fatalf("responder must allow (allow_once preferred), got %s", got)
+	}
+	if got := decide(none, "mcp__loom__report_progress", map[string]any{"text": "hi"}, std); got != "allow" {
+		t.Fatalf("hub tools allowed, got %s", got)
+	}
+
+	// Without an allow_once option it falls back to allow_always, then to
+	// whatever exists.
+	if got := decide(none, "x", nil, std[:1]); got != "always" {
+		t.Fatalf("allow_always fallback, got %s", got)
+	}
+	if got := decide(none, "x", nil, std[2:]); got != "reject" {
+		t.Fatalf("last-resort first option, got %s", got)
+	}
+	if got := decide(none, "x", nil, nil); got != "cancelled" {
+		t.Fatalf("no options → cancelled, got %s", got)
 	}
 }
 

@@ -67,12 +67,6 @@ func allowedFn(tools string) func(title, kind string) bool {
 	}
 }
 
-// hubToolRe matches the hub's own MCP tools, which arrive as an unknown kind
-// and must never be filtered by the agent's file-tool allowlist: they are the
-// orchestration channel, not a capability the agent was granted.
-func isHubTool(title string) bool {
-	return strings.Contains(strings.ToLower(title), loomToolPrefix)
-}
 
 // ---- tool jail ----
 //
@@ -87,7 +81,7 @@ func isHubTool(title string) bool {
 // capabilityGrants maps loom allowlist tokens onto the Claude Code tools they
 // legitimize.
 var capabilityGrants = map[string][]string{
-	"read":      {"Read"},
+	"read":      {"Read", "NotebookRead"},
 	"grep":      {"Grep"},
 	"glob":      {"Glob"},
 	"write":     {"Write", "NotebookEdit"},
@@ -103,8 +97,8 @@ var capabilityGrants = map[string][]string{
 // TodoWrite are deliberately absent — they act within the session and their
 // tool calls hit these same rules.
 var capabilityTools = []string{
-	"Task", "Bash", "BashOutput", "KillShell", "Read", "Write", "Edit",
-	"MultiEdit", "NotebookEdit", "Grep", "Glob", "WebFetch", "WebSearch",
+	"Task", "Bash", "BashOutput", "KillShell", "Read", "NotebookRead", "Write",
+	"Edit", "MultiEdit", "NotebookEdit", "Grep", "Glob", "WebFetch", "WebSearch",
 }
 
 // denyListFor computes the deny rules implied by an agent's tool allowlist.
@@ -142,9 +136,6 @@ func writeToolJail(workDir, tools string) error {
 	return os.WriteFile(filepath.Join(dir, "settings.local.json"), data, 0o644)
 }
 
-// loomToolPrefix is the MCP server name the hub registers under; tool titles
-// surfaced by the runtime contain it.
-const loomToolPrefix = "loom"
 
 // acpClient implements acp.Client for one session: it streams session updates
 // into the collectors, answers permission requests by policy, and hosts the
@@ -166,22 +157,36 @@ type acpClient struct {
 
 var _ acp.Client = (*acpClient)(nil)
 
+// RequestPermission answers every permission prompt with "allow".
+//
+// This is a deliberate retreat from answering by allowlist. Permission
+// prompts are designed for a human at a keyboard, and their rejection
+// semantics are poison for unattended sessions: Claude Code renders a
+// rejection as "the user doesn't want to proceed, STOP and wait" — after
+// which the model obediently ends its turn with no envelope and the task
+// dies. Worse, the adapter sends these prompts without a tool kind, so any
+// answering policy here is guesswork over display titles (one incarnation
+// approved `echo loom` as a hub tool and refused `npm install`).
+//
+// Enforcement does not live here and never did — it lives in the layers that
+// fail LOUDLY as tool errors the model can react to:
+//   - the tool jail: ungranted built-ins are denied by Claude Code core via
+//     settings.local.json (written before every session; open fails if it
+//     cannot be written);
+//   - CreateTerminal below: shell for an agent without Bash is refused with
+//     an explanatory error, whatever this responder says.
 func (c *acpClient) RequestPermission(ctx context.Context, p acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
-	title, kind := "", ""
-	if p.ToolCall.Title != nil {
-		title = *p.ToolCall.Title
-	}
-	if p.ToolCall.Kind != nil {
-		kind = string(*p.ToolCall.Kind)
-	}
-	want := acp.PermissionOptionKindRejectOnce
-	if isHubTool(title) || c.allow(title, kind) {
-		want = acp.PermissionOptionKindAllowOnce
-	}
 	var optionID acp.PermissionOptionId
-	for _, o := range p.Options {
-		if o.Kind == want {
-			optionID = o.OptionId
+	for _, want := range []acp.PermissionOptionKind{
+		acp.PermissionOptionKindAllowOnce, acp.PermissionOptionKindAllowAlways,
+	} {
+		for _, o := range p.Options {
+			if o.Kind == want {
+				optionID = o.OptionId
+				break
+			}
+		}
+		if optionID != "" {
 			break
 		}
 	}
@@ -532,9 +537,18 @@ func (a *ACP) Open(ctx context.Context, req SessionRequest) (Session, error) {
 		return nil, fmt.Errorf("acp session: %w (stderr: %s)", err, s.stderrTail())
 	}
 	s.id = sess.SessionId
-	// Auto-accept edits only when the agent is entitled to them; everything
-	// else flows through RequestPermission and our policy.
-	if s.client.allow("", "edit") {
+	// Unattended sessions bypass permission prompts entirely. Every prompt
+	// this suppresses would be auto-approved by RequestPermission anyway —
+	// except the prompt round trip is one more thing to break, and its
+	// rejection path ("STOP and wait for the user") kills turns. Enforcement
+	// is unaffected: the deny jail and the terminal allowlist check both hold
+	// under bypass — verified live by TestLiveBypassJail, where a tool-less
+	// bypassed agent could neither read nor write nor shell. When bypass is
+	// unavailable (running as root without IS_SANDBOX), fall back to
+	// acceptEdits + the always-allow responder.
+	if _, err := s.conn.SetSessionMode(ctx, acp.SetSessionModeRequest{
+		SessionId: sess.SessionId, ModeId: acp.SessionModeId("bypassPermissions"),
+	}); err != nil && s.client.allow("", "edit") {
 		s.conn.SetSessionMode(ctx, acp.SetSessionModeRequest{
 			SessionId: sess.SessionId, ModeId: acp.SessionModeId("acceptEdits")})
 	}
