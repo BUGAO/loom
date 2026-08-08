@@ -82,6 +82,7 @@ func toChecks(in []acceptanceCheckIn) []model.AcceptanceCheck {
 
 type delegateIn struct {
 	Agent       string `json:"agent" jsonschema:"name of an agent from list_agents"`
+	Model       string `json:"model,omitempty" jsonschema:"model tier for THIS task, chosen by difficulty: haiku (mechanical, low-ambiguity), sonnet (standard work), opus (hard reasoning — the ceiling for workers). Empty = the agent's default model"`
 	Title       string `json:"title,omitempty" jsonschema:"short label for the task tree"`
 	Instruction string `json:"instruction" jsonschema:"self-contained task; the worker cannot see your context"`
 	Constraints string `json:"constraints" jsonschema:"cross-domain constraints the worker cannot infer: interfaces, formats, style, boundaries with other tasks. 'none' if genuinely none"`
@@ -117,7 +118,7 @@ type progressOut struct {
 type createAgentIn struct {
 	Name         string `json:"name" jsonschema:"kebab-case, unique in the pool"`
 	Description  string `json:"description" jsonschema:"when a planner should pick this agent"`
-	Model        string `json:"model"`
+	Model        string `json:"model" jsonschema:"the agent's default model: haiku | sonnet | opus at most — the top tier is reserved for the coordinator"`
 	Tools        string `json:"tools,omitempty" jsonschema:"comma-separated subset of the allowed tool list; empty for pure reasoning"`
 	MaxTurns     int    `json:"max_turns,omitempty"`
 	SystemPrompt string `json:"system_prompt" jsonschema:"self-contained role definition"`
@@ -127,6 +128,7 @@ type proposePlanIn struct {
 	Summary string `json:"summary" jsonschema:"how you intend to approach the goal"`
 	Tasks   []struct {
 		Agent string `json:"agent"`
+		Model string `json:"model,omitempty" jsonschema:"intended model tier for this task: haiku | sonnet | opus; empty = the agent's default"`
 		Title string `json:"title"`
 		Why   string `json:"why,omitempty"`
 	} `json:"tasks"`
@@ -135,7 +137,12 @@ type proposePlanIn struct {
 }
 
 type nameOutputIn struct {
-	Name string `json:"name" jsonschema:"short kebab-case topic name for the deliverable folder, e.g. trading-health-check"`
+	Name string `json:"name,omitempty" jsonschema:"short kebab-case topic name for the deliverable folder under the default output root, e.g. trading-health-check"`
+	Dir  string `json:"dir,omitempty" jsonschema:"absolute path (or ~/...) the USER asked the deliverables to land in; overrides the default root. Only when the user explicitly named a location"`
+}
+
+type askUserIn struct {
+	Questions string `json:"questions" jsonschema:"your questions for the user, batched into ONE message — numbered if several. Ask only what you cannot decide yourself"`
 }
 
 type finishRunIn struct {
@@ -184,7 +191,8 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 		activity("propose_plan")
 		p := &model.Proposal{Summary: in.Summary}
 		for _, t := range in.Tasks {
-			p.Tasks = append(p.Tasks, model.ProposedTask{Agent: t.Agent, Title: t.Title, Why: t.Why})
+			m, _ := model.ResolveModel(t.Model) // display only; an invalid tier just shows empty
+			p.Tasks = append(p.Tasks, model.ProposedTask{Agent: t.Agent, Model: m, Title: t.Title, Why: t.Why})
 		}
 		for _, a := range in.Agents {
 			p.Agents = append(p.Agents, model.Agent{
@@ -204,13 +212,39 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name: "name_output",
-		Description: "Name this run's deliverable folder under the output root, by topic (short kebab-case). Do this " +
-			"BEFORE delegating — the name freezes at the first dispatch, and an unnamed run gets an automatic one.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in nameOutputIn) (*mcp.CallToolResult, any, error) {
-		activity("name_output " + in.Name)
-		if err := rs.SetOutputName(in.Name); err != nil {
+		Name: "ask_user",
+		Description: "Ask the user clarifying questions BEFORE committing to a plan — scope, priorities, and always " +
+			"the deliverable location. Batch every open question into ONE call, then END YOUR TURN; the user's " +
+			"answer arrives as a message in your next round. Never ask what you can decide yourself, and never " +
+			"ask twice what was already answered.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in askUserIn) (*mcp.CallToolResult, any, error) {
+		activity("ask_user")
+		if err := rs.AskUser(in.Questions); err != nil {
 			return toolErr("%v", err), nil, nil
+		}
+		return okf(rs, "Question delivered to the user. End your turn now — their answer will wake your next round."), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "name_output",
+		Description: "Set this run's deliverable folder. Default: a short kebab-case topic name under the output " +
+			"root. When the USER named a location, pass it as dir (absolute or ~/ path) and it is honored verbatim. " +
+			"Do this BEFORE delegating — the folder freezes at the first dispatch, and an unnamed run gets an " +
+			"automatic name.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in nameOutputIn) (*mcp.CallToolResult, any, error) {
+		switch {
+		case in.Dir != "":
+			activity("name_output → " + in.Dir)
+			if err := rs.SetOutputDir(in.Dir); err != nil {
+				return toolErr("%v", err), nil, nil
+			}
+		case in.Name != "":
+			activity("name_output " + in.Name)
+			if err := rs.SetOutputName(in.Name); err != nil {
+				return toolErr("%v", err), nil, nil
+			}
+		default:
+			return toolErr("pass name (topic under the default root) or dir (user-chosen absolute path)"), nil, nil
 		}
 		return okf(rs, "Deliverable folder: %s — every artifact of this run lands there.", rs.Workspace()), nil, nil
 	})
@@ -224,7 +258,7 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in delegateIn) (*mcp.CallToolResult, any, error) {
 		activity("delegate → " + in.Agent)
 		t, err := rs.Delegate(DelegateRequest{
-			Agent: in.Agent, Title: in.Title, Instruction: in.Instruction,
+			Agent: in.Agent, Model: in.Model, Title: in.Title, Instruction: in.Instruction,
 			Constraints: in.Constraints, ContextHint: in.ContextHint,
 			Acceptance: toChecks(in.Acceptance), RetryOf: in.RetryOf,
 			CreatedBy: RoleCoordinator, Depth: 1,
@@ -301,8 +335,8 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "amend_acceptance",
-		Description: "Replace an in-flight task's acceptance contract when the original was wrong (e.g. it demanded " +
-			"an artifact from an agent that cannot write). You can NEVER waive acceptance — only correct it; the " +
+		Description: "Replace an in-flight task's acceptance contract when the original was wrong (e.g. it names " +
+			"the wrong artifact path). You can NEVER waive acceptance — only correct it; the " +
 			"engine still executes the checks itself. The worker is notified at its next turn.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in amendAcceptanceIn) (*mcp.CallToolResult, any, error) {
 		activity("amend_acceptance " + in.TaskID)
@@ -358,6 +392,11 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 // CreateAgent validates a coordinator-proposed agent against the same
 // guardrails static mode applies to planner-created ones, then persists it.
 func (rs *RunSession) CreateAgent(a *model.Agent) error {
+	// Tier aliases are legal here too; Validate then judges the resolved id
+	// (unknown models, and the coordinator-only tier, are refused).
+	if resolved, ok := model.ResolveModel(a.Model); ok && resolved != "" {
+		a.Model = resolved
+	}
 	plan := &model.Plan{
 		Agents: []model.Agent{*a},
 		Nodes:  []model.PlanNode{{ID: "n1", Agent: a.Name}},
@@ -379,7 +418,13 @@ func (rs *RunSession) CreateAgent(a *model.Agent) error {
 // ---- worker tools ----
 
 type reportProgressIn struct {
-	Text string `json:"text" jsonschema:"what you have done and what is left"`
+	Text string `json:"text" jsonschema:"what you have done and what is left — a short status line, never report content"`
+}
+
+type writeArtifactIn struct {
+	Path    string `json:"path" jsonschema:"file path relative to the exchange directory, e.g. research-findings.md"`
+	Content string `json:"content" jsonschema:"the file content (UTF-8); for a large document, write it in chunks with append=true"`
+	Append  bool   `json:"append,omitempty" jsonschema:"append to the file instead of overwriting it"`
 }
 
 type askCoordinatorIn struct {
@@ -405,6 +450,21 @@ type askAgentIn struct {
 }
 
 func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskID string) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "write_artifact",
+		Description: "Write a deliverable file into the run's exchange directory. Substantial text output — a " +
+			"report, analysis, spec, review — is delivered as a Markdown file this way (or with your own file " +
+			"tools), NEVER pasted into messages or the result summary. Works even if you have no file tools. " +
+			"Overwrites unless append=true; large documents go in chunks.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in writeArtifactIn) (*mcp.CallToolResult, any, error) {
+		if err := rs.WriteArtifact(taskID, in.Path, in.Content, in.Append); err != nil {
+			return toolErr("%v", err), nil, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(
+			"Wrote %s (%d bytes) into the exchange directory. List it in your final envelope's artifacts.",
+			in.Path, len(in.Content))}}}, nil, nil
+	})
+
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "report_progress",
 		Description: "Report progress mid-task so the coordinator can see where you are. Does not end your task " +

@@ -149,24 +149,18 @@ func TestAcceptanceResultRecordedOnCompletion(t *testing.T) {
 
 // ---- contract feasibility and amendment (P2/P3) ----
 
-// An artifact contract on an agent that cannot write is refused at delegation
-// — the trap a real run walked into with a read-only reviewer.
-func TestArtifactContractRequiresWriter(t *testing.T) {
+// Artifact contracts are feasible for EVERY agent: a writeless one delivers
+// through the hub's write_artifact, so the old "impossible contract" refusal
+// would now block exactly the delegations we want (md deliverables from
+// pure-reasoning agents).
+func TestArtifactContractFeasibleForWritelessAgent(t *testing.T) {
 	rs, _ := testSession(t, openBudget())
-	_, err := rs.Delegate(DelegateRequest{
+	if _, err := rs.Delegate(DelegateRequest{
 		Agent: "alpha" /* no tools */, Instruction: "review and write a report", Constraints: "none",
 		Acceptance: []model.AcceptanceCheck{{Kind: model.CheckArtifactExists, Path: "report.md"}},
 		CreatedBy:  RoleCoordinator, Depth: 1,
-	})
-	if err == nil || !strings.Contains(err.Error(), "impossible contract") {
-		t.Fatalf("artifact contract on a writeless agent must be refused, got: %v", err)
-	}
-	if _, err := rs.Delegate(DelegateRequest{
-		Agent: "writer", Instruction: "write the report", Constraints: "none",
-		Acceptance: []model.AcceptanceCheck{{Kind: model.CheckArtifactExists, Path: "report.md"}},
-		CreatedBy:  RoleCoordinator, Depth: 1,
 	}); err != nil {
-		t.Fatalf("the same contract on a writing agent should pass: %v", err)
+		t.Fatalf("artifact contract on a writeless agent should be accepted (write_artifact makes it feasible): %v", err)
 	}
 }
 
@@ -205,12 +199,6 @@ func TestAmendRefusals(t *testing.T) {
 	// Empty contract = waiving; never allowed.
 	if err := rs.AmendAcceptance(task.ID, nil); err == nil {
 		t.Fatal("amending to an empty contract must be refused")
-	}
-	// Infeasible for the task's (writeless) agent.
-	if err := rs.AmendAcceptance(task.ID, []model.AcceptanceCheck{
-		{Kind: model.CheckArtifactExists, Path: "x.md"},
-	}); err == nil || !strings.Contains(err.Error(), "impossible contract") {
-		t.Fatalf("infeasible amendment must be refused, got: %v", err)
 	}
 	// Terminal task: the contract has already judged.
 	rs.CompleteTask(task.ID, "done", nil, nil)

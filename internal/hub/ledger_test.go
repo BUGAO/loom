@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -41,6 +43,7 @@ func testSession(t *testing.T, budget model.BudgetConfig) (*RunSession, *fakeExe
 			{Name: "alpha", Description: "a"},
 			{Name: "beta", Description: "b"},
 			{Name: "writer", Description: "w", Tools: "Read,Write"},
+			{Name: "vip", Description: "legacy agent declaring a coordinator-only model", Model: "claude-fable-5"},
 		},
 		Workspace: t.TempDir(),
 		Exec:      exec,
@@ -86,6 +89,218 @@ func TestDelegateRejectsUnknownAgent(t *testing.T) {
 	// The refusal must name the alternatives, or the coordinator can only guess.
 	if !strings.Contains(err.Error(), "alpha") {
 		t.Fatalf("error should list available agents, got: %v", err)
+	}
+}
+
+func TestDelegateModelTiering(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+
+	// A tier alias resolves to a real catalog id on the task.
+	task, err := rs.Delegate(DelegateRequest{
+		Agent: "alpha", Model: "haiku", Title: "tier", Instruction: "do the thing",
+		Constraints: "none", Acceptance: okChecks(), CreatedBy: RoleCoordinator, Depth: 1,
+	})
+	if err != nil {
+		t.Fatalf("delegate with tier alias: %v", err)
+	}
+	if task.Model != "claude-haiku-4-5" {
+		t.Fatalf("tier alias should resolve to a catalog id, got %q", task.Model)
+	}
+
+	// No model means the agent's own default.
+	def := mustDelegate(t, rs, "writer")
+	if def.Model != rs.pool["writer"].Model {
+		t.Fatalf("empty model should inherit the agent default, got %q", def.Model)
+	}
+
+	// An unknown model is refused with tier guidance, not silently accepted.
+	_, err = rs.Delegate(DelegateRequest{
+		Agent: "alpha", Model: "gpt-9", Instruction: "x",
+		Constraints: "none", Acceptance: okChecks(), CreatedBy: RoleCoordinator, Depth: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "haiku") {
+		t.Fatalf("unknown model should be refused with tier guidance, got: %v", err)
+	}
+
+	// The top tier is the coordinator's alone: an explicit request is refused…
+	_, err = rs.Delegate(DelegateRequest{
+		Agent: "alpha", Model: "fable", Instruction: "x",
+		Constraints: "none", Acceptance: okChecks(), CreatedBy: RoleCoordinator, Depth: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("coordinator-only model should be refused for workers, got: %v", err)
+	}
+
+	// …and an agent whose own default declares it gets capped at the ceiling.
+	capped, err := rs.Delegate(DelegateRequest{
+		Agent: "vip", Title: "cap", Instruction: "do the thing",
+		Constraints: "none", Acceptance: okChecks(), CreatedBy: RoleCoordinator, Depth: 1,
+	})
+	if err != nil {
+		t.Fatalf("delegate to fable-default agent: %v", err)
+	}
+	if capped.Model != model.WorkerModelCeiling {
+		t.Fatalf("inherited coordinator-only model should cap at %s, got %q", model.WorkerModelCeiling, capped.Model)
+	}
+}
+
+func TestAskUserFlow(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	rs.run.Coordinator = &model.CoordinatorState{Status: "working"}
+
+	if err := rs.AskUser("   "); err == nil {
+		t.Fatal("empty question must be refused")
+	}
+	seq := rs.Seq()
+	if err := rs.AskUser("1. Where should deliverables go? 2. Web UI or CLI?"); err != nil {
+		t.Fatal(err)
+	}
+	if rs.Seq() == seq {
+		t.Fatal("ask_user must count as a ledger transition (an ask-only round is acting, not stalling)")
+	}
+	if got := rs.run.Coordinator.Status; got != "awaiting_user" {
+		t.Fatalf("coordinator should be awaiting_user, got %q", got)
+	}
+	last := rs.run.Chat[len(rs.run.Chat)-1]
+	if last.From != "coordinator" || !strings.Contains(last.Text, "deliverables") {
+		t.Fatalf("question should land in the chat, got %+v", last)
+	}
+
+	// The user's answer restores the coordinator and queues for the next round.
+	if err := rs.UserChat("默认位置就行;做 Web UI"); err != nil {
+		t.Fatal(err)
+	}
+	if got := rs.run.Coordinator.Status; got != "working" {
+		t.Fatalf("answer should flip status back to working, got %q", got)
+	}
+	if msgs := rs.TakeUserChat(); len(msgs) != 1 {
+		t.Fatalf("answer should be queued for the next round, got %v", msgs)
+	}
+}
+
+// The poe2-build-advisor bug: name_output("topic") followed by propose_plan
+// carrying output_name "topic" again claimed a SECOND directory ("topic-2") —
+// colliding with the run's own first claim — and orphaned the first.
+func TestOutputNameRepeatAndRename(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	root := t.TempDir()
+	rs.cfg.OutputRoot = root
+
+	if err := rs.SetOutputName("topic"); err != nil {
+		t.Fatal(err)
+	}
+	first := rs.Workspace()
+	if filepath.Base(first) != "topic" {
+		t.Fatalf("first claim should be the plain name, got %s", first)
+	}
+
+	// Repeating the same topic must be a no-op, not a fresh claim.
+	if err := rs.SetOutputName("topic"); err != nil {
+		t.Fatal(err)
+	}
+	if rs.Workspace() != first {
+		t.Fatalf("repeat naming moved the folder: %s → %s", first, rs.Workspace())
+	}
+	if entries, _ := os.ReadDir(root); len(entries) != 1 {
+		t.Fatalf("repeat naming should not claim extra directories, root has %d", len(entries))
+	}
+
+	// A genuine rename claims the new name and releases the old empty claim.
+	if err := rs.SetOutputName("better-topic"); err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(rs.Workspace()) != "better-topic" {
+		t.Fatalf("rename should take effect, got %s", rs.Workspace())
+	}
+	if _, err := os.Stat(first); !os.IsNotExist(err) {
+		t.Fatalf("old empty claim should be released, stat err: %v", err)
+	}
+
+	// A rename never deletes work: a non-empty old folder stays.
+	if err := os.WriteFile(filepath.Join(rs.Workspace(), "x.md"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	kept := rs.Workspace()
+	if err := rs.SetOutputName("third"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(kept, "x.md")); err != nil {
+		t.Fatalf("non-empty old folder must be kept: %v", err)
+	}
+}
+
+func TestSetOutputDir(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+
+	if err := rs.SetOutputDir("relative/path"); err == nil {
+		t.Fatal("relative path must be refused")
+	}
+	if err := rs.SetOutputDir("/"); err == nil {
+		t.Fatal("filesystem root must be refused")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if err := rs.SetOutputDir(home); err == nil {
+			t.Fatal("home itself must be refused")
+		}
+	}
+
+	dir := filepath.Join(t.TempDir(), "my-deliverables")
+	if err := rs.SetOutputDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if rs.Workspace() != dir {
+		t.Fatalf("workspace should be the user's dir, got %s", rs.Workspace())
+	}
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		t.Fatalf("user dir should exist: %v", err)
+	}
+
+	// The first dispatch freezes the folder; moving it afterwards is refused.
+	mustDelegate(t, rs, "alpha")
+	if err := rs.SetOutputDir(filepath.Join(t.TempDir(), "elsewhere")); err == nil {
+		t.Fatal("moving the output dir after dispatch must be refused")
+	}
+}
+
+func TestWriteArtifact(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	task := mustDelegate(t, rs, "alpha") // alpha has no file tools of its own
+	rs.TaskStarted(task.ID)
+
+	// Escapes are refused regardless of anything else.
+	if err := rs.WriteArtifact(task.ID, "../oops.md", "x", false); err == nil {
+		t.Fatal("path escape must be refused")
+	}
+
+	if err := rs.WriteArtifact(task.ID, "notes/findings.md", "# Findings\n\npart one\n", false); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := rs.WriteArtifact(task.ID, "notes/findings.md", "part two\n", true); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(rs.Workspace(), "notes", "findings.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "# Findings\n\npart one\npart two\n" {
+		t.Fatalf("unexpected content: %q", data)
+	}
+
+	// The delivery is on the task record immediately (once, not per write)…
+	v, _ := rs.View(task.ID)
+	if len(v.Artifacts) != 1 || v.Artifacts[0] != "notes/findings.md" {
+		t.Fatalf("delivered file should be recorded live, got %v", v.Artifacts)
+	}
+	// …and completion unions the envelope's list instead of overwriting it.
+	rs.CompleteTask(task.ID, "done", []string{"extra.md"}, nil)
+	v, _ = rs.View(task.ID)
+	if len(v.Artifacts) != 2 {
+		t.Fatalf("completion must keep hub-written artifacts, got %v", v.Artifacts)
+	}
+
+	// The delivery window closes with the task.
+	if err := rs.WriteArtifact(task.ID, "late.md", "x", false); err == nil {
+		t.Fatal("write after terminal state must be refused")
 	}
 }
 

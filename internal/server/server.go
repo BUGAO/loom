@@ -147,6 +147,11 @@ func (s *Server) saveAgent(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Pool agents are workers: the top tier stays reserved for the main agent.
+	if model.CoordinatorOnlyModel(a.Model) {
+		writeErr(w, 400, fmt.Errorf("model %q is reserved for the main agent (planner/coordinator); pool agents cap at opus", a.Model))
+		return
+	}
 	if err := s.store.SaveAgent(a); err != nil {
 		writeErr(w, 400, err)
 		return

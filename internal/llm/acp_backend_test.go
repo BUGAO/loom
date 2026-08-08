@@ -197,6 +197,31 @@ func TestTerminalRunsCommandToExit(t *testing.T) {
 	}
 }
 
+// The adapter's real shape: the ENTIRE shell command line arrives as a single
+// Command string with no Args. This must run under shell semantics — treating
+// it as argv[0] made every non-trivial Bash call die with ENOENT, which is
+// exactly how the poe2-build-advisor run lost all four implementer tasks.
+func TestTerminalRunsBareCommandLineThroughShell(t *testing.T) {
+	c := termClient("Bash")
+	res, err := c.CreateTerminal(context.Background(), acp.CreateTerminalRequest{
+		Command: "echo one && echo two | tr a-z A-Z",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait, err := c.WaitForTerminalExit(context.Background(), acp.WaitForTerminalExitRequest{TerminalId: res.TerminalId})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wait.ExitCode == nil || *wait.ExitCode != 0 {
+		t.Fatalf("want exit 0, got %+v", wait)
+	}
+	out, _ := c.TerminalOutput(context.Background(), acp.TerminalOutputRequest{TerminalId: res.TerminalId})
+	if !strings.Contains(out.Output, "one") || !strings.Contains(out.Output, "TWO") {
+		t.Fatalf("shell operators must work (&&, |), got %q", out.Output)
+	}
+}
+
 func TestTerminalReportsNonZeroExit(t *testing.T) {
 	c := termClient("Bash")
 	res, err := c.CreateTerminal(context.Background(), acp.CreateTerminalRequest{

@@ -133,6 +133,12 @@ type RunSession struct {
 	// outputFrozen pins the exchange directory once the first task has been
 	// dispatched: prompts and contracts reference the path from then on.
 	outputFrozen bool
+	// outputBaseName is the topic name the coordinator last passed to
+	// SetOutputName, BEFORE collision suffixing. Repeating the same name
+	// (name_output, then propose_plan carrying output_name again) must be a
+	// no-op — re-claiming used to collide with the run's own first claim and
+	// silently move the run to "<topic>-2", orphaning the first directory.
+	outputBaseName string
 
 	// inspections counts the coordinator's audited reads of run deliverables.
 	// finish_run(succeeded) is refused while it is zero and artifacts exist:
@@ -210,6 +216,9 @@ func (rs *RunSession) SetOutputName(name string) error {
 	if rs.outputFrozen {
 		return fmt.Errorf("the output folder is already %s and tasks have been dispatched against it; it cannot be renamed", rs.run.OutputDir)
 	}
+	if rs.run.OutputDir != "" && rs.outputBaseName == name {
+		return nil // same topic, same folder — nothing to do
+	}
 	if rs.cfg.OutputRoot == "" {
 		return fmt.Errorf("no output root is configured for this run")
 	}
@@ -217,11 +226,25 @@ func (rs *RunSession) SetOutputName(name string) error {
 	if err != nil {
 		return err
 	}
+	rs.releaseOutputDirLocked(dir)
+	rs.outputBaseName = name
 	rs.run.OutputName = finalName
 	rs.run.OutputDir = dir
 	rs.appendEventLocked("info", "", "output folder named: "+dir)
 	rs.notifyLocked()
 	return nil
+}
+
+// releaseOutputDirLocked drops the run's previous pre-freeze output claim when
+// it is being replaced by newDir. Only an EMPTY directory is removed —
+// os.Remove refuses non-empty ones, which is exactly the safety wanted: a
+// rename never deletes work. Must hold rs.mu.
+func (rs *RunSession) releaseOutputDirLocked(newDir string) {
+	if old := rs.run.OutputDir; old != "" && old != newDir {
+		if err := os.Remove(old); err == nil {
+			rs.appendEventLocked("info", "", "released empty output folder: "+old)
+		}
+	}
 }
 
 // claimOutputDir creates root/name, suffixing -2, -3… when the name is taken.
@@ -439,7 +462,10 @@ func (rs *RunSession) AddAgent(a *model.Agent) {
 // source. Every path — coordinator delegate, peer handoff, external A2A —
 // funnels through Delegate so no caller can dodge the budget.
 type DelegateRequest struct {
-	Agent       string
+	Agent string
+	// Model is the delegator's per-task tier choice (haiku/sonnet/opus/fable
+	// or a full catalog id). Empty means the agent's own default model.
+	Model       string
 	Title       string
 	Instruction string
 	Constraints string // cross-domain constraints the worker cannot infer; required for internal callers
@@ -500,6 +526,28 @@ func (rs *RunSession) Delegate(req DelegateRequest) (*model.Task, error) {
 		rs.mu.Unlock()
 		return nil, fmt.Errorf("instruction is required and must be self-contained: the worker cannot see your context")
 	}
+	taskModel, ok := model.ResolveModel(strings.TrimSpace(req.Model))
+	if !ok {
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("unknown model %q: use a tier alias (haiku for mechanical work, sonnet for standard work, "+
+			"opus for hard reasoning) or omit the field to use the agent's default", req.Model)
+	}
+	if model.CoordinatorOnlyModel(taskModel) {
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("model %q is reserved for the coordinator role; worker tasks cap at opus — "+
+			"use \"opus\" for the hardest delegations", req.Model)
+	}
+	modelCapped := ""
+	if taskModel == "" {
+		taskModel = agent.Model
+		// A legacy or hand-edited pool agent may declare a coordinator-only
+		// default; the ceiling is enforced here, where the session model is
+		// actually decided, and audited below.
+		if model.CoordinatorOnlyModel(taskModel) {
+			modelCapped = taskModel
+			taskModel = model.WorkerModelCeiling
+		}
+	}
 	internal := req.CreatedBy != CreatedByExternal
 	if internal {
 		if strings.TrimSpace(req.Constraints) == "" {
@@ -508,11 +556,10 @@ func (rs *RunSession) Delegate(req DelegateRequest) (*model.Task, error) {
 				"(interfaces to honor, formats, style rules, boundaries with other tasks). Write \"none\" only if there " +
 				"genuinely are none")
 		}
+		// Feasibility needs no per-agent check anymore: every worker can
+		// deliver files through the hub's write_artifact, whatever its own
+		// tool allowlist says.
 		if err := ValidateChecks(req.Acceptance); err != nil {
-			rs.mu.Unlock()
-			return nil, err
-		}
-		if err := ChecksFeasibleFor(agent, req.Acceptance); err != nil {
 			rs.mu.Unlock()
 			return nil, err
 		}
@@ -572,6 +619,7 @@ func (rs *RunSession) Delegate(req DelegateRequest) (*model.Task, error) {
 	t := &model.Task{
 		ID:          store.NewTaskID(),
 		Agent:       req.Agent,
+		Model:       taskModel,
 		Title:       strings.TrimSpace(req.Title),
 		Instruction: req.Instruction,
 		Constraints: strings.TrimSpace(req.Constraints),
@@ -599,7 +647,11 @@ func (rs *RunSession) Delegate(req DelegateRequest) (*model.Task, error) {
 	rs.notifyLocked()
 	rs.mu.Unlock()
 
-	rs.event("task_created", t.ID, fmt.Sprintf("%s → %s: %s (depth %d)", req.CreatedBy, req.Agent, t.Title, t.Depth))
+	rs.event("task_created", t.ID, fmt.Sprintf("%s → %s [%s]: %s (depth %d)", req.CreatedBy, req.Agent, taskModel, t.Title, t.Depth))
+	if modelCapped != "" {
+		rs.event("model_capped", t.ID, fmt.Sprintf("agent %q declares %s, which is reserved for the coordinator; task runs on %s",
+			req.Agent, modelCapped, taskModel))
+	}
 	rs.schedule()
 	return t, nil
 }
@@ -764,7 +816,11 @@ func (rs *RunSession) CompleteTaskWith(taskID, summary string, artifacts []strin
 		t.Status = to // terminal states are absorbing; never leave a zombie
 	}
 	t.Summary = summary
-	t.Artifacts = artifacts
+	// Union, not overwrite: files already delivered through write_artifact
+	// stay on the record even when the final envelope forgets to list them.
+	for _, a := range artifacts {
+		t.Artifacts = appendUnique(t.Artifacts, a)
+	}
 	t.Activity = ""
 	t.EndedAt = time.Now()
 	if summary != "" {
@@ -998,6 +1054,7 @@ func (rs *RunSession) Related(a, b string) bool {
 type TaskView struct {
 	ID         string   `json:"task_id"`
 	Agent      string   `json:"agent"`
+	Model      string   `json:"model,omitempty"`
 	Title      string   `json:"title"`
 	Status     string   `json:"status"`
 	Summary    string   `json:"summary,omitempty"`
@@ -1019,7 +1076,7 @@ type TaskView struct {
 
 func (rs *RunSession) viewLocked(t *model.Task) TaskView {
 	v := TaskView{
-		ID: t.ID, Agent: t.Agent, Title: t.Title, Status: t.Status,
+		ID: t.ID, Agent: t.Agent, Model: t.Model, Title: t.Title, Status: t.Status,
 		Summary: t.Summary, Error: t.Error, Artifacts: t.Artifacts,
 		Activity: t.Activity, Depth: t.Depth, Turns: t.Turns, CostUSD: t.CostUSD,
 	}
@@ -1047,8 +1104,9 @@ func (rs *RunSession) viewLocked(t *model.Task) TaskView {
 
 // AmendAcceptance replaces an in-flight task's acceptance contract. The
 // coordinator can never waive a contract — but a contract that was wrong at
-// delegation time (the trap: artifact checks on a read-only agent) can be
-// corrected, audited, with the worker told at its next turn boundary.
+// delegation time (e.g. it demanded the wrong path) can be corrected,
+// audited, with the worker told at its next turn boundary. Artifact checks
+// are feasible for every agent — the hub's write_artifact sees to that.
 func (rs *RunSession) AmendAcceptance(taskID string, checks []model.AcceptanceCheck) error {
 	if err := ValidateChecks(checks); err != nil {
 		return err
@@ -1063,23 +1121,6 @@ func (rs *RunSession) AmendAcceptance(taskID string, checks []model.AcceptanceCh
 		st := t.Status
 		rs.mu.Unlock()
 		return fmt.Errorf("task %s is already %s; its contract has been judged and cannot be amended", taskID, st)
-	}
-	agent := rs.pool[t.Agent]
-	if agent != nil {
-		if err := ChecksFeasibleFor(agent, checks); err != nil {
-			rs.mu.Unlock()
-			return err
-		}
-	} else {
-		// Unknown agent (e.g. a resumed run whose creator wasn't re-pooled):
-		// feasibility can't be verified, so artifact checks are refused rather
-		// than risked — the trap this feature exists to close.
-		for _, c := range checks {
-			if c.Kind == model.CheckArtifactExists || c.Kind == model.CheckArtifactContains {
-				rs.mu.Unlock()
-				return fmt.Errorf("agent %q is not in this run's pool, so artifact-check feasibility cannot be verified; use command checks", t.Agent)
-			}
-		}
 	}
 	t.Acceptance = checks
 	note := "The acceptance contract of your task was AMENDED. Your work now passes only if the new checks pass:\n" +
@@ -1375,9 +1416,14 @@ func (rs *RunSession) watchStall(ctx context.Context) {
 			return
 		case <-tick.C:
 			rs.mu.Lock()
+			// Waiting on a human is not a stall: a coordinator parked on
+			// ask_user (or the approval gate) has done its part, and a stall
+			// notice here would push it to abandon a legitimate wait.
+			waitingOnHuman := rs.approvalPending ||
+				(rs.run.Coordinator != nil && rs.run.Coordinator.Status == "awaiting_user")
 			idle := time.Since(rs.lastTransition)
 			last := rs.lastTransition
-			stalled := idle > time.Duration(rs.budget.StallSec)*time.Second && last.After(warned)
+			stalled := !waitingOnHuman && idle > time.Duration(rs.budget.StallSec)*time.Second && last.After(warned)
 			if stalled {
 				warned = time.Now()
 				rs.pendingNotice = joinNotice(rs.pendingNotice, fmt.Sprintf(
@@ -1471,6 +1517,84 @@ func (rs *RunSession) AwaitingApproval() bool {
 	return rs.approvalPending
 }
 
+// ---- worker artifact delivery ----
+
+// maxArtifactWriteBytes bounds one write_artifact call; append lets a larger
+// document arrive in chunks without any single call ballooning the transport.
+const maxArtifactWriteBytes = 512 * 1024
+
+// WriteArtifact is the hub's delivery channel for worker output: any worker —
+// including a pure-reasoning agent with no file tools at all — can persist a
+// document into the exchange directory through it. It exists so that "large
+// text goes into md files, never into messages" is an enforceable rule rather
+// than advice a no-tool agent cannot follow.
+func (rs *RunSession) WriteArtifact(taskID, path, content string, appendTo bool) error {
+	if err := checkPathOK(path); err != nil {
+		return err
+	}
+	if len(content) > maxArtifactWriteBytes {
+		return fmt.Errorf("content is %d bytes; one write_artifact call caps at %d — split the document and "+
+			"send the rest with append=true", len(content), maxArtifactWriteBytes)
+	}
+	rs.mu.Lock()
+	t := rs.run.Tasks[taskID]
+	if t == nil {
+		rs.mu.Unlock()
+		return fmt.Errorf("unknown task %s", taskID)
+	}
+	if model.TaskTerminal(t.Status) {
+		st := t.Status
+		rs.mu.Unlock()
+		return fmt.Errorf("task %s is %s; its delivery window has closed", taskID, st)
+	}
+	rs.mu.Unlock()
+
+	full := filepath.Join(rs.Workspace(), path)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return err
+	}
+	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	if appendTo {
+		flags = os.O_CREATE | os.O_WRONLY | os.O_APPEND
+	}
+	f, err := os.OpenFile(full, flags, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	// The delivery is recorded on the task immediately: the UI shows artifacts
+	// live, and completion can only add to this list, never lose it.
+	rs.mu.Lock()
+	if t := rs.run.Tasks[taskID]; t != nil {
+		t.Artifacts = appendUnique(t.Artifacts, path)
+	}
+	rs.notifyLocked()
+	rs.mu.Unlock()
+	mode := ""
+	if appendTo {
+		mode = ", append"
+	}
+	rs.event("artifact_written", taskID, fmt.Sprintf("%s (%d bytes%s)", path, len(content), mode))
+	return nil
+}
+
+// appendUnique adds s to list unless it is already there.
+func appendUnique(list []string, s string) []string {
+	for _, x := range list {
+		if x == s {
+			return list
+		}
+	}
+	return append(list, s)
+}
+
 // ---- coordinator round support ----
 
 // Inspect is the coordinator's audited read of a run deliverable: a file under
@@ -1547,9 +1671,79 @@ func (rs *RunSession) UserChat(text string) error {
 	}
 	rs.run.Chat = append(rs.run.Chat, model.ChatMessage{Ts: time.Now(), From: "user", Text: text})
 	rs.pendingChat = append(rs.pendingChat, text)
+	// An answer arrived: the coordinator is no longer waiting on the user.
+	if rs.run.Coordinator != nil && rs.run.Coordinator.Status == "awaiting_user" {
+		rs.run.Coordinator.Status = "working"
+	}
 	rs.notifyLocked()
 	rs.mu.Unlock()
 	rs.event("chat", "", "user → coordinator: "+firstLine(text, 120))
+	return nil
+}
+
+// AskUser records a clarifying question from the coordinator to the user —
+// the plan-mode interaction: gather what only the user knows, THEN propose.
+// The question lands in the chat, the coordinator card flips to
+// "awaiting_user", and the round driver parks until the user answers (their
+// reply is a first-class wake reason). Counts as a ledger transition, so an
+// ask-only round is acting, not stalling.
+func (rs *RunSession) AskUser(text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fmt.Errorf("question is empty: ask the user something concrete")
+	}
+	rs.mu.Lock()
+	if rs.closed {
+		rs.mu.Unlock()
+		return fmt.Errorf("this run has ended")
+	}
+	rs.run.Chat = append(rs.run.Chat, model.ChatMessage{Ts: time.Now(), From: "coordinator", Text: text})
+	if rs.run.Coordinator != nil {
+		rs.run.Coordinator.Status = "awaiting_user"
+	}
+	rs.notifyLocked()
+	rs.mu.Unlock()
+	rs.event("user_question", "", "coordinator asked the user: "+firstLine(text, 120))
+	return nil
+}
+
+// SetOutputDir points the run's deliverable folder at a user-chosen absolute
+// path instead of the default output root — the user said where the work
+// should land, and that wish is honored verbatim (no -2 suffixing: an existing
+// directory is used as-is). Same freeze rules as SetOutputName.
+func (rs *RunSession) SetOutputDir(dir string) error {
+	dir = strings.TrimSpace(dir)
+	if dir == "~" || strings.HasPrefix(dir, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("cannot resolve ~: %v", err)
+		}
+		dir = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(dir, "~"), "/"))
+	}
+	if !filepath.IsAbs(dir) {
+		return fmt.Errorf("output dir must be an absolute path (or start with ~/); got %q", dir)
+	}
+	dir = filepath.Clean(dir)
+	if home, err := os.UserHomeDir(); dir == "/" || (err == nil && dir == home) {
+		return fmt.Errorf("output dir %q is too broad; use a dedicated subdirectory", dir)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.outputFrozen {
+		return fmt.Errorf("the output folder is already %s and tasks have been dispatched against it; it cannot be moved", rs.run.OutputDir)
+	}
+	if rs.run.OutputDir == dir {
+		return nil // already there
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("cannot create %s: %v", dir, err)
+	}
+	rs.releaseOutputDirLocked(dir)
+	rs.outputBaseName = ""
+	rs.run.OutputName = filepath.Base(dir)
+	rs.run.OutputDir = dir
+	rs.appendEventLocked("info", "", "output folder set by user request: "+dir)
+	rs.notifyLocked()
 	return nil
 }
 

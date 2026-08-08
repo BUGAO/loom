@@ -98,6 +98,10 @@ const MSG_LABEL = {
 const chip = (st, labels = RUN_LABEL) =>
   `<span class="chip ${esc(st)}">${esc(labels[st] || st)}</span>`;
 
+// shortModel compresses a catalog id for badges: claude-opus-5 → opus-5.
+const shortModel = (m) => String(m || "").replace(/^claude-/, "");
+const modelBadge = (m) => (m ? `<span class="badge mbadge" title="${esc(m)}">${esc(shortModel(m))}</span>` : "");
+
 // Costs are API-list-price equivalents, not a bill — every display of one says
 // so, because these runs usually ride a subscription and are billed at zero.
 const fmtCost = (c) => (c > 0 ? "$" + c.toFixed(4) : "—");
@@ -133,8 +137,10 @@ api("/meta").then((m) => (meta = m)).catch(() => {});
 
 // modelSelect renders real model IDs with friendly labels; a stored value not
 // in the server's list (legacy alias, custom id) stays selectable at the top.
-function modelSelect(id, current) {
-  const models = [...meta.models];
+// worker:true hides coordinator-only tiers — pool agents cap at opus, the top
+// tier belongs to the main agent alone.
+function modelSelect(id, current, { worker = false } = {}) {
+  const models = meta.models.filter((m) => !worker || !m.coordinator_only);
   if (current && !models.some((m) => m.id === current)) {
     models.unshift({ id: current, label: current + "(当前值)" });
   }
@@ -189,6 +195,7 @@ async function wfListPage() {
   let sesId = null;  // selected session; null = compose a new one
   let run = null;    // the selected session, fully loaded
   let es = null;
+  let threadId = null; // task whose thread panel is open; null = closed
 
   const terminalRun = (r) => ["succeeded", "failed", "canceled", "interrupted"].includes(r.status);
   const selWf = () => wfs.find((w) => w.id === selId);
@@ -197,6 +204,7 @@ async function wfListPage() {
   const loadRun = async () => {
     run = null;
     sessions = [];
+    threadId = null;
     if (!selId) return;
     try {
       sessions = await api("/runs?workflow_id=" + selId); // newest first
@@ -261,6 +269,7 @@ async function wfListPage() {
     if (nb) nb.addEventListener("click", () => {
       sesId = null;
       run = null;
+      threadId = null;
       sessionStorage.setItem(sesKey(), "new");
       renderSessions(); renderRight(); resub();
     });
@@ -293,6 +302,7 @@ async function wfListPage() {
         sesId = chip.dataset.ses;
         sessionStorage.setItem(sesKey(), sesId);
         run = null;
+        threadId = null;
         try { run = await api("/runs/" + sesId); } catch {}
         renderSessions(); renderRight(); resub();
       }));
@@ -337,14 +347,15 @@ async function wfListPage() {
     if (dyn) {
       const tasks = (run.task_order || []).map((id) => run.tasks[id]).filter(Boolean);
       const rows = tasks.map((t) => `
-        <a class="wf-task ${esc(t.status)}" href="#/runs/${esc(run.id)}">
+        <div class="wf-task ${esc(t.status)}" data-thread="${esc(t.id)}" title="打开该任务的 thread">
           <span class="tdot"></span>
           <span class="ttitle">${esc(t.title || t.id)}</span>
           <span class="tmeta"><span class="mono">${esc(t.agent)}</span>
+            ${modelBadge(t.model)}
             <span>${t.status === "working" && t.activity ? "⚙ " + esc(t.activity) : esc(TASK_LABEL[t.status] || t.status)}</span>
             ${t.failure_kind ? `<span class="mono" style="color:var(--bad)">${esc(t.failure_kind)}</span>` : ""}
           </span>
-        </a>`).join("");
+        </div>`).join("");
       return header + (rows ? `<div class="wf-tasks">${rows}</div>` : '<div class="muted" style="font-size:12px;padding:6px 2px">main agent 还没有派发任务…</div>');
     }
     const nodes = run.plan?.nodes || [];
@@ -360,15 +371,57 @@ async function wfListPage() {
     return header + (rows ? `<div class="wf-tasks">${rows}</div>` : '<div class="muted" style="font-size:12px;padding:6px 2px">planner 正在组装 DAG…</div>');
   };
 
-  // Chat zone: the conversation with the main agent, plus decision moments
-  // (approval, verdict) inline where they happen.
+  // A dispatch card is one delegation shown inline in the conversation — the
+  // thread root, Lark-style: click it to open the coordinator ↔ worker thread.
+  const dispatchCard = (t) => {
+    const who = t.created_by === "coordinator" ? "main agent · 派发任务"
+      : t.created_by === "external" ? "外部 · 提交任务"
+      : `任务 ${esc(String(t.created_by).slice(-8))} · 交接子任务`;
+    const sub = t.status === "working" && t.activity
+      ? `<span class="tact">⚙ ${esc(t.activity)}</span>`
+      : `<span>${esc(TASK_LABEL[t.status] || t.status)}</span>`;
+    const n = (t.messages || []).length;
+    return `
+      <div class="cmsg agent">
+        <div class="cwho">${who} · ${fmtTime(t.created_at)}</div>
+        <div class="dispatch ${esc(t.status)} ${threadId === t.id ? "open" : ""}" data-thread="${esc(t.id)}"
+             title="打开 thread,查看 main agent 与 worker 的完整往来">
+          <span class="tdot"></span>
+          <div class="dmain">
+            <div class="dtitle">${esc(t.title || t.id)}</div>
+            <div class="dmeta">
+              <span class="mono">${esc(t.agent)}</span>
+              ${modelBadge(t.model)}
+              ${sub}
+              ${t.failure_kind ? `<span class="mono" style="color:var(--bad)">${esc(t.failure_kind)}</span>` : ""}
+            </div>
+          </div>
+          <span class="dthread">💬 ${n} ›</span>
+        </div>
+      </div>`;
+  };
+
+  // Chat zone: the conversation with the main agent, with every delegation
+  // shown inline as a thread root at the moment it happened, plus decision
+  // moments (approval, verdict) where they occur.
   const renderChat = () => {
     if (!run) return "";
-    const msgs = (run.chat || []).map((m) => `
+    const items = (run.chat || []).map((m) => ({
+      ts: m.ts,
+      html: `
       <div class="cmsg ${m.from === "user" ? "me" : "agent"}">
         <div class="cwho">${m.from === "user" ? "你" : "main agent"} · ${fmtTime(m.ts)}</div>
         <div class="cbody">${esc(m.text)}</div>
-      </div>`).join("");
+      </div>`,
+    }));
+    if (run.mode === "dynamic") {
+      (run.task_order || []).map((id) => run.tasks[id]).filter(Boolean).forEach((t) =>
+        items.push({ ts: t.created_at, html: dispatchCard(t) }));
+    }
+    // Stable merge by timestamp: a dispatch lands right after the round reply
+    // that announced it.
+    items.sort((a, b) => new Date(a.ts) - new Date(b.ts));
+    const msgs = items.map((i) => i.html).join("");
     let tail = "";
     if (terminalRun(run) && run.mode === "dynamic") {
       const label = run.status === "succeeded" ? "已交付" : RUN_LABEL[run.status] || run.status;
@@ -381,7 +434,7 @@ async function wfListPage() {
           <div class="cbody">
             ${esc(run.proposal.summary || "")}
             <ol style="margin:8px 0 0 18px">${(run.proposal.tasks || []).map((t) =>
-              `<li>${esc(t.title || "")} → <span class="mono">${esc(t.agent)}</span></li>`).join("")}</ol>
+              `<li>${esc(t.title || "")} → <span class="mono">${esc(t.agent)}</span>${modelBadge(t.model)}</li>`).join("")}</ol>
             <div class="row" style="margin-top:10px">
               <button class="small primary" data-act="approve">✓ 批准</button>
               <button class="small danger" data-act="reject">✗ 拒绝</button>
@@ -389,7 +442,9 @@ async function wfListPage() {
           </div>
         </div>`;
     } else if (!terminalRun(run) && run.mode === "dynamic") {
-      tail = `<div class="cmsg agent typing"><div class="cbody">⋯ main agent 工作中(${esc(run.coordinator?.activity || "等待任务推进")})</div></div>`;
+      tail = run.coordinator?.status === "awaiting_user"
+        ? '<div class="cmsg agent typing"><div class="cbody" style="color:var(--warn);font-style:normal">❓ main agent 在等你回答上面的问题——直接在下面输入即可</div></div>'
+        : `<div class="cmsg agent typing"><div class="cbody">⋯ main agent 工作中(${esc(run.coordinator?.activity || "等待任务推进")})</div></div>`;
     }
     return msgs + tail;
   };
@@ -408,6 +463,93 @@ async function wfListPage() {
     if (dryWrap) dryWrap.style.display = !run ? "" : "none";
     st.querySelectorAll("[data-act]").forEach(wireAct);
     log.querySelectorAll("[data-act]").forEach(wireAct);
+    const openThread = (el) => el.addEventListener("click", () => {
+      threadId = threadId === el.dataset.thread ? null : el.dataset.thread;
+      renderRight();
+    });
+    st.querySelectorAll("[data-thread]").forEach(openThread);
+    log.querySelectorAll("[data-thread]").forEach(openThread);
+    renderThread();
+  };
+
+  // Thread panel — the Lark-style side sheet over the conversation: one task's
+  // full coordinator ↔ worker message history, live, with an input to speak
+  // into the task (same audited channel as the coordinator's send_message).
+  const renderThread = () => {
+    const panel = $main.querySelector("#wf-thread");
+    if (!panel) return;
+    const t = threadId && run && run.tasks ? run.tasks[threadId] : null;
+    if (!t) {
+      threadId = null;
+      panel.style.display = "none";
+      panel.innerHTML = "";
+      return;
+    }
+    // Re-rendered on every SSE push: preserve the half-typed reply and the
+    // reading position (unless pinned to the bottom, where new messages land).
+    const prevInput = panel.querySelector("#th-input")?.value ?? "";
+    const prevList = panel.querySelector(".th-msgs");
+    const atBottom = !prevList || prevList.scrollHeight - prevList.scrollTop - prevList.clientHeight < 60;
+    const prevScroll = prevList ? prevList.scrollTop : 0;
+    const live = !["completed", "failed", "canceled"].includes(t.status);
+    const fromLabel = (m) =>
+      m.from === "coordinator" ? "main agent"
+        : m.from === t.id ? t.agent
+        : m.from === "external" ? "外部"
+        : m.from === "user" ? "你"
+        : `任务 ${String(m.from).slice(-8)}`;
+    panel.style.display = "";
+    panel.innerHTML = `
+      <div class="th-head">
+        <div class="th-title">
+          <b>${esc(t.title || t.id)}</b>
+          <div class="th-sub">
+            <span class="mono">${esc(t.agent)}</span>
+            ${modelBadge(t.model)}
+            ${chip(t.status, TASK_LABEL)}
+            ${t.turns > 1 ? `<span>${t.turns} 轮</span>` : ""}
+            ${t.cost_usd ? `<span title="按 API 牌价折算">est. ${fmtCost(t.cost_usd)}</span>` : ""}
+          </div>
+        </div>
+        <a class="btn small" href="#/runs/${esc(run.id)}" title="到运行详情页看完整输出与验收契约">详情</a>
+        <button class="small" id="th-close" title="关闭 thread">✕</button>
+      </div>
+      <div class="th-msgs">
+        ${(t.messages || []).map((m) => `
+          <div class="msg ${esc(m.role)}">
+            <div class="who"><b>${esc(MSG_LABEL[m.role] || m.role)}</b>
+              <span>${esc(fromLabel(m))}</span><span>${fmtTime(m.ts)}</span></div>
+            <div class="body">${esc(m.text)}</div>
+          </div>`).join("") || '<div class="muted" style="font-size:12px;text-align:center;padding:14px 0">还没有消息</div>'}
+        ${t.status === "working" && t.activity ? `<div class="th-live">⚙ ${esc(t.activity)}</div>` : ""}
+        ${t.error ? `<div class="msg" style="border-color:rgba(251,113,133,.5)"><div class="who"><b>错误</b>${t.failure_kind ? `<span class="mono">${esc(t.failure_kind)}</span>` : ""}</div><div class="body" style="color:var(--bad)">${esc(t.error)}</div></div>` : ""}
+        ${t.artifacts?.length ? `<div class="msg result"><div class="who"><b>产物</b></div><div class="body mono" style="font-size:11.5px">${t.artifacts.map(esc).join("<br>")}</div></div>` : ""}
+      </div>
+      ${live ? `
+      <div class="th-input">
+        <textarea id="th-input" rows="2" placeholder="${t.status === "input-required" ? "回答 worker 的反问…" : "对该任务插话或调整方向…"}(Enter 发送)"></textarea>
+        <button class="primary small" id="th-send">发送</button>
+      </div>` : `<div class="th-done muted">任务已${esc(TASK_LABEL[t.status] || t.status)},thread 只读</div>`}`;
+    const list = panel.querySelector(".th-msgs");
+    list.scrollTop = atBottom ? list.scrollHeight : prevScroll;
+    panel.querySelector("#th-close").onclick = () => { threadId = null; renderRight(); };
+    const input = panel.querySelector("#th-input");
+    if (input) {
+      input.value = prevInput;
+      const sendThread = async () => {
+        const text = input.value.trim();
+        if (!text) return;
+        try {
+          await api(`/runs/${run.id}/tasks/${t.id}/message`, { method: "POST", body: { text } });
+          input.value = "";
+        } catch (e) { toast("发送失败:" + e.message); }
+      };
+      panel.querySelector("#th-send").onclick = sendThread;
+      input.addEventListener("keydown", (e) => {
+        if (e.isComposing || e.keyCode === 229) return;
+        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendThread(); }
+      });
+    }
   };
 
   const wireAct = (btn) => btn.addEventListener("click", async () => {
@@ -474,6 +616,7 @@ async function wfListPage() {
         <div class="wf-sessions" id="wf-sessions"></div>
         <div class="wf-status" id="wf-status"></div>
         <div class="wf-chat-log" id="wf-chat-log"></div>
+        <div class="thread-panel" id="wf-thread" style="display:none"></div>
         <div class="wf-chat-input">
           <label class="check" id="wf-dry-wrap" style="font-size:11.5px">
             <input type="checkbox" id="wf-dry" ${meta.default_dry_run ? "checked" : ""}>
@@ -933,7 +1076,7 @@ function renderProposal(p) {
       <div class="muted" style="font-size:12.5px;white-space:pre-wrap">${esc(p.summary || "")}</div>
       <ol>
         ${(p.tasks || []).map((t) => `
-          <li><b>${esc(t.title || "(未命名)")}</b> → <span class="mono">${esc(t.agent)}</span>
+          <li><b>${esc(t.title || "(未命名)")}</b> → <span class="mono">${esc(t.agent)}</span>${modelBadge(t.model)}
             ${t.why ? `<span class="muted"> — ${esc(t.why)}</span>` : ""}</li>`).join("")}
       </ol>
       ${p.agents?.length ? `
@@ -954,7 +1097,9 @@ function renderTaskTree(run, selected) {
 
   const coordCard = c ? `
     <div class="coord">
-      <h3>🧭 coordinator ${chip(c.status === "done" ? "succeeded" : c.status === "failed" ? "failed" : "running")}
+      <h3>🧭 coordinator ${c.status === "awaiting_user"
+        ? '<span class="chip input-required">等待用户回答</span>'
+        : chip(c.status === "done" ? "succeeded" : c.status === "failed" ? "failed" : "running")}
         <span class="badge">${esc(c.model)}</span>
         ${c.rounds ? `<span class="badge" title="每轮上下文由任务台账重建,不跨轮累积">第 ${c.rounds} 轮</span>` : ""}
         <span class="badge" title="按 API 牌价折算">est. ${fmtCost(c.cost_usd)}</span></h3>
@@ -984,6 +1129,7 @@ function renderTaskTree(run, selected) {
         <span class="ttitle">${esc(t.title || t.id)}</span>
         <span class="tmeta">
           <span class="mono">${esc(t.agent)}</span>
+          ${modelBadge(t.model)}
           ${sub}
           ${t.turns > 1 ? `<span>${t.turns} 轮</span>` : ""}
           ${t.duration_ms ? `<span>${fmtDur(t.duration_ms)}</span>` : ""}
@@ -1015,6 +1161,7 @@ function renderTaskDrawer(run, taskID) {
     ${t.status === "working" && t.activity ? `<div class="summary" style="color:var(--run)">⚙ ${esc(t.activity)}</div>` : ""}
     <div class="kv">
       <dt>状态</dt><dd>${chip(t.status, TASK_LABEL)}</dd>
+      ${t.model ? `<dt>模型</dt><dd class="mono">${esc(t.model)}</dd>` : ""}
       <dt>创建者</dt><dd class="mono">${esc(t.created_by)}</dd>
       <dt>深度</dt><dd class="mono">${t.depth}</dd>
       <dt>轮次</dt><dd class="mono">${t.turns || 0}</dd>
@@ -1174,7 +1321,7 @@ function agentModal(agent, _all) {
             <select id="am-runtime" title="该 agent 的会话由谁托管">${meta.runtimes.map((r) =>
               `<option value="${esc(r.id)}" ${(a.runtime || meta.default_runtime) === r.id ? "selected" : ""}>${esc(r.label)}</option>`).join("")}
             </select></label>
-          <label class="field" style="flex:1"><span>模型</span>${modelSelect("am-model", a.model)}</label>
+          <label class="field" style="flex:1"><span>模型(worker 上限 opus;Fable 仅 main agent)</span>${modelSelect("am-model", a.model, { worker: true })}</label>
           <label class="field" style="flex:1"><span>max turns(0=默认)</span><input id="am-turns" type="number" value="${a.max_turns || 0}"></label>
         </div>
         <label class="field"><span>允许的工具(逗号分隔,空=纯文本推理)</span>

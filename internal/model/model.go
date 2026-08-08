@@ -321,8 +321,11 @@ type TaskMessage struct {
 // mode, except it comes into existence at runtime rather than being declared
 // up front.
 type Task struct {
-	ID          string        `json:"id"`
-	Agent       string        `json:"agent"`
+	ID    string `json:"id"`
+	Agent string `json:"agent"`
+	// Model is the model this task's session runs on, resolved at delegation
+	// time: the coordinator's per-task tier choice, or the agent's own default.
+	Model       string        `json:"model,omitempty"`
 	Title       string        `json:"title"`
 	Instruction string        `json:"instruction"`
 	Constraints string        `json:"constraints,omitempty"` // cross-domain constraints, fixed at delegation
@@ -418,7 +421,7 @@ type Run struct {
 type CoordinatorState struct {
 	Agent      string     `json:"agent"` // synthetic name, for cost attribution
 	Model      string     `json:"model"`
-	Status     string     `json:"status"`   // working | awaiting_approval | done | failed
+	Status     string     `json:"status"`   // working | awaiting_user | awaiting_approval | done | failed
 	Activity   string     `json:"activity"` // last tool it called
 	Decision   string     `json:"decision"` // last delegation/verdict, for the card
 	Rounds     int        `json:"rounds"`   // decision rounds driven so far (each = a fresh context)
@@ -436,6 +439,7 @@ type Proposal struct {
 
 type ProposedTask struct {
 	Agent string `json:"agent"`
+	Model string `json:"model,omitempty"` // intended tier/model; display only, the delegate call decides
 	Title string `json:"title"`
 	Why   string `json:"why"`
 }

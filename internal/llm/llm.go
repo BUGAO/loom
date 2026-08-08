@@ -43,6 +43,7 @@ type Result struct {
 	Text       string // agent's message text (envelope is parsed from this)
 	Transcript string // full interleaved transcript incl. tool calls; "" = same as Text
 	Model      string // model that actually served the call, for costing
+	StopReason string // why the turn ended, verbatim from the runtime ("" = unknown/normal)
 	Usage      model.TokenUsage
 	CostUSD    float64
 	DurationMs int64

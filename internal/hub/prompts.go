@@ -55,6 +55,17 @@ message for the user: answer what they asked, or say what you delegated and what
 When a user message changes the goal or scope mid-run, treat it as the requirement it is — re-plan,
 re-scope running tasks via send_message, or delegate anew. Do not silently ignore it.
 
+## Planning with the user (before the plan, not after)
+Before you commit to a plan, collect what only the user can tell you — with the ask_user tool:
+- ALWAYS confirm where the deliverables should land: the default is a topic-named folder under the
+  output root, but the user may want them somewhere specific. Apply their answer with name_output
+  (name for the default root, dir for a user-given path).
+- If the goal leaves real decisions open (scope, tech choices with different cost, priorities),
+  ask those too. Decisions you can make yourself are yours — do not outsource them.
+Batch EVERYTHING into ONE ask_user call and end your turn; the answers arrive as a user message in
+your next round. Then propose the plan (or delegate, if this workflow has no approval gate). One
+ask round is planning; repeated ask rounds are stalling.
+
 ## Delegation discipline
 - Every instruction must be SELF-CONTAINED. The worker cannot see this conversation, the goal, or what
   other workers did. Restate whatever it needs.
@@ -65,14 +76,37 @@ re-scope running tasks via send_message, or delegate anew. Do not silently ignor
   command checks that the engine executes itself when the worker finishes. A task passes only if its
   checks pass — the worker's own report never decides. Write checks that would actually catch a bad
   result, not checks that always pass.
-- Contracts must be FEASIBLE for the assigned agent: artifact checks on an agent without Write/Edit
-  are refused at delegation. You can NEVER waive a contract — telling a worker to "ignore the checks"
-  is a lie the engine will expose. If a contract turns out wrong, fix it with amend_acceptance.
+- command checks run in the ENGINE's own shell, independent of any worker's tools — so for code, the
+  closing milestone must carry real verification commands (build, typecheck, test): file-existence
+  checks prove nothing compiles. Never declare a code goal succeeded on artifact_exists alone.
+- Fix target paths at delegation time: tell the worker the exact directory its deliverables belong
+  in. A "move/copy files" follow-up task is a planning failure — an LLM spending minutes shuttling
+  files one Read/Write at a time is pure waste.
+- Every worker can deliver files: even an agent with no file tools has the hub's write_artifact. So
+  for text-heavy work (research, analysis, review, specs) always demand a Markdown deliverable and
+  pin it in acceptance (artifact_exists / artifact_contains) — never accept the result "in the reply".
+- You can NEVER waive a contract — telling a worker to "ignore the checks" is a lie the engine will
+  expose. If a contract turns out wrong, fix it with amend_acceptance.
 - Deliverables go in the shared exchange directory. Tell each worker which upstream artifacts to read
-  and what to write. Messages are for coordination only: never ask a worker to paste report content
-  into a message, and never accept it as delivery — content belongs in files.
+  and what to write. Downstream tasks read upstream md files from the exchange directory — pass file
+  paths in instructions, never paste one worker's output into another's instruction. Messages are for
+  coordination only: never ask a worker to paste report content into a message, and never accept it
+  as delivery — content belongs in files.
 - Prefer an existing pool agent. Only create one when the goal needs expertise none of them has.
 - Parallelize independent work. Sequence only what genuinely depends on something.
+
+## Model tiering
+Every delegation runs on a model YOU choose — assess each task's difficulty and set delegate's
+model field accordingly:
+- "haiku" — mechanical, low-ambiguity work: reformatting, file assembly, straightforward lookups,
+  boilerplate documentation.
+- "sonnet" — standard engineering and research work; the right default for most tasks.
+- "opus" — genuinely hard reasoning: architecture, cross-cutting design, subtle debugging,
+  high-stakes review.
+Omit the field to use the agent's own default (shown in the pool list). Opus is the CEILING for
+delegated work — the top tier (fable) is reserved for your role and will be refused. Match cost to
+difficulty: do not spend opus on haiku work, and do not send haiku into a task that needs judgment.
+In propose_plan, state the intended tier per task so the human approves the cost shape too.
 
 ## Failure routing (enforced by the engine)
 Failed tasks carry a failure_kind and a route:
@@ -115,10 +149,12 @@ why — an honest failure is worth more than a summary that papers over a gap.
 		fmt.Fprintf(&b, "This run's exchange directory is %s — upstream artifacts live there and every deliverable "+
 			"must be written there.\n", outputDir)
 	} else if outputRoot != "" {
-		fmt.Fprintf(&b, "Deliverables land in %s/<name> — FIRST, before delegating, name the folder by topic with "+
-			"name_output (or propose_plan's output_name): a short kebab-case name like \"trading-health-check\". "+
-			"An unnamed run gets an automatic, unreadable name at first dispatch. The resolved path appears in "+
-			"your round prompt; tell every worker to write deliverables to the exchange directory.\n", outputRoot)
+		fmt.Fprintf(&b, "By default deliverables land in %s/<name>. Confirm the location with the user during "+
+			"planning (see ask_user above): if they accept the default, name the folder by topic with name_output "+
+			"(or propose_plan's output_name) — a short kebab-case name like \"trading-health-check\"; if they name "+
+			"a different location, set it with name_output's dir field. Do this BEFORE delegating — an unnamed run "+
+			"gets an automatic, unreadable name at first dispatch. The resolved path appears in your round prompt; "+
+			"tell every worker to write deliverables to the exchange directory.\n", outputRoot)
 	} else {
 		b.WriteString("Deliverables go to the run's shared exchange directory; its path appears in your round prompt.\n")
 	}
@@ -135,10 +171,11 @@ why — an honest failure is worth more than a summary that papers over a gap.
 		budget.MaxReworksPerTask, budget.RunTimeoutSec)
 
 	if budget.ApprovalPolicy == model.ApprovalInitial {
-		b.WriteString("\n## Approval gate\nThis workflow requires human approval of your initial plan. Call propose_plan " +
-			"BEFORE your first delegate, then END YOUR TURN — the decision may take minutes or hours, and it will " +
-			"wake you as a system notice. Delegations are refused until approval; a rejection notice means revise " +
-			"and re-propose, or finish_run as failed.\n")
+		b.WriteString("\n## Approval gate\nThis workflow requires human approval of your initial plan. The shape of a " +
+			"good opening: ask_user first (location + open questions), get the answers, THEN propose_plan — a plan " +
+			"built on answers beats a plan built on guesses. Call propose_plan BEFORE your first delegate, then END " +
+			"YOUR TURN — the decision may take minutes or hours, and it will wake you as a system notice. Delegations " +
+			"are refused until approval; a rejection notice means revise and re-propose, or finish_run as failed.\n")
 	}
 	if budget.AllowPeerHandoff {
 		b.WriteString("\n## Peer handoff\nWorkers may hand sub-tasks to each other directly. You will see those tasks in " +
@@ -160,7 +197,7 @@ why — an honest failure is worth more than a summary that papers over a gap.
 			flag = " [independent verifier: no context_hint allowed; give it only the requirement, " +
 				"the acceptance criteria and the artifact paths — never the author's summary or reasoning]"
 		}
-		fmt.Fprintf(&b, "- **%s** — %s (tools: %s)%s\n", a.Name, a.Description, tools, flag)
+		fmt.Fprintf(&b, "- **%s** — %s (default model: %s; tools: %s)%s\n", a.Name, a.Description, a.Model, tools, flag)
 	}
 	if wf.Coordinator != nil && strings.TrimSpace(wf.Coordinator.SystemPrompt) != "" {
 		fmt.Fprintf(&b, "\n## Workflow-specific guidance\n%s\n", wf.Coordinator.SystemPrompt)
@@ -262,7 +299,7 @@ func WorkerPrompt(t *model.Task, agent *model.Agent, run *model.Run, workspace s
 		}
 	}
 
-	toolNote := "You have NO file tools: complete the task entirely in your reply text."
+	toolNote := "You have NO file tools of your own — deliver every file through the write_artifact tool below."
 	if agent.Tools != "" {
 		toolNote = fmt.Sprintf(`You have EXACTLY these file tools: %s. Nothing else.
 - Access the exchange directory with ABSOLUTE paths. Do not try to list it first if you lack a shell.
@@ -274,11 +311,18 @@ func WorkerPrompt(t *model.Task, agent *model.Agent, run *model.Run, workspace s
 %s
 
 You also have loom coordination tools:
+- write_artifact — write a file into the exchange directory (works regardless of your file tools;
+  use append=true to deliver a large document in chunks).
 - report_progress — tell the coordinator where you are on a long task. Does not end your task.
 - ask_coordinator — ask when the task is genuinely ambiguous and a wrong guess would waste the work.
   It blocks until you get an answer. Use it instead of inventing an assumption.
-Messages are for COORDINATION, not delivery: keep them short, and never paste report or artifact
-content into a message — deliverables are files in the exchange directory, nothing else counts.
+
+## Delivering text work
+Any substantial text product — a report, an analysis, a spec, a review, anything beyond a dozen
+lines — MUST be delivered as a Markdown file in the exchange directory (via your file tools or
+write_artifact) and listed in your envelope's artifacts. Messages and the envelope summary are for
+COORDINATION only: keep them short and reference file paths. Content pasted into a message or a
+summary does not count as delivery.
 `, toolNote)
 	if peerHandoff {
 		b.WriteString("- handoff — give a sub-task to another agent when it is clearly outside your remit.\n" +
@@ -295,7 +339,7 @@ content into a message — deliverables are files in the exchange directory, not
 ## Output contract
 End your reply with a fenced json block:
 `+"```json"+`
-{"status": "ok", "summary": "<self-contained summary of what you did and produced>", "artifacts": ["<paths relative to the exchange directory>"]}
+{"status": "ok", "summary": "<SHORT summary: what you did and which files you delivered — the substance lives in the artifacts, not here>", "artifacts": ["<paths relative to the exchange directory>"]}
 `+"```"+`
 If you could NOT complete the task, use:
 `+"```json"+`

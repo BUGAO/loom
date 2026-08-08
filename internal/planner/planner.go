@@ -130,6 +130,10 @@ func Validate(p *model.Plan, pool []*model.Agent, maxNodes int, allowCreate bool
 		if !model.ValidModel(a.Model) {
 			return fmt.Errorf("new agent %q uses unknown model %q", a.Name, a.Model)
 		}
+		if model.CoordinatorOnlyModel(a.Model) {
+			return fmt.Errorf("new agent %q uses model %q, which is reserved for the main agent; "+
+				"pool agents cap at opus", a.Name, a.Model)
+		}
 		if !model.ValidRuntime(a.Runtime) {
 			return fmt.Errorf("new agent %q uses unknown runtime %q", a.Name, a.Runtime)
 		}

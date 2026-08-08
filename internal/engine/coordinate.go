@@ -462,10 +462,17 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 	}
 	// The exchange directory is frozen by the dispatch that started this task.
 	workspace := rs.Workspace()
+	// The task carries the model resolved at delegation (the coordinator's
+	// per-task tier choice, or the agent default); legacy tasks fall back to
+	// the agent's model.
+	taskModel := view.Model
+	if taskModel == "" {
+		taskModel = agent.Model
+	}
 	sess, err := llm.Sessions(workerBackend).Open(taskCtx, llm.SessionRequest{
 		Kind:         llm.KindWorker,
 		SystemPrompt: agent.SystemPrompt,
-		Model:        agent.Model,
+		Model:        taskModel,
 		WorkDir:      e.store.AgentHome(agent.Name),
 		AddDirs:      []string{workspace},
 		Tools:        agent.Tools,
@@ -499,7 +506,7 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 		if res != nil {
 			modelID := res.Model
 			if modelID == "" {
-				modelID = agent.Model
+				modelID = taskModel
 			}
 			rs.RecordTaskCost(taskID, modelID, res.Usage, res.CostUSD, res.DurationMs)
 			if res.Usage.Empty() && res.CostUSD == 0 && workerBackend.Name() == "acp" {
@@ -541,8 +548,12 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 			if len(tail) > 300 {
 				tail = "…" + tail[len(tail)-300:]
 			}
+			stop := res.StopReason
+			if stop == "" {
+				stop = "unknown"
+			}
 			rs.CompleteTaskWith(taskID, "", nil, fmt.Errorf(
-				"agent ended without a result envelope (likely stopped early, e.g. after a rejected tool call); output tail: %s", tail),
+				"agent ended its turn (stop reason: %s) without a result envelope — likely stopped early, e.g. after repeated tool errors; output tail: %s", stop, tail),
 				model.FailUnspecified, nil)
 		case lastEnv.Status != "ok":
 			kind := lastEnv.FailureKind

@@ -258,9 +258,9 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
 .events .ev:last-child { border-bottom: none; }
 .ev .ts { color: var(--muted); white-space: nowrap; }
 .ev .tag { width: 100px; flex-shrink: 0; color: var(--muted); }
-.ev.replan .tag, .ev.stall_warning .tag, .ev.budget_hit .tag, .ev.cost_unavailable .tag { color: var(--warn); }
+.ev.replan .tag, .ev.stall_warning .tag, .ev.budget_hit .tag, .ev.cost_unavailable .tag, .ev.model_capped .tag { color: var(--warn); }
 .ev.error .tag { color: var(--bad); }
-.ev.task_created .tag, .ev.handoff .tag, .ev.agent_created .tag { color: #a5b4fc; }
+.ev.task_created .tag, .ev.handoff .tag, .ev.agent_created .tag, .ev.artifact_written .tag { color: #a5b4fc; }
 
 /* agent cards */
 .agent-card { transition: border-color .15s, box-shadow .15s; }
@@ -430,6 +430,7 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
   display: flex; align-items: center; gap: 10px; padding: 7px 11px;
   border: 1px solid var(--border-soft); border-radius: 10px;
   background: rgba(255, 255, 255, 0.02); text-decoration: none; color: var(--text);
+  cursor: pointer;
 }
 .wf-task:hover { border-color: rgba(139, 92, 246, 0.45); }
 .wf-task .tdot { width: 7px; height: 7px; border-radius: 50%; background: var(--idle); flex-shrink: 0; }
@@ -459,6 +460,59 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
   border-color: rgba(139, 92, 246, 0.4);
 }
 .cmsg.typing .cbody { color: var(--muted); font-style: italic; }
+
+/* model tier badge — the per-task model choice, visible wherever a task is */
+.mbadge { color: #c4b5fd; border-color: rgba(139, 92, 246, 0.35); }
+
+/* dispatch card: one delegation, inline in the conversation as a thread root */
+.dispatch {
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  border: 1px solid var(--border); border-radius: 12px; cursor: pointer;
+  background: rgba(255, 255, 255, 0.03); min-width: min(320px, 100%); max-width: 100%;
+  transition: border-color .15s;
+}
+.dispatch:hover { border-color: rgba(139, 92, 246, 0.5); }
+.dispatch.open {
+  border: 1.5px solid transparent; padding: 8.5px 11.5px;
+  background: linear-gradient(#1a2138, #1a2138) padding-box, var(--grad-full) border-box;
+}
+.dispatch .tdot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); flex-shrink: 0; }
+.dispatch.working .tdot { background: #67e8f9; animation: pulse 1.2s infinite; box-shadow: 0 0 8px rgba(103, 232, 249, 0.7); }
+.dispatch.completed .tdot { background: #86efac; }
+.dispatch.failed .tdot { background: #fda4af; }
+.dispatch.input-required .tdot { background: var(--warn); box-shadow: 0 0 8px rgba(251, 191, 36, 0.5); }
+.dispatch .dmain { min-width: 0; }
+.dispatch .dtitle { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dispatch .dmeta { font-size: 11px; color: var(--muted); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 2px; }
+.dispatch .dmeta .tact { color: #67e8f9; }
+.dispatch .dthread { margin-left: auto; padding-left: 8px; font-size: 11.5px; color: #a5b4fc; white-space: nowrap; flex-shrink: 0; }
+
+/* thread panel — Lark-style side sheet over the conversation: one task's full
+   coordinator ↔ worker exchange, live, with an input to speak into the task */
+.wf-right { position: relative; }
+.thread-panel {
+  position: absolute; top: 0; right: 0; bottom: 0; z-index: 6;
+  width: min(430px, 92%);
+  display: flex; flex-direction: column;
+  border: 1px solid var(--border); border-radius: 14px;
+  background: rgba(15, 20, 38, 0.96); backdrop-filter: blur(22px);
+  box-shadow: -16px 0 48px rgba(0, 0, 0, 0.45);
+}
+.th-head {
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+  padding: 12px 14px; border-bottom: 1px solid var(--border-soft);
+}
+.th-title { flex: 1; min-width: 0; }
+.th-title b { font-size: 13.5px; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.th-sub { font-size: 11px; color: var(--muted); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+.th-msgs { flex: 1; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+.th-live { color: #67e8f9; font-size: 11.5px; padding: 2px 2px 0; }
+.th-input {
+  display: flex; gap: 8px; align-items: flex-end; flex-shrink: 0;
+  padding: 10px 12px; border-top: 1px solid var(--border-soft);
+}
+.th-input textarea { resize: none; min-height: 40px; }
+.th-done { font-size: 12px; padding: 10px 14px; border-top: 1px solid var(--border-soft); flex-shrink: 0; }
 
 .wf-chat-input {
   border: 1px solid var(--border); border-radius: 14px;

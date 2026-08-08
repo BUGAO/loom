@@ -306,7 +306,18 @@ func (c *acpClient) CreateTerminal(ctx context.Context, p acp.CreateTerminalRequ
 	if p.OutputByteLimit != nil && *p.OutputByteLimit > 0 {
 		t.limit = *p.OutputByteLimit
 	}
-	cmd := exec.Command(p.Command, p.Args...)
+	// claude-code-acp sends the ENTIRE shell command line as a single string
+	// in Command, with no Args — `cd x && npm install | tail -20` arrives as
+	// one token. Executing that as a bare argv[0] means looking for a binary
+	// literally named "cd x && npm install | tail -20": ENOENT on every
+	// non-trivial command, which is how a whole run's Bash silently died.
+	// A terminal's contract is shell semantics, so give it a shell.
+	var cmd *exec.Cmd
+	if len(p.Args) > 0 {
+		cmd = exec.Command(p.Command, p.Args...)
+	} else {
+		cmd = exec.Command("/bin/sh", "-c", p.Command)
+	}
 	if p.Cwd != nil && *p.Cwd != "" {
 		cmd.Dir = *p.Cwd
 	}
@@ -609,6 +620,7 @@ func (s *acpSession) Prompt(ctx context.Context, text string) (*Result, error) {
 		Text:       msgText.String(),
 		Transcript: transcript.String(),
 		Model:      s.req.Model,
+		StopReason: string(resp.StopReason),
 		DurationMs: time.Since(start).Milliseconds(),
 	}
 	s.collectUsage(res)

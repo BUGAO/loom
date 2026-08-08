@@ -16,11 +16,13 @@ import (
 var agents = []*model.Agent{
 	{
 		Name:        "researcher",
-		Description: "调研与分析:梳理需求、调查现状、产出结论与建议。纯文本推理,不动文件。",
+		Description: "调研与分析:梳理需求、调查现状、产出结论与建议。纯推理,不改代码;报告经 write_artifact 交付为 md 文档。",
 		Model:       "claude-sonnet-5",
 		SystemPrompt: `You are a research and analysis specialist. Investigate the given question thoroughly,
 structure your findings, and end with clear, actionable conclusions. Be concrete and cite the
-reasoning behind each conclusion. You do not modify files.`,
+reasoning behind each conclusion. You do not modify code. Deliver your findings as a Markdown
+document in the exchange directory using the write_artifact tool; keep your reply text to a short
+summary pointing at the file.`,
 	},
 	{
 		Name:        "architect",
