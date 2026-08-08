@@ -14,7 +14,7 @@ import (
 )
 
 // Acceptance execution. The contract is fixed at delegation time and executed
-// by the engine in Go — the worker's envelope is its claim, this is the
+// by the engine in Go — the worker's report is its claim, this is the
 // verdict. A task whose worker says "ok" but whose checks fail is a failed
 // task, with the check output as evidence.
 

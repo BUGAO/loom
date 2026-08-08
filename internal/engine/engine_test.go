@@ -306,3 +306,35 @@ func TestCancel(t *testing.T) {
 		t.Fatalf("want canceled, got %s", final.Status)
 	}
 }
+
+// Regression: an envelope whose summary quotes something in backticks (a
+// command, a filename) must still parse — the old pattern excluded backticks
+// from the JSON body outright, so an otherwise-successful task was failed as
+// "no result envelope".
+func TestParseEnvelopeToleratesBackticksInStrings(t *testing.T) {
+	text := "All done.\n\n```json\n" +
+		`{"status": "ok", "summary": "fixed the broken ` + "`npm run typecheck`" + ` script", "artifacts": ["report.md"]}` +
+		"\n```"
+	env, ok := parseEnvelope(text)
+	if !ok {
+		t.Fatal("envelope with backticks in a string must parse")
+	}
+	if env.Status != "ok" || len(env.Artifacts) != 1 {
+		t.Fatalf("unexpected envelope: %+v", env)
+	}
+}
+
+func TestParseEnvelopeSkipsNonEnvelopeBlocks(t *testing.T) {
+	// Fenced JSON without a "status" field is code being quoted, not a result;
+	// the real envelope after it must still be found.
+	text := "Here is the config I wrote:\n\n```json\n{\"port\": 8080}\n```\n\n" +
+		"```json\n{\"status\": \"error\", \"failure_kind\": \"blocked\", \"summary\": \"stuck\"}\n```"
+	env, ok := parseEnvelope(text)
+	if !ok || env.Status != "error" || env.FailureKind != "blocked" {
+		t.Fatalf("expected the trailing envelope, got %+v (ok=%v)", env, ok)
+	}
+
+	if _, ok := parseEnvelope("no envelope here, just prose"); ok {
+		t.Fatal("prose must not parse as an envelope")
+	}
+}

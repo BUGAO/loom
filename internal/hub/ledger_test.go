@@ -825,3 +825,38 @@ func TestStallNoticeTakenOnce(t *testing.T) {
 		t.Fatalf("notice should be consumed once, got it again: %q", n)
 	}
 }
+
+// report_result is the primary result channel: the report is held on the
+// control block until the engine collects it at the turn boundary, a repeat
+// call replaces it, and collecting clears it (a steering-continued turn must
+// not inherit a stale "done" report).
+func TestReportResultHeldAndTakenOnce(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	task := mustDelegate(t, rs, "alpha")
+	rs.TaskStarted(task.ID)
+
+	if _, ok := rs.TakeReportedResult(task.ID); ok {
+		t.Fatal("no report was made yet")
+	}
+	if err := rs.ReportResult(task.ID, ReportedResult{Status: "error", FailureKind: "blocked", Summary: "first"}); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	if err := rs.ReportResult(task.ID, ReportedResult{Status: "ok", Summary: "second", Artifacts: []string{"a.md"}}); err != nil {
+		t.Fatalf("second report should replace the first: %v", err)
+	}
+	rep, ok := rs.TakeReportedResult(task.ID)
+	if !ok || rep.Status != "ok" || rep.Summary != "second" || len(rep.Artifacts) != 1 {
+		t.Fatalf("expected the latest report, got %+v (ok=%v)", rep, ok)
+	}
+	if _, ok := rs.TakeReportedResult(task.ID); ok {
+		t.Fatal("a taken report must be cleared")
+	}
+
+	rs.CompleteTask(task.ID, "done", nil, nil)
+	if err := rs.ReportResult(task.ID, ReportedResult{Status: "ok"}); err == nil {
+		t.Fatal("reporting on a terminal task must be refused")
+	}
+	if err := rs.ReportResult("task_missing", ReportedResult{Status: "ok"}); err == nil {
+		t.Fatal("reporting on an unknown task must be refused")
+	}
+}

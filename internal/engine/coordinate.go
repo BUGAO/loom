@@ -532,10 +532,19 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 			rs.CompleteTask(taskID, "", nil, err)
 			return
 		}
-		lastEnv, haveEnv = parseEnvelope(res.Text)
+		// The structured report_result call is the primary channel; a trailing
+		// envelope in the reply text is the fallback for sessions that never
+		// made the call (older agents, tool trouble).
+		if rep, ok := rs.TakeReportedResult(taskID); ok {
+			lastEnv = envelope{Status: rep.Status, FailureKind: rep.FailureKind,
+				Summary: rep.Summary, Artifacts: rep.Artifacts}
+			haveEnv = true
+		} else {
+			lastEnv, haveEnv = parseEnvelope(res.Text)
+		}
 
 		// Steering that arrived mid-turn is delivered now: the task continues
-		// for another turn and any envelope from this turn is superseded,
+		// for another turn and any result from this turn is superseded,
 		// because the task plainly is not finished (docs/DECISIONS-v2.md D4).
 		if inbox := rs.TakeInbox(taskID); len(inbox) > 0 && used < max {
 			prompt = hub.FollowupPrompt(inbox)
@@ -553,7 +562,7 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 				stop = "unknown"
 			}
 			rs.CompleteTaskWith(taskID, "", nil, fmt.Errorf(
-				"agent ended its turn (stop reason: %s) without a result envelope — likely stopped early, e.g. after repeated tool errors; output tail: %s", stop, tail),
+				"agent ended its turn (stop reason: %s) without reporting a result (no report_result call, no trailing envelope) — likely stopped early, e.g. after repeated tool errors; output tail: %s", stop, tail),
 				model.FailUnspecified, nil)
 		case lastEnv.Status != "ok":
 			kind := lastEnv.FailureKind

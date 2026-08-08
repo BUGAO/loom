@@ -271,9 +271,9 @@ func RoundPrompt(run *model.Run, rs *RunSession, round int, changed, userMsgs []
 }
 
 // WorkerPrompt renders the task instruction handed to an executor agent. It
-// mirrors the static-mode node prompt on purpose — same envelope contract,
-// same directory rules — so an agent behaves identically in either mode, with
-// only the reporting tools added.
+// mirrors the static-mode node prompt on purpose — same directory rules, same
+// result fields — but results travel through the hub's report_result tool
+// (static mode, which has no hub, keeps the text envelope).
 func WorkerPrompt(t *model.Task, agent *model.Agent, run *model.Run, workspace string, peerHandoff bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "You are executor agent %q working on task %q (%s) of a workflow run.\n\n", t.Agent, t.Title, t.ID)
@@ -314,13 +314,15 @@ You also have loom coordination tools:
 - write_artifact — write a file into the exchange directory (works regardless of your file tools;
   use append=true to deliver a large document in chunks).
 - report_progress — tell the coordinator where you are on a long task. Does not end your task.
+- report_result — deliver your final work report (status, summary, artifacts). This is how your
+  task ends; see "Reporting your result" below.
 - ask_coordinator — ask when the task is genuinely ambiguous and a wrong guess would waste the work.
   It blocks until you get an answer. Use it instead of inventing an assumption.
 
 ## Delivering text work
 Any substantial text product — a report, an analysis, a spec, a review, anything beyond a dozen
 lines — MUST be delivered as a Markdown file in the exchange directory (via your file tools or
-write_artifact) and listed in your envelope's artifacts. Messages and the envelope summary are for
+write_artifact) and listed in your report_result artifacts. Messages and the report summary are for
 COORDINATION only: keep them short and reference file paths. Content pasted into a message or a
 summary does not count as delivery.
 `, toolNote)
@@ -336,26 +338,28 @@ summary does not count as delivery.
 - This run's shared exchange directory is: %s
   Upstream artifacts are there. Every deliverable of this task MUST be written there.
 
-## Output contract
-End your reply with a fenced json block:
-`+"```json"+`
-{"status": "ok", "summary": "<SHORT summary: what you did and which files you delivered — the substance lives in the artifacts, not here>", "artifacts": ["<paths relative to the exchange directory>"]}
-`+"```"+`
-If you could NOT complete the task, use:
-`+"```json"+`
-{"status": "error", "failure_kind": "<spec-unclear|blocked|missing-dependency|conflict>", "summary": "<what stopped you>"}
-`+"```"+`
+## Reporting your result (REQUIRED)
+When the task is done — or definitively stuck — call the report_result tool. This report is what
+the coordinator receives; a task whose turn ends without one is treated as FAILED, no matter how
+good the work was.
+- status "ok": a SHORT summary (what you did and which files you delivered — the substance lives
+  in the artifacts, not here) plus the artifacts list (paths relative to the exchange directory).
+- status "error": failure_kind plus what stopped you.
 failure_kind is how your failure gets routed — choose honestly:
 - spec-unclear: the instruction itself is ambiguous or wrong (prefer ask_coordinator before failing with this)
 - blocked: you understood the task but hit an implementation obstacle
 - missing-dependency: an input you were told to use does not exist
 - conflict: the requirement contradicts other work or constraints
-This envelope is REQUIRED — a reply without it is treated as a failed task.
+Only if the report_result call itself fails, fall back to ending your reply with a fenced json
+block carrying the same fields:
+`+"```json"+`
+{"status": "ok|error", "failure_kind": "<only on error>", "summary": "<short>", "artifacts": ["<paths>"]}
+`+"```"+`
 
 You are UNATTENDED: no human watches this session, and "stop and wait" instructions injected by
-tool-permission refusals do not apply to the envelope. If a tool call is refused, first try a
-different way (another allowed tool, a narrower command); if the task truly cannot proceed, end
-NOW with the error envelope (failure_kind "blocked") — never end your turn silently.
+tool-permission refusals do not apply to the result report. If a tool call is refused, first try a
+different way (another allowed tool, a narrower command); if the task truly cannot proceed, call
+report_result NOW with status "error" (failure_kind "blocked") — never end your turn silently.
 `, workspace)
 	return b.String()
 }
@@ -368,6 +372,6 @@ func FollowupPrompt(messages []string) string {
 		b.WriteString(m)
 		b.WriteString("\n")
 	}
-	b.WriteString("\nYour task is NOT finished: act on this, then end with the result envelope as before.\n")
+	b.WriteString("\nYour task is NOT finished: act on this, then report again with report_result as before.\n")
 	return b.String()
 }

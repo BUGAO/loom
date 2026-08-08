@@ -384,6 +384,9 @@ func (s *mockSession) work(ctx context.Context, prompt string, call callFn) (str
 	case <-time.After(s.mock.delay()):
 	}
 
+	// The failure path deliberately reports through the text envelope, keeping
+	// the engine's fallback parser exercised; the success path below uses the
+	// primary report_result tool.
 	if strings.Contains(prompt, "MOCK_FAIL") {
 		env, _ := json.Marshal(map[string]any{
 			"status": "error", "failure_kind": "blocked", "summary": "(mock) simulated task failure",
@@ -407,12 +410,16 @@ func (s *mockSession) work(ctx context.Context, prompt string, call callFn) (str
 			}
 		}
 	}
-	env, _ := json.Marshal(map[string]any{
-		"status":    "ok",
-		"summary":   "(mock) task completed",
-		"artifacts": artifacts,
-	})
-	return "Mock worker transcript.\n\n```json\n" + string(env) + "\n```", nil
+	if _, err := call("report_result", map[string]any{
+		"status": "ok", "summary": "(mock) task completed", "artifacts": artifacts,
+	}); err != nil {
+		// Same degradation path a real agent is told to take: envelope in text.
+		env, _ := json.Marshal(map[string]any{
+			"status": "ok", "summary": "(mock) task completed", "artifacts": artifacts,
+		})
+		return "Mock worker transcript.\n\n```json\n" + string(env) + "\n```", nil
+	}
+	return "Mock worker transcript.", nil
 }
 
 // exchangeDirOf extracts the run's exchange directory from a worker prompt.

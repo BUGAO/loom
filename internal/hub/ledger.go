@@ -175,7 +175,19 @@ type taskCtrl struct {
 	// answer unblocks a worker parked in ask_coordinator. Buffered so the
 	// answering side never blocks on a worker that gave up.
 	answer chan string
-	cancel context.CancelFunc
+	// reported is the work report delivered through report_result, held until
+	// the engine collects it at the turn boundary.
+	reported *ReportedResult
+	cancel   context.CancelFunc
+}
+
+// ReportedResult is a worker's final work report, delivered structurally
+// through the report_result tool instead of being parsed out of reply text.
+type ReportedResult struct {
+	Status      string
+	FailureKind string
+	Summary     string
+	Artifacts   []string
 }
 
 func (rs *RunSession) newTaskCtrl() *taskCtrl {
@@ -817,7 +829,7 @@ func (rs *RunSession) CompleteTaskWith(taskID, summary string, artifacts []strin
 	}
 	t.Summary = summary
 	// Union, not overwrite: files already delivered through write_artifact
-	// stay on the record even when the final envelope forgets to list them.
+	// stay on the record even when the final report forgets to list them.
 	for _, a := range artifacts {
 		t.Artifacts = appendUnique(t.Artifacts, a)
 	}
@@ -1016,6 +1028,38 @@ func (rs *RunSession) Progress(taskID, text string) error {
 	rs.mu.Unlock()
 	rs.event("task_message", taskID, "progress: "+firstLine(text, 120))
 	return nil
+}
+
+// ReportResult records the worker's final report. The task does not settle
+// here — the engine collects the report at the turn boundary and still runs
+// the acceptance contract itself. Calling again in the same turn replaces the
+// earlier report.
+func (rs *RunSession) ReportResult(taskID string, r ReportedResult) error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	t := rs.run.Tasks[taskID]
+	ctrl := rs.ctrl[taskID]
+	if t == nil || ctrl == nil || model.TaskTerminal(t.Status) {
+		return fmt.Errorf("task %s is not active", taskID)
+	}
+	ctrl.reported = &r
+	return nil
+}
+
+// TakeReportedResult hands the engine the report of the turn just ended, if
+// any, and clears it — a task continued by steering starts the next turn with
+// a clean slate, because a report made before the steering arrived no longer
+// describes a finished task.
+func (rs *RunSession) TakeReportedResult(taskID string) (ReportedResult, bool) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	ctrl := rs.ctrl[taskID]
+	if ctrl == nil || ctrl.reported == nil {
+		return ReportedResult{}, false
+	}
+	r := *ctrl.reported
+	ctrl.reported = nil
+	return r, true
 }
 
 // PeerMessage records a worker-to-worker exchange on both tasks' ledgers.

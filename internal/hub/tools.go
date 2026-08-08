@@ -449,6 +449,13 @@ type askAgentIn struct {
 	Question string `json:"question"`
 }
 
+type reportResultIn struct {
+	Status      string   `json:"status" jsonschema:"ok | error"`
+	FailureKind string   `json:"failure_kind,omitempty" jsonschema:"required when status=error: spec-unclear | blocked | missing-dependency | conflict"`
+	Summary     string   `json:"summary" jsonschema:"SHORT: what you did and which files you delivered, or what stopped you — the substance lives in the artifacts, not here"`
+	Artifacts   []string `json:"artifacts,omitempty" jsonschema:"paths relative to the exchange directory"`
+}
+
 func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskID string) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "write_artifact",
@@ -461,7 +468,7 @@ func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskID string) {
 			return toolErr("%v", err), nil, nil
 		}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(
-			"Wrote %s (%d bytes) into the exchange directory. List it in your final envelope's artifacts.",
+			"Wrote %s (%d bytes) into the exchange directory. List it in your report_result artifacts.",
 			in.Path, len(in.Content))}}}, nil, nil
 	})
 
@@ -474,6 +481,32 @@ func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskID string) {
 			return toolErr("%v", err), nil, nil
 		}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Progress recorded."}}}, nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "report_result",
+		Description: "Deliver your final work report: status, a SHORT summary, and the artifact list. Call this " +
+			"when the task is done (or definitively stuck), then end your turn — the engine settles your task " +
+			"from this report and runs the acceptance checks itself. Calling again replaces the earlier report.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in reportResultIn) (*mcp.CallToolResult, any, error) {
+		status := strings.ToLower(strings.TrimSpace(in.Status))
+		if status != "ok" && status != "error" {
+			return toolErr("status must be \"ok\" or \"error\", got %q", in.Status), nil, nil
+		}
+		kind := in.FailureKind
+		if status == "error" && !model.ValidFailureKind(kind) {
+			return toolErr("status \"error\" requires failure_kind: spec-unclear | blocked | missing-dependency | conflict"), nil, nil
+		}
+		if status == "ok" {
+			kind = ""
+		}
+		if err := rs.ReportResult(taskID, ReportedResult{
+			Status: status, FailureKind: kind, Summary: in.Summary, Artifacts: in.Artifacts,
+		}); err != nil {
+			return toolErr("%v", err), nil, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Result recorded. " +
+			"End your turn now — the engine settles your task from this report."}}}, nil, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{

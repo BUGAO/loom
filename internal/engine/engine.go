@@ -909,7 +909,10 @@ Use "status": "error" with an explanatory summary if you could not complete the 
 	return b.String()
 }
 
-var envelopeRe = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{[^`]*\"status\"[^`]*\\})\\s*```")
+// The body match is lazy, not [^`]*: a backtick inside a JSON string (e.g. a
+// summary quoting `a command`) must not break the match. Non-envelope fenced
+// JSON is filtered below by requiring "status" and a clean unmarshal.
+var envelopeRe = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{.*?\\})\\s*```")
 
 type envelope struct {
 	Status      string   `json:"status"`
@@ -924,16 +927,21 @@ type envelope struct {
 // exactly this shape, and defaulting it to "ok" silently green-lights a node
 // that did nothing.
 func parseEnvelope(text string) (envelope, bool) {
-	env := envelope{Status: "ok"}
-	if ms := envelopeRe.FindAllStringSubmatch(text, -1); len(ms) > 0 {
-		if err := json.Unmarshal([]byte(ms[len(ms)-1][1]), &env); err == nil {
+	ms := envelopeRe.FindAllStringSubmatch(text, -1)
+	for i := len(ms) - 1; i >= 0; i-- {
+		body := ms[i][1]
+		if !strings.Contains(body, `"status"`) {
+			continue
+		}
+		env := envelope{Status: "ok"}
+		if err := json.Unmarshal([]byte(body), &env); err == nil {
 			if env.Status == "" {
 				env.Status = "ok"
 			}
 			return env, true
 		}
 	}
-	return env, false
+	return envelope{Status: "ok"}, false
 }
 
 // execNode runs one node with retries and reports on the results channel.
