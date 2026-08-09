@@ -87,6 +87,20 @@ type Session interface {
 	Close() error
 }
 
+// Image is one inline image attachment for a prompt turn.
+type Image struct {
+	Name     string // display / audit name (upload filename)
+	MimeType string // image/png, image/jpeg, image/webp, image/gif
+	Data     []byte // raw bytes (encoding is the transport's business)
+}
+
+// ImageSession is optionally implemented by sessions whose transport can carry
+// inline images with a prompt. Callers must check for it and fall back to a
+// text-only Prompt when it is absent — never assume every runtime has eyes.
+type ImageSession interface {
+	PromptImages(ctx context.Context, text string, images []Image) (*Result, error)
+}
+
 // SessionBackend is a backend that can hold a session open. Backends without a
 // native session concept (the CLI) are adapted by SingleShotSessions.
 type SessionBackend interface {

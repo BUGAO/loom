@@ -3,6 +3,7 @@ package llm
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -483,9 +484,14 @@ type acpSession struct {
 
 	usageMu   sync.Mutex
 	lastUsage modelUsage // per-model totals as of the previous turn
+
+	// imageOK mirrors the agent's advertised promptCapabilities.image; images
+	// are only sent when the runtime declared it can receive them.
+	imageOK bool
 }
 
 var _ Session = (*acpSession)(nil)
+var _ ImageSession = (*acpSession)(nil)
 
 func (a *ACP) Open(ctx context.Context, req SessionRequest) (Session, error) {
 	// Fail closed: without the jail on disk, the allowlist is advisory.
@@ -515,7 +521,7 @@ func (a *ACP) Open(ctx context.Context, req SessionRequest) (Session, error) {
 
 	initCtx, cancelInit := context.WithTimeout(ctx, 60*time.Second)
 	defer cancelInit()
-	if _, err := s.conn.Initialize(initCtx, acp.InitializeRequest{
+	init, err := s.conn.Initialize(initCtx, acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		ClientCapabilities: acp.ClientCapabilities{
 			Fs: acp.FileSystemCapabilities{ReadTextFile: false, WriteTextFile: false},
@@ -524,10 +530,12 @@ func (a *ACP) Open(ctx context.Context, req SessionRequest) (Session, error) {
 			// honest capability is true, backed by a real implementation.
 			Terminal: true,
 		},
-	}); err != nil {
+	})
+	if err != nil {
 		s.Close()
 		return nil, fmt.Errorf("acp initialize: %w (stderr: %s)", err, s.stderrTail())
 	}
+	s.imageOK = init.AgentCapabilities.PromptCapabilities.Image
 	sess, err := s.conn.NewSession(initCtx, acp.NewSessionRequest{
 		Cwd:        req.WorkDir,
 		McpServers: mcpServers(req.MCPServers),
@@ -581,6 +589,30 @@ func (s *acpSession) stderrTail() string {
 }
 
 func (s *acpSession) Prompt(ctx context.Context, text string) (*Result, error) {
+	return s.promptBlocks(ctx, []acp.ContentBlock{acp.TextBlock(text)})
+}
+
+// PromptImages sends one turn carrying inline images. When the agent did not
+// advertise image support the images are withheld and the model is told so in
+// plain text — a silent drop would leave it answering about pictures it never
+// saw.
+func (s *acpSession) PromptImages(ctx context.Context, text string, images []Image) (*Result, error) {
+	if len(images) == 0 || !s.imageOK {
+		if len(images) > 0 {
+			text += fmt.Sprintf("\n\n[NOTE: the user attached %d image(s), but this agent runtime does not "+
+				"accept image input — ask the user to describe the content instead.]", len(images))
+		}
+		return s.promptBlocks(ctx, []acp.ContentBlock{acp.TextBlock(text)})
+	}
+	blocks := make([]acp.ContentBlock, 0, len(images)+1)
+	blocks = append(blocks, acp.TextBlock(text))
+	for _, img := range images {
+		blocks = append(blocks, acp.ImageBlock(base64.StdEncoding.EncodeToString(img.Data), img.MimeType))
+	}
+	return s.promptBlocks(ctx, blocks)
+}
+
+func (s *acpSession) promptBlocks(ctx context.Context, blocks []acp.ContentBlock) (*Result, error) {
 	var msgText, transcript strings.Builder
 	lastThought := false
 	s.client.setCollectors(
@@ -628,7 +660,7 @@ func (s *acpSession) Prompt(ctx context.Context, text string) (*Result, error) {
 
 	resp, err := s.conn.Prompt(promptCtx, acp.PromptRequest{
 		SessionId: s.id,
-		Prompt:    []acp.ContentBlock{acp.TextBlock(text)},
+		Prompt:    blocks,
 	})
 	res := &Result{
 		Text:       msgText.String(),

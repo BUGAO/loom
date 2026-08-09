@@ -3,6 +3,7 @@ package server
 
 import (
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strings"
 
 	"loom/internal/engine"
+	"loom/internal/llm"
 	"loom/internal/model"
 	"loom/internal/store"
 )
@@ -65,6 +67,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/runs/{id}/tasks/{task}/message", s.sendTaskMessage)
 	mux.HandleFunc("GET /api/runs/{id}/events", s.streamRun)
 	mux.HandleFunc("GET /api/runs/{id}/nodes/{node}/output", s.nodeOutput)
+	mux.HandleFunc("GET /api/runs/{id}/uploads/{name}", s.getUpload)
 
 	// The hub's own surfaces: MCP for loom's agents, A2A for outside clients.
 	if s.hub != nil {
@@ -301,6 +304,45 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, run)
 }
 
+// chatImage is one image attached to a chat message: base64 payload plus its
+// declared MIME type. Decoding and limits live in decodeImages.
+type chatImage struct {
+	Mime string `json:"mime"`
+	Data string `json:"data"` // base64 (no data: URL prefix)
+}
+
+const (
+	maxChatImages    = 10
+	maxChatImageSize = 8 << 20 // 8 MiB decoded, per image
+)
+
+// decodeImages validates and decodes chat image attachments.
+func decodeImages(in []chatImage) ([]llm.Image, error) {
+	if len(in) > maxChatImages {
+		return nil, fmt.Errorf("at most %d images per message", maxChatImages)
+	}
+	out := make([]llm.Image, 0, len(in))
+	for i, img := range in {
+		switch img.Mime {
+		case "image/png", "image/jpeg", "image/webp", "image/gif":
+		default:
+			return nil, fmt.Errorf("image %d: unsupported type %q (accepted: png, jpeg, webp, gif)", i+1, img.Mime)
+		}
+		data, err := base64.StdEncoding.DecodeString(img.Data)
+		if err != nil {
+			return nil, fmt.Errorf("image %d: invalid base64: %v", i+1, err)
+		}
+		if len(data) == 0 {
+			return nil, fmt.Errorf("image %d is empty", i+1)
+		}
+		if len(data) > maxChatImageSize {
+			return nil, fmt.Errorf("image %d exceeds %d MB", i+1, maxChatImageSize>>20)
+		}
+		out = append(out, llm.Image{MimeType: img.Mime, Data: data})
+	}
+	return out, nil
+}
+
 // chatWorkflow is the conversational entry point: a message to a workflow's
 // main agent. A session IS a run: messages continue the addressed session —
 // reopening it if it had finished — and only new_session (or a workflow with
@@ -313,20 +355,26 @@ func (s *Server) chatWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body, ok := readBody[struct {
-		Text       string `json:"text"`
-		DryRun     bool   `json:"dry_run"`
-		RunID      string `json:"run_id"`      // the session to continue; empty = active or latest
-		NewSession bool   `json:"new_session"` // force a fresh session
+		Text       string      `json:"text"`
+		Images     []chatImage `json:"images"`
+		DryRun     bool        `json:"dry_run"`
+		RunID      string      `json:"run_id"`      // the session to continue; empty = active or latest
+		NewSession bool        `json:"new_session"` // force a fresh session
 	}](w, r)
 	if !ok {
 		return
 	}
-	if strings.TrimSpace(body.Text) == "" {
+	if strings.TrimSpace(body.Text) == "" && len(body.Images) == 0 {
 		writeErr(w, 400, fmt.Errorf("text is required"))
 		return
 	}
+	images, err := decodeImages(body.Images)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
 	if wf.EffectiveMode() != model.ModeDynamic || body.NewSession {
-		run, err := s.engine.StartRun(wf, body.Text, body.DryRun)
+		run, err := s.engine.StartRun(wf, body.Text, body.DryRun, images...)
 		if err != nil {
 			writeErr(w, 400, err)
 			return
@@ -353,7 +401,7 @@ func (s *Server) chatWorkflow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if target == "" {
-		run, err := s.engine.StartRun(wf, body.Text, body.DryRun)
+		run, err := s.engine.StartRun(wf, body.Text, body.DryRun, images...)
 		if err != nil {
 			writeErr(w, 400, err)
 			return
@@ -364,8 +412,8 @@ func (s *Server) chatWorkflow(w http.ResponseWriter, r *http.Request) {
 
 	// Continue the session: live runs get the message directly; finished ones
 	// are reopened by it.
-	if err := s.engine.ChatToRun(target, body.Text); err != nil {
-		if _, rerr := s.engine.ReopenRun(target, body.Text); rerr != nil {
+	if err := s.engine.ChatToRun(target, body.Text, images...); err != nil {
+		if _, rerr := s.engine.ReopenRun(target, body.Text, images...); rerr != nil {
 			writeErr(w, 400, fmt.Errorf("cannot continue session %s: %v", target, rerr))
 			return
 		}
@@ -381,16 +429,35 @@ func (s *Server) chatWorkflow(w http.ResponseWriter, r *http.Request) {
 // chatRun continues a specific active run's conversation.
 func (s *Server) chatRun(w http.ResponseWriter, r *http.Request) {
 	body, ok := readBody[struct {
-		Text string `json:"text"`
+		Text   string      `json:"text"`
+		Images []chatImage `json:"images"`
 	}](w, r)
 	if !ok {
 		return
 	}
-	if err := s.engine.ChatToRun(r.PathValue("id"), body.Text); err != nil {
+	images, err := decodeImages(body.Images)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if err := s.engine.ChatToRun(r.PathValue("id"), body.Text, images...); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// getUpload serves one stored chat attachment (the UI renders chat images
+// from here). The store's name validation refuses path traversal.
+func (s *Server) getUpload(w http.ResponseWriter, r *http.Request) {
+	data, err := s.store.ReadUpload(r.PathValue("id"), r.PathValue("name"))
+	if err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	w.Header().Set("Content-Type", http.DetectContentType(data))
+	w.Header().Set("Cache-Control", "private, max-age=86400, immutable")
+	w.Write(data)
 }
 
 func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {

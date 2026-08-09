@@ -359,6 +359,9 @@ type ChatMessage struct {
 	Ts   time.Time `json:"ts"`
 	From string    `json:"from"` // "user" | "coordinator"
 	Text string    `json:"text"`
+	// Images are upload filenames attached to this message. The bytes live as
+	// files under the run's uploads directory, never inline in the run record.
+	Images []string `json:"images,omitempty"`
 }
 
 // Event is one entry of a run's append-only audit log.
@@ -410,6 +413,10 @@ type Run struct {
 	// rounds, and each round's reply lands here. Persisted with the run, so a
 	// resumed run keeps its conversation.
 	Chat []ChatMessage `json:"chat,omitempty"`
+	// GoalImages are upload filenames attached to the goal itself (a run
+	// started from a message with images). Delivered to the coordinator's
+	// first round of each activation, alongside the goal text.
+	GoalImages []string `json:"goal_images,omitempty"`
 	// CoordinatorNotes is the coordinator's externalized memory: bounded notes
 	// it chose to persist across rounds. This — plus the task ledger — is ALL
 	// the state a new round starts from; there is no accumulated conversation.

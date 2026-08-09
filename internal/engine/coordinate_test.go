@@ -318,3 +318,46 @@ func TestDynamicRefusesSessionlessRuntime(t *testing.T) {
 		t.Fatalf("dry-run should succeed regardless of runtime: %s (%s)", final.Status, final.Error)
 	}
 }
+
+// Regression: a user message during the approval gate must not spin the round
+// loop. The quiet-round notice used to be consumable only via tool-result
+// piggyback, so a round that made no tool call left it pending and AwaitRound
+// woke immediately, forever (observed live: 2450 rounds in ~2 minutes).
+func TestChatWhileAwaitingApprovalDoesNotSpin(t *testing.T) {
+	b := noApproval()
+	b.ApprovalPolicy = model.ApprovalInitial
+	eng, st, wf := dynSetup(t, b)
+
+	run, err := eng.StartRun(wf, "build the thing", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		r, _ := st.LoadRun(run.ID)
+		if r != nil && r.Status == model.RunAwaitingApproval {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never reached awaiting_approval")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := eng.ChatToRun(run.ID, "先别急,我看看计划"); err != nil {
+		t.Fatal(err)
+	}
+	// Give a spinning loop time to reveal itself, then check the round count:
+	// one round for the chat, one corrective round for the notice — not dozens.
+	time.Sleep(1500 * time.Millisecond)
+	r, _ := st.LoadRun(run.ID)
+	if r.Coordinator.Rounds > 6 {
+		t.Fatalf("round loop is spinning: %d rounds while awaiting approval", r.Coordinator.Rounds)
+	}
+	if err := eng.Approve(run.ID); err != nil {
+		t.Fatal(err)
+	}
+	final := waitTerminal(t, st, run.ID)
+	if final.Status != model.RunSucceeded {
+		t.Fatalf("after approval want succeeded, got %s (%s)", final.Status, final.Error)
+	}
+}

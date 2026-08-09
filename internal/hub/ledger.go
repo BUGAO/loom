@@ -149,7 +149,7 @@ type RunSession struct {
 	// pendingChat holds user messages not yet delivered to a coordinator
 	// round. A non-empty queue wakes AwaitRound, and the next round's prompt
 	// carries the drained messages.
-	pendingChat []string
+	pendingChat []model.ChatMessage
 
 	// seq increments on every ledger transition; the round driver compares it
 	// across rounds to detect a coordinator that acts without effect.
@@ -1703,9 +1703,9 @@ func (rs *RunSession) AddNote(text string) {
 // UserChat records a message from the user and wakes the round driver: the
 // user talking to the coordinator is a first-class wake reason, same as a
 // task settling.
-func (rs *RunSession) UserChat(text string) error {
+func (rs *RunSession) UserChat(text string, images ...string) error {
 	text = strings.TrimSpace(text)
-	if text == "" {
+	if text == "" && len(images) == 0 {
 		return fmt.Errorf("message is empty")
 	}
 	rs.mu.Lock()
@@ -1713,8 +1713,9 @@ func (rs *RunSession) UserChat(text string) error {
 		rs.mu.Unlock()
 		return fmt.Errorf("this run has ended; message the workflow to start a new one")
 	}
-	rs.run.Chat = append(rs.run.Chat, model.ChatMessage{Ts: time.Now(), From: "user", Text: text})
-	rs.pendingChat = append(rs.pendingChat, text)
+	m := model.ChatMessage{Ts: time.Now(), From: "user", Text: text, Images: images}
+	rs.run.Chat = append(rs.run.Chat, m)
+	rs.pendingChat = append(rs.pendingChat, m)
 	// An answer arrived: the coordinator is no longer waiting on the user.
 	if rs.run.Coordinator != nil && rs.run.Coordinator.Status == "awaiting_user" {
 		rs.run.Coordinator.Status = "working"
@@ -1792,7 +1793,7 @@ func (rs *RunSession) SetOutputDir(dir string) error {
 }
 
 // TakeUserChat drains queued user messages for delivery into a round prompt.
-func (rs *RunSession) TakeUserChat() []string {
+func (rs *RunSession) TakeUserChat() []model.ChatMessage {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	out := rs.pendingChat

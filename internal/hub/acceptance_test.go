@@ -386,7 +386,7 @@ func TestUserChatWakesRound(t *testing.T) {
 	}
 
 	msgs := rs.TakeUserChat()
-	if len(msgs) != 1 || msgs[0] != "加一个深色模式" {
+	if len(msgs) != 1 || msgs[0].Text != "加一个深色模式" {
 		t.Fatalf("queued chat not delivered: %v", msgs)
 	}
 	if got := rs.TakeUserChat(); len(got) != 0 {
@@ -570,5 +570,21 @@ func TestLegacyRunKeepsInternalWorkspace(t *testing.T) {
 	}
 	if err := rs.SetOutputName("late"); err == nil {
 		t.Fatal("naming a legacy run with dispatched tasks must be refused")
+	}
+}
+
+// Image attachments are files on disk; the round prompt carries their names so
+// the coordinator can connect the inline images to the words around them.
+func TestRoundPromptNamesAttachedImages(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	run := rs.Run()
+	run.Goal = "看看这张截图"
+	run.GoalImages = []string{"img-1.png"}
+	msgs := []model.ChatMessage{{Text: "再看这两张", Images: []string{"img-2.png", "img-3.png"}}}
+	p := RoundPrompt(run, rs, 1, nil, msgs)
+	for _, want := range []string{"img-1.png", "img-2.png", "img-3.png", "2 attached image(s)"} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("round prompt should mention %q:\n%s", want, p)
+		}
 	}
 }

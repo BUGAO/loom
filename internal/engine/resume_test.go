@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"loom/internal/llm"
 	"loom/internal/model"
 )
 
@@ -319,5 +320,40 @@ func TestReopenAppendsCoordinatorTranscript(t *testing.T) {
 	}
 	if strings.Count(string(second), "## Round ") <= strings.Count(string(first), "## Round ") {
 		t.Fatal("reopen did not append new rounds to the transcript")
+	}
+}
+
+// A goal message can carry images: they are persisted as run uploads, recorded
+// on the opening chat message, and the run still converges on a backend that
+// cannot display them (the mock) — the degrade path must not break a round.
+func TestGoalImagesPersistAndDegrade(t *testing.T) {
+	eng, st, wf := dynSetup(t, noApproval())
+	png := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3}
+	run, err := eng.StartRun(wf, "look at the pasted screenshot", true,
+		llm.Image{MimeType: "image/png", Data: png})
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := waitTerminal(t, st, run.ID)
+	if final.Status != model.RunSucceeded {
+		t.Fatalf("run failed: %s (%s)", final.Status, final.Error)
+	}
+	if len(final.GoalImages) != 1 || !strings.HasSuffix(final.GoalImages[0], ".png") {
+		t.Fatalf("goal images not recorded: %v", final.GoalImages)
+	}
+	data, err := st.ReadUpload(run.ID, final.GoalImages[0])
+	if err != nil || len(data) != len(png) {
+		t.Fatalf("upload not stored: %v (%d bytes)", err, len(data))
+	}
+	if len(final.Chat) == 0 || len(final.Chat[0].Images) != 1 {
+		t.Fatalf("opening chat message should carry the image: %+v", final.Chat[0])
+	}
+}
+
+func TestGoalImagesRejectUnsupportedType(t *testing.T) {
+	eng, _, wf := dynSetup(t, noApproval())
+	_, err := eng.StartRun(wf, "goal", true, llm.Image{MimeType: "image/tiff", Data: []byte{1}})
+	if err == nil || !strings.Contains(err.Error(), "unsupported image type") {
+		t.Fatalf("expected unsupported-type refusal, got %v", err)
 	}
 }

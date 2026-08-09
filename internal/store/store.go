@@ -322,6 +322,35 @@ func (s *Store) NodeOutputPath(runID, nodeID string) string {
 	return filepath.Join(s.runDir(runID), "nodes", nodeID+".md")
 }
 
+// SaveUpload stores one user-attached file (e.g. a pasted chat image) under
+// the run's uploads directory. Uploads live beside run.json, not in the
+// exchange directory — they are conversation input, not a deliverable, and
+// the exchange directory can move when the run gets named.
+func (s *Store) SaveUpload(runID, name string, data []byte) error {
+	if err := safeName(runID); err != nil {
+		return err
+	}
+	if err := safeName(name); err != nil {
+		return err
+	}
+	dir := filepath.Join(s.runDir(runID), "uploads")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, name), data, 0o644)
+}
+
+// ReadUpload returns one stored upload's bytes.
+func (s *Store) ReadUpload(runID, name string) ([]byte, error) {
+	if err := safeName(runID); err != nil {
+		return nil, err
+	}
+	if err := safeName(name); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(filepath.Join(s.runDir(runID), "uploads", name))
+}
+
 func (s *Store) SaveRun(r *model.Run) error {
 	if err := safeName(r.ID); err != nil {
 		return err

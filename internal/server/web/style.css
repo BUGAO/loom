@@ -520,6 +520,23 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
 }
 .wf-chat-input textarea { flex: 1; resize: none; }
 
+/* chat image attachments: staged previews above the input, inline in bubbles */
+.attach-strip { display: flex; gap: 8px; flex-wrap: wrap; padding: 6px 0 8px; }
+.attach-thumb { position: relative; display: inline-block; }
+.attach-thumb img {
+  width: 56px; height: 56px; object-fit: cover; border-radius: 8px;
+  border: 1px solid var(--border); display: block;
+}
+.attach-thumb button {
+  position: absolute; top: -6px; right: -6px; width: 18px; height: 18px;
+  padding: 0; font-size: 10px; line-height: 1; border-radius: 50%;
+}
+.cimgs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.cimg {
+  max-width: 220px; max-height: 160px; border-radius: 8px; display: block;
+  border: 1px solid var(--border-soft);
+}
+
 /* ---- screen adaptation ---- */
 /* The conversation page goes full-bleed; other pages keep the 1280px column. */
 .main.wide { max-width: none; }

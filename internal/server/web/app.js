@@ -406,12 +406,15 @@ async function wfListPage() {
   // moments (approval, verdict) where they occur.
   const renderChat = () => {
     if (!run) return "";
+    const chatImgs = (m) => (m.images || []).map((n) =>
+      `<a href="/api/runs/${esc(run.id)}/uploads/${esc(n)}" target="_blank" rel="noopener">
+         <img class="cimg" src="/api/runs/${esc(run.id)}/uploads/${esc(n)}" alt="${esc(n)}" loading="lazy"></a>`).join("");
     const items = (run.chat || []).map((m) => ({
       ts: m.ts,
       html: `
       <div class="cmsg ${m.from === "user" ? "me" : "agent"}">
         <div class="cwho">${m.from === "user" ? "你" : "main agent"} · ${fmtTime(m.ts)}</div>
-        <div class="cbody">${esc(m.text)}</div>
+        <div class="cbody">${esc(m.text)}${m.images?.length ? `<div class="cimgs">${chatImgs(m)}</div>` : ""}</div>
       </div>`,
     }));
     if (run.mode === "dynamic") {
@@ -569,12 +572,52 @@ async function wfListPage() {
     } catch (e) { toast(e.message); }
   });
 
+  // Images staged for the next message: pasted into the box or picked with
+  // the attach button. Sent as base64 alongside the text; the server stores
+  // them as run uploads and the main agent sees them inline.
+  let pendingImgs = []; // {mime, data (base64), url (object URL for preview)}
+  const IMG_MIMES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+  const renderAttach = () => {
+    const strip = $main.querySelector("#wf-attach");
+    if (!strip) return;
+    strip.style.display = pendingImgs.length ? "" : "none";
+    strip.innerHTML = pendingImgs.map((p, i) => `
+      <span class="attach-thumb"><img src="${p.url}" alt="">
+        <button data-rm="${i}" title="移除">✕</button></span>`).join("");
+    strip.querySelectorAll("[data-rm]").forEach((b) => b.addEventListener("click", () => {
+      URL.revokeObjectURL(pendingImgs[b.dataset.rm]?.url);
+      pendingImgs.splice(b.dataset.rm, 1);
+      renderAttach();
+    }));
+  };
+
+  const addImages = (files) => {
+    for (const f of files) {
+      if (!IMG_MIMES.includes(f.type)) { toast(`不支持的图片类型:${f.type || f.name}`); continue; }
+      if (f.size > 8 * 1024 * 1024) { toast(`图片超过 8MB:${f.name || "剪贴板图片"}`); continue; }
+      if (pendingImgs.length >= 10) { toast("每条消息最多 10 张图片"); break; }
+      const reader = new FileReader();
+      const url = URL.createObjectURL(f);
+      reader.onload = () => {
+        pendingImgs.push({ mime: f.type, data: reader.result.split(",", 2)[1], url });
+        renderAttach();
+      };
+      reader.readAsDataURL(f);
+    }
+  };
+
   const send = async () => {
     const box = $main.querySelector("#wf-input");
     const text = box.value.trim();
-    if (!text) return;
+    if (!text && !pendingImgs.length) return;
     const wf = selWf();
     if (!wf) return;
+    if (wf.mode !== "dynamic" && pendingImgs.length) {
+      toast("静态工作流没有会话,不支持图片——图片仅动态编排可用");
+      return;
+    }
+    const images = pendingImgs.map((p) => ({ mime: p.mime, data: p.data }));
     box.value = "";
     try {
       const dry = $main.querySelector("#wf-dry")?.checked || false;
@@ -584,11 +627,14 @@ async function wfListPage() {
         // opens a new one. Finished sessions are reopened server-side.
         r = await api(`/workflows/${wf.id}/chat`, {
           method: "POST",
-          body: { text, dry_run: dry, run_id: sesId || "", new_session: sesId === null },
+          body: { text, images, dry_run: dry, run_id: sesId || "", new_session: sesId === null },
         });
       } else {
         r = await api(`/workflows/${wf.id}/runs`, { method: "POST", body: { goal: text, dry_run: dry } });
       }
+      pendingImgs.forEach((p) => URL.revokeObjectURL(p.url));
+      pendingImgs = [];
+      renderAttach();
       const isNew = !run || r.id !== run.id;
       run = r;
       sesId = r.id;
@@ -621,8 +667,11 @@ async function wfListPage() {
           <label class="check" id="wf-dry-wrap" style="font-size:11.5px">
             <input type="checkbox" id="wf-dry" ${meta.default_dry_run ? "checked" : ""}>
             <span>演示模式(dry run,零成本)— 仅对新发起的运行生效</span></label>
+          <div class="attach-strip" id="wf-attach" style="display:none"></div>
           <div class="row" style="align-items:flex-end">
-            <textarea id="wf-input" rows="2" placeholder="对 main agent 说出目标或追加要求…(Enter 发送,Shift+Enter 换行)"></textarea>
+            <button class="small" id="wf-attachbtn" title="添加图片(也可直接粘贴)">🖼</button>
+            <input type="file" id="wf-file" accept="image/png,image/jpeg,image/webp,image/gif" multiple style="display:none">
+            <textarea id="wf-input" rows="2" placeholder="对 main agent 说出目标或追加要求…(Enter 发送,Shift+Enter 换行,可粘贴图片)"></textarea>
             <button class="primary" id="wf-send">发送</button>
           </div>
         </div>
@@ -639,6 +688,16 @@ async function wfListPage() {
     if (e.isComposing || e.keyCode === 229) return;
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   });
+  // Image intake: paste into the box, or pick via the attach button.
+  $main.querySelector("#wf-input").addEventListener("paste", (e) => {
+    const files = [...(e.clipboardData?.items || [])]
+      .filter((it) => it.kind === "file" && it.type.startsWith("image/"))
+      .map((it) => it.getAsFile()).filter(Boolean);
+    if (files.length) { e.preventDefault(); addImages(files); }
+  });
+  const fileInput = $main.querySelector("#wf-file");
+  $main.querySelector("#wf-attachbtn").addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => { addImages([...fileInput.files]); fileInput.value = ""; });
 }
 
 // ---------- workflow editor ----------

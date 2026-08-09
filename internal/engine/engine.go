@@ -132,8 +132,10 @@ func (e *Engine) runtimeFor(agentRuntime string, dryRun bool) (llm.Backend, erro
 
 // StartRun creates a run and drives it asynchronously from planning onward.
 // dryRun swaps every execution — planner, coordinator, workers — for the mock;
-// which real runtime each agent uses is the agent's own declaration.
-func (e *Engine) StartRun(wf *model.Workflow, goal string, dryRun bool) (*model.Run, error) {
+// which real runtime each agent uses is the agent's own declaration. Images
+// attached to the goal message are persisted as run uploads and shown to a
+// dynamic run's coordinator (static mode has no conversation to carry them).
+func (e *Engine) StartRun(wf *model.Workflow, goal string, dryRun bool, images ...llm.Image) (*model.Run, error) {
 	if _, err := e.runtimeFor("", dryRun); err != nil {
 		return nil, err // fail fast: the default runtime must exist
 	}
@@ -155,6 +157,12 @@ func (e *Engine) StartRun(wf *model.Workflow, goal string, dryRun bool) (*model.
 		return nil, err
 	}
 	run.DryRun = dryRun
+	if names, err := e.saveUploads(run.ID, images); err != nil {
+		return nil, err
+	} else if len(names) > 0 {
+		run.GoalImages = names
+		e.store.SaveRun(run)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &handle{cancel: cancel, approveCh: make(chan struct{}), wfID: wf.ID}
 	e.mu.Lock()

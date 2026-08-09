@@ -211,9 +211,13 @@ why — an honest failure is worth more than a summary that papers over a gap.
 // that came before. Every read of mutable run state goes through the session's
 // locked accessors: peer handoffs and external A2A submissions mutate the same
 // object while this builds.
-func RoundPrompt(run *model.Run, rs *RunSession, round int, changed, userMsgs []string) string {
+func RoundPrompt(run *model.Run, rs *RunSession, round int, changed []string, userMsgs []model.ChatMessage) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## Goal\n%s\n", run.Goal)
+	if len(run.GoalImages) > 0 {
+		fmt.Fprintf(&b, "(the goal message carries %d attached image(s): %s)\n",
+			len(run.GoalImages), strings.Join(run.GoalImages, ", "))
+	}
 	fmt.Fprintf(&b, "\n## Round %d\n", round)
 	if round == 1 && rs.TaskCount() == 0 {
 		b.WriteString("This is the first round: decompose the goal and delegate.\n")
@@ -232,7 +236,11 @@ func RoundPrompt(run *model.Run, rs *RunSession, round int, changed, userMsgs []
 	if len(userMsgs) > 0 {
 		b.WriteString("\n## New messages from the user\n")
 		for _, m := range userMsgs {
-			fmt.Fprintf(&b, "- %s\n", m)
+			fmt.Fprintf(&b, "- %s", m.Text)
+			if len(m.Images) > 0 {
+				fmt.Fprintf(&b, " [with %d attached image(s): %s]", len(m.Images), strings.Join(m.Images, ", "))
+			}
+			b.WriteString("\n")
 		}
 		b.WriteString("Address these this round; your reply text will be shown to the user.\n")
 	}

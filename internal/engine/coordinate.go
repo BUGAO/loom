@@ -32,7 +32,7 @@ import (
 // carries user messages that triggered this activation (a reopened session's
 // first message), delivered into the first round.
 func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, run *model.Run,
-	pool []*model.Agent, dryRun bool, opening []string) {
+	pool []*model.Agent, dryRun bool, opening []model.ChatMessage) {
 
 	budget := wf.EffectiveBudget()
 
@@ -64,7 +64,7 @@ func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, 
 	// The goal is the conversation's opening message; a resumed run keeps its
 	// existing chat.
 	if len(run.Chat) == 0 {
-		run.Chat = append(run.Chat, model.ChatMessage{Ts: time.Now(), From: "user", Text: run.Goal})
+		run.Chat = append(run.Chat, model.ChatMessage{Ts: time.Now(), From: "user", Text: run.Goal, Images: run.GoalImages})
 	}
 
 	d := &dynamicRun{engine: e, run: run, wf: wf, dryRun: dryRun, sessions: sessions, workers: map[string]*workerHandle{}}
@@ -83,7 +83,7 @@ func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, 
 	d.rs = rs
 	h.setRunSession(rs)
 	for _, m := range opening {
-		rs.UserChat(m) // recorded, audited, and queued for the first round
+		rs.UserChat(m.Text, m.Images...) // recorded, audited, and queued for the first round
 	}
 
 	rs.AppendEvent("run_status", "", fmt.Sprintf("coordinator started (%s)", coordModel))
@@ -130,15 +130,15 @@ func (e *Engine) ResumeRun(runID string) (*model.Run, error) {
 // ReopenRun continues a finished dynamic session: the run IS the session, and
 // a verdict is a milestone, not the end of the conversation. The new message
 // wakes a fresh coordinator round over the same ledger, notes and chat.
-func (e *Engine) ReopenRun(runID, text string) (*model.Run, error) {
-	return e.reactivate(runID, text, false)
+func (e *Engine) ReopenRun(runID, text string, images ...llm.Image) (*model.Run, error) {
+	return e.reactivate(runID, text, false, images...)
 }
 
 // reactivate brings a non-active dynamic run back to life. Completed
 // (accepted) tasks are preserved; a fresh coordinator round picks up from the
 // task tree — possible precisely because the coordinator carries no session
 // state between rounds: the persisted run file is the whole session.
-func (e *Engine) reactivate(runID, text string, requireInterrupted bool) (*model.Run, error) {
+func (e *Engine) reactivate(runID, text string, requireInterrupted bool, images ...llm.Image) (*model.Run, error) {
 	e.mu.Lock()
 	if e.active[runID] != nil {
 		e.mu.Unlock()
@@ -198,9 +198,13 @@ func (e *Engine) reactivate(runID, text string, requireInterrupted bool) (*model
 	e.mu.Lock()
 	e.active[run.ID] = h
 	e.mu.Unlock()
-	var opening []string
-	if text != "" {
-		opening = []string{text}
+	var opening []model.ChatMessage
+	names, err := e.saveUploads(runID, images)
+	if err != nil {
+		return nil, err
+	}
+	if text != "" || len(names) > 0 {
+		opening = []model.ChatMessage{{Text: text, Images: names}}
 	}
 	go e.coordinate(ctx, h, wf, run, pool, dryRun, opening)
 	return run, nil
@@ -281,7 +285,26 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 			return fmt.Errorf("open coordinator session: %w", err)
 		}
 		start := time.Now()
-		res, perr := sess.Prompt(ctx, hub.RoundPrompt(d.run, rs, round, changed, userMsgs))
+		prompt := hub.RoundPrompt(d.run, rs, round, changed, userMsgs)
+		// Deliver any pending system notice in the round prompt itself. Relying
+		// on the tool-result piggyback (withNotice) alone hot-loops: a round
+		// that makes no tool call leaves the notice pending, and AwaitRound
+		// treats a pending notice as an immediate wake reason — forever.
+		if n := rs.TakeNotice(); n != "" {
+			prompt += "\n## System notice\n" + n + "\n"
+		}
+		// Goal images ride on the first round of each activation (the
+		// coordinator has no memory between rounds, but re-sending them every
+		// round would pay their token cost times the round count); chat images
+		// ride on the round their message is delivered in.
+		var imgNames []string
+		if i == 1 {
+			imgNames = append(imgNames, d.run.GoalImages...)
+		}
+		for _, m := range userMsgs {
+			imgNames = append(imgNames, m.Images...)
+		}
+		res, perr := e.promptWithUploads(ctx, sess, d.run.ID, prompt, imgNames)
 		sess.Close()
 		if res != nil {
 			modelID := res.Model
@@ -352,7 +375,9 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 }
 
 // ChatToRun routes a user message into an active dynamic run's conversation.
-func (e *Engine) ChatToRun(runID, text string) error {
+// Attached images are persisted as run uploads and delivered to the
+// coordinator inline with the round that carries the message.
+func (e *Engine) ChatToRun(runID, text string, images ...llm.Image) error {
 	e.mu.Lock()
 	h := e.active[runID]
 	e.mu.Unlock()
@@ -363,7 +388,77 @@ func (e *Engine) ChatToRun(runID, text string) error {
 	if rs == nil {
 		return fmt.Errorf("run %s is not a dynamic run", runID)
 	}
-	return rs.UserChat(text)
+	names, err := e.saveUploads(runID, images)
+	if err != nil {
+		return err
+	}
+	return rs.UserChat(text, names...)
+}
+
+// saveUploads persists incoming chat images and returns their stored names.
+func (e *Engine) saveUploads(runID string, images []llm.Image) ([]string, error) {
+	if len(images) == 0 {
+		return nil, nil
+	}
+	names := make([]string, 0, len(images))
+	for i, img := range images {
+		ext, ok := uploadExt[img.MimeType]
+		if !ok {
+			return nil, fmt.Errorf("unsupported image type %q (accepted: png, jpeg, webp, gif)", img.MimeType)
+		}
+		name := fmt.Sprintf("img-%d-%d%s", time.Now().UnixNano(), i+1, ext)
+		if err := e.store.SaveUpload(runID, name, img.Data); err != nil {
+			return nil, fmt.Errorf("store image: %w", err)
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+// uploadExt maps the accepted image MIME types onto stored file extensions;
+// mimeOfUpload is its inverse, keyed on the stored name.
+var uploadExt = map[string]string{
+	"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif",
+}
+
+func mimeOfUpload(name string) string {
+	for mime, ext := range uploadExt {
+		if strings.HasSuffix(strings.ToLower(name), ext) {
+			return mime
+		}
+	}
+	if strings.HasSuffix(strings.ToLower(name), ".jpeg") {
+		return "image/jpeg"
+	}
+	return ""
+}
+
+// promptWithUploads sends one coordinator turn, attaching the named uploads
+// inline when the session's transport can carry them. A backend without image
+// support still gets the text — with an honest note instead of a silent drop.
+func (e *Engine) promptWithUploads(ctx context.Context, sess llm.Session, runID, prompt string, names []string) (*llm.Result, error) {
+	var imgs []llm.Image
+	for _, name := range names {
+		mime := mimeOfUpload(name)
+		if mime == "" {
+			continue
+		}
+		data, err := e.store.ReadUpload(runID, name)
+		if err != nil {
+			continue // recorded in chat but gone from disk: nothing to attach
+		}
+		imgs = append(imgs, llm.Image{Name: name, MimeType: mime, Data: data})
+	}
+	if len(imgs) == 0 {
+		return sess.Prompt(ctx, prompt)
+	}
+	if is, ok := sess.(llm.ImageSession); ok {
+		prompt += "\n## Attached images\nThe attached image(s) named above accompany this message.\n"
+		return is.PromptImages(ctx, prompt, imgs)
+	}
+	prompt += fmt.Sprintf("\n## Attached images\nNOTE: the user attached %d image(s), but this runtime "+
+		"cannot receive images — ask the user to describe the content instead.\n", len(imgs))
+	return sess.Prompt(ctx, prompt)
 }
 
 // ActiveDynamicRun returns the id of the workflow's currently active dynamic
