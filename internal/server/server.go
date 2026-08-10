@@ -13,8 +13,10 @@ import (
 	"strings"
 
 	"loom/internal/engine"
+	"loom/internal/hub"
 	"loom/internal/llm"
 	"loom/internal/model"
+	"loom/internal/planner"
 	"loom/internal/store"
 )
 
@@ -48,6 +50,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/workflows", s.listWorkflows)
 	mux.HandleFunc("POST /api/workflows", s.saveWorkflow)
+	mux.HandleFunc("POST /api/workflows/prompt-preview", s.promptPreview)
 	mux.HandleFunc("GET /api/workflows/{id}", s.getWorkflow)
 	mux.HandleFunc("DELETE /api/workflows/{id}", s.deleteWorkflow)
 	mux.HandleFunc("POST /api/workflows/{id}/runs", s.startRun)
@@ -224,6 +227,43 @@ func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, wf)
+}
+
+// promptPreview assembles the EFFECTIVE main-agent system prompt for a draft
+// workflow — exactly what the coordinator (dynamic) or planner (static) will
+// receive at run time, minus run-specific values (goal, resolved output dir).
+// The draft is not persisted: the settings page posts the current form state
+// so the user sees the real configuration, not a description of it.
+func (s *Server) promptPreview(w http.ResponseWriter, r *http.Request) {
+	wf, ok := readBody[model.Workflow](w, r)
+	if !ok {
+		return
+	}
+	all, err := s.store.ListAgents()
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	pool := all
+	if len(wf.AgentPool) > 0 {
+		byName := map[string]*model.Agent{}
+		for _, a := range all {
+			byName[a.Name] = a
+		}
+		pool = nil
+		for _, name := range wf.AgentPool {
+			if a, ok := byName[name]; ok {
+				pool = append(pool, a)
+			}
+		}
+	}
+	var prompt string
+	if wf.EffectiveMode() == model.ModeDynamic {
+		prompt = hub.CoordinatorPrompt(&model.Run{}, wf, wf.EffectiveBudget(), s.engine.OutputRoot(), "", pool)
+	} else {
+		prompt = planner.BuildPrompt("<用户发起运行时输入的目标>", pool, wf.Planner, "", wf.AllowAgentCreation)
+	}
+	writeJSON(w, 200, map[string]string{"mode": wf.EffectiveMode(), "prompt": prompt})
 }
 
 func (s *Server) saveWorkflow(w http.ResponseWriter, r *http.Request) {

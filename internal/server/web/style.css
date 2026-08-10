@@ -380,6 +380,23 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
 .proposal ol { margin: 10px 0 10px 20px; font-size: 13px; }
 .proposal li { margin-bottom: 4px; }
 
+/* effective-prompt preview (workflow settings): the main agent's assembled
+   system prompt, shown verbatim — a read-only window, styled like the drawer's
+   output panes rather than like an editable field. */
+.prompt-preview {
+  border: 1px solid var(--border-soft); border-radius: 12px;
+  background: rgba(0, 0, 0, 0.18); margin-top: 4px;
+}
+.pp-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; }
+.pp-head b { font-size: 13px; display: block; }
+.pp-head .muted { font-size: 11.5px; display: block; margin-top: 2px; line-height: 1.5; }
+.pp-body {
+  margin: 0 12px 12px; padding: 10px;
+  background: rgba(0, 0, 0, 0.3); border: 1px solid var(--border-soft); border-radius: 10px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px; line-height: 1.6;
+  max-height: 480px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+}
+
 .empty { color: var(--muted); text-align: center; padding: 40px 0; }
 .toast {
   position: fixed; bottom: 24px; right: 24px;
@@ -390,8 +407,12 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
 }
 
 /* ---- workflow page: list + conversation with the main agent ---- */
+/* The page itself never scrolls: the grid row is hard-capped to the container
+   (minmax(0,1fr)) and every column opts out of min-height:auto, so long chats
+   scroll inside .wf-chat-log while the composer stays pinned at the bottom. */
 .wf-split {
-  display: grid; grid-template-columns: 260px 1fr; gap: 14px;
+  display: grid; grid-template-columns: 260px 1fr;
+  grid-template-rows: minmax(0, 1fr); gap: 14px;
   height: calc(100vh - 96px); min-height: 480px;
 }
 .wf-left {
@@ -412,7 +433,7 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
 .wf-item-head { display: flex; align-items: center; gap: 8px; justify-content: space-between; margin-bottom: 3px; }
 
 .wf-right {
-  display: flex; flex-direction: column; gap: 10px; min-width: 0;
+  display: flex; flex-direction: column; gap: 10px; min-width: 0; min-height: 0;
 }
 .wf-head {
   display: flex; align-items: center; gap: 10px;
@@ -442,7 +463,7 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
 .wf-task .tmeta { margin-left: auto; display: flex; gap: 10px; font-size: 11px; color: var(--muted); white-space: nowrap; }
 
 .wf-chat-log {
-  flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
+  flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
   border: 1px solid var(--border); border-radius: 14px;
   background: var(--panel-glass); padding: 14px;
 }
@@ -511,14 +532,42 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
   display: flex; gap: 8px; align-items: flex-end; flex-shrink: 0;
   padding: 10px 12px; border-top: 1px solid var(--border-soft);
 }
-.th-input textarea { resize: none; min-height: 40px; }
+.th-input textarea {
+  resize: none; min-height: 40px; max-height: 32vh; overflow-y: auto;
+}
 .th-done { font-size: 12px; padding: 10px 14px; border-top: 1px solid var(--border-soft); flex-shrink: 0; }
 
+/* Composer — one glass card that is the whole control: the textarea inside is
+   chromeless (the card carries the focus ring) and grows with its content up
+   to 40vh; the toolbar row below holds attach + send. */
 .wf-chat-input {
   border: 1px solid var(--border); border-radius: 14px;
-  background: var(--panel-glass); padding: 10px 12px; flex-shrink: 0;
+  background: var(--panel-glass); padding: 8px 10px; flex-shrink: 0;
+  transition: border-color .15s, box-shadow .15s;
 }
-.wf-chat-input textarea { flex: 1; resize: none; }
+.wf-chat-input:focus-within {
+  border-color: rgba(139, 92, 246, 0.55);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.12);
+}
+.wf-chat-input textarea {
+  display: block; width: 100%; resize: none;
+  background: transparent; border: none; padding: 6px 6px 2px;
+  min-height: 34px; max-height: 40vh; overflow-y: auto;
+}
+.wf-chat-input textarea:focus { box-shadow: none; border: none; }
+.composer-bar { display: flex; align-items: center; gap: 8px; padding: 4px 2px 0; }
+
+/* Icon buttons (attach etc.): quiet until hovered, same radius family as the
+   rest of the chrome, icon inherits currentColor. */
+.icon-btn {
+  width: 32px; height: 32px; padding: 0; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border: 1px solid transparent; border-radius: 9px;
+  color: var(--muted); cursor: pointer;
+  transition: color .15s, background .15s, border-color .15s;
+}
+.icon-btn:hover { background: var(--panel2); color: var(--text); border-color: var(--border); }
+.icon-btn svg { width: 17px; height: 17px; display: block; }
 
 /* chat image attachments: staged previews above the input, inline in bubbles */
 .attach-strip { display: flex; gap: 8px; flex-wrap: wrap; padding: 6px 0 8px; }

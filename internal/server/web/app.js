@@ -22,6 +22,27 @@ async function api(path, opts = {}) {
   return data;
 }
 
+// autoGrow makes a textarea track its content height (Claude-style): height
+// resets then follows scrollHeight, capped by the element's CSS max-height and
+// a JS-side viewport clamp (layout can be mid-settle at page build, so an
+// empty box is never measured — its height comes from CSS alone).
+// Returns the resize function so callers can re-run it after setting .value.
+function autoGrow(ta) {
+  const resize = () => {
+    if (!ta.value) { ta.style.height = ""; return; }
+    ta.style.height = "auto";
+    const cap = Math.round((document.documentElement.clientHeight || 720) * 0.4);
+    ta.style.height = Math.min(ta.scrollHeight + 2, cap) + "px";
+  };
+  ta.addEventListener("input", resize);
+  resize();
+  return resize;
+}
+
+// Inline SVG for the attach-image button — emoji glyphs render inconsistently
+// across platforms; an outlined icon stays on-theme everywhere.
+const ICON_IMG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="4"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.5-3.5a2 2 0 0 0-2.8 0L6 20"/></svg>`;
+
 function toast(msg) {
   const el = document.createElement("div");
   el.className = "toast";
@@ -530,7 +551,7 @@ async function wfListPage() {
       </div>
       ${live ? `
       <div class="th-input">
-        <textarea id="th-input" rows="2" placeholder="${t.status === "input-required" ? "回答 worker 的反问…" : "对该任务插话或调整方向…"}(Enter 发送)"></textarea>
+        <textarea id="th-input" rows="1" placeholder="${t.status === "input-required" ? "回答 worker 的反问…" : "对该任务插话或调整方向…"}(Enter 发送)"></textarea>
         <button class="primary small" id="th-send">发送</button>
       </div>` : `<div class="th-done muted">任务已${esc(TASK_LABEL[t.status] || t.status)},thread 只读</div>`}`;
     const list = panel.querySelector(".th-msgs");
@@ -539,12 +560,14 @@ async function wfListPage() {
     const input = panel.querySelector("#th-input");
     if (input) {
       input.value = prevInput;
+      const grow = autoGrow(input);
       const sendThread = async () => {
         const text = input.value.trim();
         if (!text) return;
         try {
           await api(`/runs/${run.id}/tasks/${t.id}/message`, { method: "POST", body: { text } });
           input.value = "";
+          grow();
         } catch (e) { toast("发送失败:" + e.message); }
       };
       panel.querySelector("#th-send").onclick = sendThread;
@@ -619,6 +642,7 @@ async function wfListPage() {
     }
     const images = pendingImgs.map((p) => ({ mime: p.mime, data: p.data }));
     box.value = "";
+    box.dispatchEvent(new Event("input")); // collapse the auto-grown composer
     try {
       const dry = $main.querySelector("#wf-dry")?.checked || false;
       let r;
@@ -664,15 +688,16 @@ async function wfListPage() {
         <div class="wf-chat-log" id="wf-chat-log"></div>
         <div class="thread-panel" id="wf-thread" style="display:none"></div>
         <div class="wf-chat-input">
-          <label class="check" id="wf-dry-wrap" style="font-size:11.5px">
+          <label class="check" id="wf-dry-wrap" style="font-size:11.5px;padding:2px 4px 6px">
             <input type="checkbox" id="wf-dry" ${meta.default_dry_run ? "checked" : ""}>
             <span>演示模式(dry run,零成本)— 仅对新发起的运行生效</span></label>
           <div class="attach-strip" id="wf-attach" style="display:none"></div>
-          <div class="row" style="align-items:flex-end">
-            <button class="small" id="wf-attachbtn" title="添加图片(也可直接粘贴)">🖼</button>
+          <textarea id="wf-input" rows="1" placeholder="对 main agent 说出目标或追加要求…(Enter 发送,Shift+Enter 换行,可粘贴图片)"></textarea>
+          <div class="composer-bar">
+            <button class="icon-btn" id="wf-attachbtn" title="添加图片(也可直接粘贴)">${ICON_IMG}</button>
             <input type="file" id="wf-file" accept="image/png,image/jpeg,image/webp,image/gif" multiple style="display:none">
-            <textarea id="wf-input" rows="2" placeholder="对 main agent 说出目标或追加要求…(Enter 发送,Shift+Enter 换行,可粘贴图片)"></textarea>
-            <button class="primary" id="wf-send">发送</button>
+            <span style="flex:1"></span>
+            <button class="primary small" id="wf-send">发送</button>
           </div>
         </div>
       </div>
@@ -681,6 +706,7 @@ async function wfListPage() {
   await loadRun();
   renderHead(); renderSessions(); renderRight(); resub();
   $main.querySelector("#wf-send").addEventListener("click", send);
+  autoGrow($main.querySelector("#wf-input"));
   $main.querySelector("#wf-input").addEventListener("keydown", (e) => {
     // An Enter that is confirming an IME composition (pinyin etc.) belongs to
     // the IME, not to us: isComposing covers the standard case, keyCode 229
@@ -801,11 +827,27 @@ async function wfEditPage(id) {
       </div>
       `}
 
-      <label class="field"><span>Agent 池 · <span id="pool-count"></span>(不选 = 使用全部)</span></label>
+      <label class="field"><span>Agent 池 · <span id="pool-count"></span>(不选 = 使用全部)—
+        每个 agent 的 system prompt(即其 home 的 AGENTS.md)与私有 skills 在
+        <a href="#/agents">Agent 池</a> 页查看与编辑</span></label>
       <div class="pool-picker">
         ${agents.map((a) => `
           <label class="check"><input type="checkbox" data-agent="${esc(a.name)}" ${pool.has(a.name) ? "checked" : ""}>
             <span><b>${esc(a.name)}</b> <span class="muted">${esc(a.description || "")}</span></span></label>`).join("")}
+      </div>
+
+      <div class="prompt-preview">
+        <div class="pp-head">
+          <div style="flex:1;min-width:0">
+            <b>main agent 完整配置 — ${dyn ? "coordinator" : "planner"} 系统提示词</b>
+            <span class="muted">${dyn
+              ? "coordinator 每次激活实际收到的完整系统提示词:loom 编排规则 + 预算护栏 + 审批策略 + Agent 池 + 上方附加指导,实时组装。只读;要改可编辑的部分,用上面的「附加指导」。"
+              : "planner 组装 DAG 时实际收到的完整提示词:组装规则 + Agent 注册表 + 上方附加指导,实时组装。只读;要改可编辑的部分,用上面的「附加指导」。"}</span>
+          </div>
+          <button class="small" id="pp-refresh" style="display:none" title="按当前表单值重新组装">刷新</button>
+          <button class="small" id="pp-btn">查看</button>
+        </div>
+        <pre id="pp-body" class="pp-body" style="display:none"></pre>
       </div>
     </div>`;
     wire();
@@ -835,6 +877,28 @@ async function wfEditPage(id) {
         mode = r.value;
         render();
       }));
+    // Effective-prompt preview: posts the CURRENT form state (unsaved edits
+    // included), so what the user reads is what the main agent would get.
+    const ppBtn = $main.querySelector("#pp-btn");
+    const ppRefresh = $main.querySelector("#pp-refresh");
+    const ppBody = $main.querySelector("#pp-body");
+    const loadPreview = async () => {
+      collect();
+      try {
+        const res = await api("/workflows/prompt-preview", { method: "POST", body: wf });
+        ppBody.textContent = res.prompt;
+        ppBody.style.display = "";
+        ppRefresh.style.display = "";
+        ppBtn.textContent = "收起";
+      } catch (e) { toast("预览失败:" + e.message); }
+    };
+    ppBtn.onclick = () => {
+      if (ppBody.style.display === "none") return loadPreview();
+      ppBody.style.display = "none";
+      ppRefresh.style.display = "none";
+      ppBtn.textContent = "查看";
+    };
+    ppRefresh.onclick = loadPreview;
     $main.querySelector("#wf-save").onclick = async () => {
       collect();
       if (!wf.name) return toast("请填写名称");

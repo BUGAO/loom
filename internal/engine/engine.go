@@ -43,6 +43,9 @@ type Engine struct {
 // default at the CLI).
 func (e *Engine) SetOutputRoot(dir string) { e.outputRoot = dir }
 
+// OutputRoot reports the configured deliverable root (for prompt previews).
+func (e *Engine) OutputRoot() string { return e.outputRoot }
+
 // handle is the control surface of one active run. static runs are released
 // through approveCh; dynamic runs have no plan to approve up front, so their
 // gate lives on the ledger session instead.
