@@ -319,6 +319,88 @@ func TestDynamicRefusesSessionlessRuntime(t *testing.T) {
 	}
 }
 
+// One live session serves every round of an activation: the approval-gate
+// dance (propose → park → approved → delegate → verdict) spans several rounds
+// but must open exactly one coordinator session.
+func TestDynamicCoordinatorSessionPersists(t *testing.T) {
+	b := noApproval()
+	b.ApprovalPolicy = model.ApprovalInitial
+	eng, st, wf := dynSetup(t, b)
+	mock := eng.backends["mock"].(*llm.Mock)
+
+	run, err := eng.StartRun(wf, "build the thing", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitApproval(t, st, run.ID)
+	if err := eng.Approve(run.ID); err != nil {
+		t.Fatal(err)
+	}
+	final := waitTerminal(t, st, run.ID)
+	if final.Status != model.RunSucceeded {
+		t.Fatalf("want succeeded, got %s (%s)", final.Status, final.Error)
+	}
+	if final.Coordinator.Rounds < 2 {
+		t.Fatalf("expected a multi-round run, got %d round(s)", final.Coordinator.Rounds)
+	}
+	if n := mock.CoordinatorOpens.Load(); n != 1 {
+		t.Fatalf("a %d-round activation opened %d coordinator sessions, want 1", final.Coordinator.Rounds, n)
+	}
+}
+
+// A live session dying mid-activation is not a run failure: the engine drops
+// it, rebuilds a fresh session from the ledger, and the run still converges.
+func TestDynamicCoordinatorSessionRebuiltAfterLoss(t *testing.T) {
+	b := noApproval()
+	b.ApprovalPolicy = model.ApprovalInitial
+	eng, st, wf := dynSetup(t, b)
+	mock := eng.backends["mock"].(*llm.Mock)
+	// Prompt 1 proposes the plan; prompt 2 — the first LIVE-session round,
+	// woken by the approval — is made to fail.
+	mock.FailCoordinatorPrompt = 2
+
+	run, err := eng.StartRun(wf, "build the thing", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitApproval(t, st, run.ID)
+	if err := eng.Approve(run.ID); err != nil {
+		t.Fatal(err)
+	}
+	final := waitTerminal(t, st, run.ID)
+	if final.Status != model.RunSucceeded {
+		t.Fatalf("want succeeded after a session rebuild, got %s (%s)", final.Status, final.Error)
+	}
+	if n := mock.CoordinatorOpens.Load(); n != 2 {
+		t.Fatalf("want exactly 2 coordinator sessions (original + rebuild), got %d", n)
+	}
+	found := false
+	for _, ev := range final.Events {
+		if strings.Contains(ev.Msg, "coordinator session lost") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the session loss was not recorded on the audit trail")
+	}
+}
+
+// awaitApproval polls until the run parks at the approval gate.
+func awaitApproval(t *testing.T, st *store.Store, runID string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		r, _ := st.LoadRun(runID)
+		if r != nil && r.Status == model.RunAwaitingApproval {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("never reached awaiting_approval (status %v)", r.Status)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // Regression: a user message during the approval gate must not spin the round
 // loop. The quiet-round notice used to be consumable only via tool-result
 // piggyback, so a round that made no tool call left it pending and AwaitRound

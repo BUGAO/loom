@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -36,6 +37,18 @@ import (
 //	simulate-budget   the coordinator delegates until the budget refuses it
 type Mock struct {
 	NodeDelay time.Duration // 0 = random 0.8–2.2s
+
+	// FailCoordinatorPrompt makes the Nth coordinator prompt (1-based, counted
+	// across the Mock's lifetime) fail once, simulating a live session dying
+	// mid-activation. 0 = never. Tests use it to exercise the engine's
+	// rebuild-from-ledger path.
+	FailCoordinatorPrompt int64
+
+	// CoordinatorOpens counts coordinator sessions opened — how tests observe
+	// that one live session served many rounds.
+	CoordinatorOpens atomic.Int64
+
+	coordPrompts atomic.Int64
 }
 
 func (m *Mock) Name() string { return "mock" }
@@ -101,6 +114,9 @@ func (m *Mock) node(ctx context.Context, req Request) (*Result, error) {
 // ---- dynamic mode: a scripted MCP client ----
 
 func (m *Mock) Open(ctx context.Context, req SessionRequest) (Session, error) {
+	if req.Kind == KindCoordinator {
+		m.CoordinatorOpens.Add(1)
+	}
 	if len(req.MCPServers) == 0 {
 		return &singleShotSession{be: m, req: req}, nil
 	}
@@ -141,6 +157,11 @@ func (s *mockSession) Close() error                 { return s.cs.Close() }
 
 func (s *mockSession) Prompt(ctx context.Context, text string) (*Result, error) {
 	s.turn++
+	if s.req.Kind == KindCoordinator {
+		if n := s.mock.coordPrompts.Add(1); s.mock.FailCoordinatorPrompt != 0 && n == s.mock.FailCoordinatorPrompt {
+			return nil, fmt.Errorf("mock: session connection lost (injected)")
+		}
+	}
 	start := time.Now()
 	var log strings.Builder
 	call := func(name string, args map[string]any) (string, error) {

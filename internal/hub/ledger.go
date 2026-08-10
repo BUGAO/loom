@@ -1792,6 +1792,30 @@ func (rs *RunSession) SetOutputDir(dir string) error {
 	return nil
 }
 
+// ChatHistory returns the user↔coordinator conversation so far, excluding the
+// given messages (the ones a round prompt is about to deliver as new — they
+// must not appear twice). Matching is by timestamp+sender+text; worker
+// exchanges never enter run.Chat, so history is chat only — task outcomes
+// reach the coordinator as ledger summaries, not transcripts.
+func (rs *RunSession) ChatHistory(exclude []model.ChatMessage) []model.ChatMessage {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	out := make([]model.ChatMessage, 0, len(rs.run.Chat))
+	for _, m := range rs.run.Chat {
+		skip := false
+		for _, x := range exclude {
+			if m.Ts.Equal(x.Ts) && m.From == x.From && m.Text == x.Text {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // TakeUserChat drains queued user messages for delivery into a round prompt.
 func (rs *RunSession) TakeUserChat() []model.ChatMessage {
 	rs.mu.Lock()

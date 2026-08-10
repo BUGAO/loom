@@ -39,11 +39,14 @@ error, fix the call, and retry IN THE SAME ROUND. Ending a round with nothing de
 call was refused wastes the whole round.
 
 ## How you operate: decision rounds
-You work in ROUNDS. Each round you are given a fresh snapshot of the task ledger — you have NO memory
-of previous rounds beyond that snapshot and the notes you recorded. In a round you typically:
-1. read the snapshot: what settled, what failed and why, what is being asked;
+You work in ROUNDS in one continuous session: you remember earlier rounds, and each new round brings
+only what changed (settled tasks, new user messages). But the session does NOT survive a server
+restart — after one, a fresh session is rebuilt from the task ledger, the conversation record, and
+the notes you recorded, and NOTHING else. In a round you typically:
+1. read what changed: what settled, what failed and why, what is being asked;
 2. act: delegate new tasks, answer questions, send steering, inspect deliverables;
-3. record_note anything a future round must know (strategy, dead ends, decisions);
+3. record_note strategy, dead ends and decisions — the parts of your thinking a rebuilt session
+   could not recover from the ledger or the chat;
 4. end your turn. You will be woken for the next round when something settles.
 You may use await to collect quick results within a round, but do not sit in await for long-running
 work — end the turn instead; waking you is the engine's job.
@@ -205,12 +208,84 @@ why — an honest failure is worth more than a summary that papers over a gap.
 	return b.String()
 }
 
-// RoundPrompt is the coordinator's one user turn per round: the goal, its own
-// notes, new user messages, and the current ledger — rebuilt from scratch
-// every time, so its size tracks the task tree, never the number of rounds
-// that came before. Every read of mutable run state goes through the session's
-// locked accessors: peer handoffs and external A2A submissions mutate the same
-// object while this builds.
+// Caps on the conversation-history section of a fresh-session round prompt.
+// The history is context, not the work: user words are kept near-verbatim
+// (they are what the coordinator kept forgetting), coordinator replies are
+// trimmed harder (their substance lives in the ledger and the notes), and the
+// window is bounded so prompt size tracks the conversation tail, not its
+// whole life. Worker exchanges never appear here at all — tasks reach the
+// coordinator as ledger summaries only.
+const (
+	historyMaxMessages  = 40
+	historyUserCap      = 2000
+	historyCoordCap     = 1000
+	historyTruncateNote = " …[truncated]"
+)
+
+// writeChatHistory renders the "Conversation so far" section from history.
+func writeChatHistory(b *strings.Builder, history []model.ChatMessage) {
+	if len(history) == 0 {
+		return
+	}
+	b.WriteString("\n## Conversation so far (user ↔ you)\n")
+	if omitted := len(history) - historyMaxMessages; omitted > 0 {
+		fmt.Fprintf(b, "(%d earlier message(s) omitted — durable facts live in your notes)\n", omitted)
+		history = history[len(history)-historyMaxMessages:]
+	}
+	for _, m := range history {
+		limit, label := historyCoordCap, "you"
+		if m.From == "user" {
+			limit, label = historyUserCap, "user"
+		}
+		text := m.Text
+		if len(text) > limit {
+			text = text[:limit] + historyTruncateNote
+		}
+		fmt.Fprintf(b, "[%s] %s\n", label, text)
+	}
+}
+
+// writeUserMessages renders the new-messages section shared by both prompts.
+func writeUserMessages(b *strings.Builder, userMsgs []model.ChatMessage) {
+	if len(userMsgs) == 0 {
+		return
+	}
+	b.WriteString("\n## New messages from the user\n")
+	for _, m := range userMsgs {
+		fmt.Fprintf(b, "- %s", m.Text)
+		if len(m.Images) > 0 {
+			fmt.Fprintf(b, " [with %d attached image(s): %s]", len(m.Images), strings.Join(m.Images, ", "))
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("Address these this round; your reply text will be shown to the user.\n")
+}
+
+// writeRunStatus renders the exchange-directory and budget lines shared by
+// both prompts.
+func writeRunStatus(b *strings.Builder, rs *RunSession) {
+	outDir, named := rs.OutputInfo()
+	fmt.Fprintf(b, "\n## Exchange directory\n%s%s\n", outDir,
+		map[bool]string{true: "", false: " (unnamed — call name_output before delegating)"}[named])
+
+	bs := rs.BudgetStatus()
+	data, _ := json.Marshal(bs)
+	fmt.Fprintf(b, "\n## Budget status\n%s\n", data)
+}
+
+const actNow = "\nAct now: answer any pending questions, route any failures per their failure_kind, delegate " +
+	"what is needed, inspect what claims to be done. Then either finish_run, or record_note your strategy " +
+	"and end your turn to wait for the next round.\n"
+
+// RoundPrompt is the first user turn of a FRESH coordinator session — the
+// opening round of an activation, or a rebuild after the live session was
+// lost. It carries everything a session with no memory needs: the goal, the
+// conversation so far, the notes, and the full ledger. Its size tracks the
+// task tree and the conversation tail, never the number of rounds that came
+// before. Every read of mutable run state goes through the session's locked
+// accessors: peer handoffs and external A2A submissions mutate the same
+// object while this builds. Later rounds of a live session use
+// ContinuationPrompt instead.
 func RoundPrompt(run *model.Run, rs *RunSession, round int, changed []string, userMsgs []model.ChatMessage) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## Goal\n%s\n", run.Goal)
@@ -222,7 +297,8 @@ func RoundPrompt(run *model.Run, rs *RunSession, round int, changed []string, us
 	if round == 1 && rs.TaskCount() == 0 {
 		b.WriteString("This is the first round: decompose the goal and delegate.\n")
 	} else {
-		b.WriteString("You have no memory of previous rounds beyond your notes and the ledger below.\n")
+		b.WriteString("This session starts fresh: everything you know is in this prompt — the conversation, " +
+			"your notes, and the ledger below.\n")
 	}
 
 	// A reopened session carries its last verdict: the coordinator must treat
@@ -233,17 +309,8 @@ func RoundPrompt(run *model.Run, rs *RunSession, round int, changed []string, us
 			"do not redo what was already accepted.\n", decision)
 	}
 
-	if len(userMsgs) > 0 {
-		b.WriteString("\n## New messages from the user\n")
-		for _, m := range userMsgs {
-			fmt.Fprintf(&b, "- %s", m.Text)
-			if len(m.Images) > 0 {
-				fmt.Fprintf(&b, " [with %d attached image(s): %s]", len(m.Images), strings.Join(m.Images, ", "))
-			}
-			b.WriteString("\n")
-		}
-		b.WriteString("Address these this round; your reply text will be shown to the user.\n")
-	}
+	writeChatHistory(&b, rs.ChatHistory(userMsgs))
+	writeUserMessages(&b, userMsgs)
 
 	if notes := rs.Notes(); len(notes) > 0 {
 		b.WriteString("\n## Your notes from previous rounds\n")
@@ -264,17 +331,34 @@ func RoundPrompt(run *model.Run, rs *RunSession, round int, changed []string, us
 		fmt.Fprintf(&b, "\n## Settled since your last round\n%s\n", strings.Join(changed, ", "))
 	}
 
-	outDir, named := rs.OutputInfo()
-	fmt.Fprintf(&b, "\n## Exchange directory\n%s%s\n", outDir,
-		map[bool]string{true: "", false: " (unnamed — call name_output before delegating)"}[named])
+	writeRunStatus(&b, rs)
+	b.WriteString(actNow)
+	return b.String()
+}
 
-	bs := rs.BudgetStatus()
-	data, _ := json.Marshal(bs)
-	fmt.Fprintf(&b, "\n## Budget status\n%s\n", data)
+// ContinuationPrompt is a later round of a LIVE coordinator session: the model
+// remembers everything already said, so this carries only the delta — new user
+// messages and the tasks that settled since the last round (as full ledger
+// views, so their summary/error/question need no re-reading). The goal line is
+// repeated as a one-line anchor.
+func ContinuationPrompt(run *model.Run, rs *RunSession, round int, changedIDs []string, userMsgs []model.ChatMessage) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "## Goal\n%s\n", run.Goal)
+	fmt.Fprintf(&b, "\n## Round %d (session continues)\n", round)
+	b.WriteString("You remember the previous rounds of this session; below is only what changed.\n")
 
-	b.WriteString("\nAct now: answer any pending questions, route any failures per their failure_kind, delegate " +
-		"what is needed, inspect what claims to be done. Then either finish_run, or record_note your strategy " +
-		"and end your turn to wait for the next round.\n")
+	writeUserMessages(&b, userMsgs)
+
+	if len(changedIDs) > 0 {
+		b.WriteString("\n## Settled since your last round\n")
+		for _, v := range rs.Views(changedIDs) {
+			data, _ := json.Marshal(v)
+			fmt.Fprintf(&b, "%s\n", data)
+		}
+	}
+
+	writeRunStatus(&b, rs)
+	b.WriteString(actNow)
 	return b.String()
 }
 

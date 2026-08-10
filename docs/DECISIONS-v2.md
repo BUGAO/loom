@@ -390,3 +390,24 @@ dynamic run 的交换目录本体就是 `<output根>/<短名>/`(`-output` flag /
 短名由 coordinator 按主题起(`name_output` 工具或 `propose_plan.output_name`,kebab ≤40 字符,重名自动 -2 后缀);
 **首个任务派发时冻结**,未起名自动兜底 `MMDD-<runid短>`。产物外部实时可见;删除会话不删产物目录;
 旧会话(已有任务)保持原交换目录不迁移。static 模式维持内部交换目录不变。
+
+## D28 `[体验整改]` coordinator 持久会话 + 对话历史回灌(修订 D21 的每轮重建)
+
+D21 的「每轮全新会话」把跨轮记忆全押在 `record_note` 上,实用中 coordinator 记不住用户在会话里
+说过的话,用户被迫每轮重复关键信息;每轮冷启动 + 全量重建也拖慢了轮次。修订为:
+
+- **一次激活一条活会话**:轮与轮之间复用同一 ACP 会话,后续轮只投递增量
+  (`hub.ContinuationPrompt`:落定任务的台账视图 + 用户新消息 + 预算余量 + 一行 goal 锚点)。
+  记忆与推理在激活内原生连续,依赖运行时自身的上下文管理/compaction。
+- **台账降级为恢复路径,而非唯一状态**:活会话 prompt 失败(适配器崩溃、上下文溢出)时引擎丢弃会话、
+  记审计事件、用全量 `hub.RoundPrompt` 重建重试该轮;未送达的用户消息与系统通知重新排队,不丢。
+  重建会话自身再失败才判 run failed。进程重启(resume)与会话重开(reopen)天然走同一重建路径——
+  D21 的可恢复性保持不变。
+- **对话历史回灌**:重建轮的 `RoundPrompt` 新增「Conversation so far」——完整 user↔coordinator
+  对话(`run.Chat`),带界限:尾部窗口 40 条、user 单条 2000 字符、coordinator 单条 1000 字符,
+  更早的折叠成一行省略计数。**worker 往来永不进对话历史**:任务只以台账 `TaskView` 的
+  summary/error/question 出现,transcript 留在审计层。「prompt 不随轮数增长」的断言保持成立
+  (随任务树 + 对话尾部走)。
+- `record_note` 语义收窄:记台账和对话都复原不了的东西(策略、死胡同、决策),不再是唯一记忆通道。
+- 测试:多轮激活恰好开 1 条 coordinator 会话;注入会话中途死亡 → 重建后 run 照常收敛,审计留痕;
+  历史节的排重(新消息不重复出现)、截断与窗口折叠;continuation prompt 不带全量台账/便签/历史。

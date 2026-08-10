@@ -23,10 +23,13 @@ import (
 // stream it out. The engine below is deliberately dumb about strategy and
 // strict about limits.
 //
-// The coordinator is driven in ROUNDS, each a fresh session whose context is
-// rebuilt from the ledger (plus its own recorded notes). The coordinator holds
-// no conversation history across rounds — the ledger is the state, which is
-// also what makes a dynamic run resumable after a process restart.
+// The coordinator is driven in ROUNDS over ONE live session per activation:
+// the session keeps its own memory between rounds, and each round delivers
+// only the delta (settled tasks, new user messages). The ledger is still the
+// durable state — a session lost to a crash, a restart or a context overflow
+// is rebuilt from it (plus the conversation record and the coordinator's
+// notes), which is what keeps a dynamic run resumable without making every
+// round pay the rebuild price.
 
 // coordinate drives a dynamic run from coordinator start to verdict. opening
 // carries user messages that triggered this activation (a reopened session's
@@ -232,11 +235,14 @@ type workerHandle struct {
 	cancel context.CancelFunc
 }
 
-// runCoordinator drives decision rounds until a verdict or an error. Each
-// round is a fresh session: the coordinator's only state is the ledger and its
-// recorded notes. There is no round limit — the run's wall clock is the
-// termination guarantee; a coordinator that stops moving the ledger gets one
-// corrective notice and then simply parks until something real happens.
+// runCoordinator drives decision rounds until a verdict or an error. One live
+// session serves the whole activation: its first round carries the full
+// context (conversation, notes, ledger), later rounds carry only the delta. A
+// session that dies mid-activation is rebuilt from the ledger and the round
+// retried once — the restart path, paid only when actually needed. There is no
+// round limit — the run's wall clock is the termination guarantee; a
+// coordinator that stops moving the ledger gets one corrective notice and then
+// simply parks until something real happens.
 func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, pool []*model.Agent, budget model.BudgetConfig) error {
 	e := d.engine
 	token := e.hub.IssueCoordinatorToken(d.run.ID)
@@ -256,8 +262,19 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 		transcript.Write(prev)
 	}
 
+	// The live session, opened lazily and kept across rounds. sess == nil
+	// means the next round starts a fresh one, whose first prompt must carry
+	// the full rebuilt context.
+	var sess llm.Session
+	defer func() {
+		if sess != nil {
+			sess.Close()
+		}
+	}()
+
 	seen := map[string]string{}
-	var changed []string
+	var changed []string                   // "id → status" summary for a rebuild prompt
+	var changedIDs []string                // settled task ids for a continuation prompt
 	quiet := 0                             // consecutive rounds without a ledger transition
 	startRound := d.run.Coordinator.Rounds // > 0 when resuming
 	userMsgs := rs.TakeUserChat()          // messages queued before the first round
@@ -267,45 +284,53 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 		rs.UpdateCoordinator(func(c *model.CoordinatorState) { c.Rounds = round })
 		seqBefore := rs.Seq()
 
-		sess, err := d.sessions.Open(ctx, llm.SessionRequest{
-			Kind:         llm.KindCoordinator,
-			SystemPrompt: sysPrompt,
-			Model:        d.run.Coordinator.Model,
-			WorkDir:      workspace,
-			AddDirs:      []string{workspace},
-			// No file tools at all: the coordinator's only read access to the
-			// work is the hub's audited inspect tool, which is also what makes
-			// "verified before sign-off" a checkable fact instead of a hope.
-			Tools:      "",
-			MCPServers: e.hubServers(token),
-			OnActivity: func(text string) { rs.CoordinatorActivity(text) },
-		})
-		if err != nil {
-			rs.UpdateCoordinator(func(c *model.CoordinatorState) { c.Status = "failed" })
-			return fmt.Errorf("open coordinator session: %w", err)
+		fresh := sess == nil
+		if fresh {
+			s, err := d.sessions.Open(ctx, llm.SessionRequest{
+				Kind:         llm.KindCoordinator,
+				SystemPrompt: sysPrompt,
+				Model:        d.run.Coordinator.Model,
+				WorkDir:      workspace,
+				AddDirs:      []string{workspace},
+				// No file tools at all: the coordinator's only read access to the
+				// work is the hub's audited inspect tool, which is also what makes
+				// "verified before sign-off" a checkable fact instead of a hope.
+				Tools:      "",
+				MCPServers: e.hubServers(token),
+				OnActivity: func(text string) { rs.CoordinatorActivity(text) },
+			})
+			if err != nil {
+				rs.UpdateCoordinator(func(c *model.CoordinatorState) { c.Status = "failed" })
+				return fmt.Errorf("open coordinator session: %w", err)
+			}
+			sess = s
 		}
 		start := time.Now()
-		prompt := hub.RoundPrompt(d.run, rs, round, changed, userMsgs)
+		var prompt string
+		if fresh {
+			prompt = hub.RoundPrompt(d.run, rs, round, changed, userMsgs)
+		} else {
+			prompt = hub.ContinuationPrompt(d.run, rs, round, changedIDs, userMsgs)
+		}
 		// Deliver any pending system notice in the round prompt itself. Relying
 		// on the tool-result piggyback (withNotice) alone hot-loops: a round
 		// that makes no tool call leaves the notice pending, and AwaitRound
 		// treats a pending notice as an immediate wake reason — forever.
-		if n := rs.TakeNotice(); n != "" {
-			prompt += "\n## System notice\n" + n + "\n"
+		notice := rs.TakeNotice()
+		if notice != "" {
+			prompt += "\n## System notice\n" + notice + "\n"
 		}
-		// Goal images ride on the first round of each activation (the
-		// coordinator has no memory between rounds, but re-sending them every
-		// round would pay their token cost times the round count); chat images
+		// Goal images ride on the first prompt of each session (a fresh session
+		// has never seen them; a live one still remembers them); chat images
 		// ride on the round their message is delivered in.
 		var imgNames []string
-		if i == 1 {
+		if fresh {
 			imgNames = append(imgNames, d.run.GoalImages...)
 		}
 		for _, m := range userMsgs {
 			imgNames = append(imgNames, m.Images...)
 		}
 		res, perr := e.promptWithUploads(ctx, sess, d.run.ID, prompt, imgNames)
-		sess.Close()
 		if res != nil {
 			modelID := res.Model
 			if modelID == "" {
@@ -323,6 +348,21 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 		}
 		rs.UpdateCoordinator(func(c *model.CoordinatorState) { c.Activity = "" })
 		if perr != nil {
+			// A LIVE session failing mid-activation (adapter crash, context
+			// overflow) is exactly what the ledger rebuild exists for: drop the
+			// session and retry this round fresh. Only a failure of the rebuilt
+			// session itself — or a canceled run — fails the coordinator.
+			// userMsgs stays undrained and the notice is re-queued: the failed
+			// prompt delivered neither.
+			if ctx.Err() == nil && !fresh {
+				sess.Close()
+				sess = nil
+				if notice != "" {
+					rs.InjectNotice(notice)
+				}
+				rs.AppendEvent("run_status", "", "coordinator session lost ("+firstLineOf(perr.Error())+"); rebuilding from the ledger")
+				continue
+			}
 			rs.UpdateCoordinator(func(c *model.CoordinatorState) { c.Status = "failed" })
 			return perr
 		}
@@ -365,13 +405,25 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 		}
 
 		userMsgs = rs.TakeUserChat()
-		changed = nil
+		changed, changedIDs = nil, nil
 		for _, v := range rs.Views(nil) {
 			if fp := hub.SettledFingerprint(v); fp != "" && seen[v.ID] != fp {
 				changed = append(changed, v.ID+" → "+v.Status)
+				changedIDs = append(changedIDs, v.ID)
 			}
 		}
 	}
+}
+
+// firstLineOf clips an error message to its first line for the event log.
+func firstLineOf(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 200 {
+		s = s[:200] + "…"
+	}
+	return s
 }
 
 // ChatToRun routes a user message into an active dynamic run's conversation.
