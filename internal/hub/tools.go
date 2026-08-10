@@ -164,6 +164,10 @@ type recordNoteIn struct {
 	Text string `json:"text" jsonschema:"the note; keep it short and decision-relevant"`
 }
 
+type recordProjectFactIn struct {
+	Text string `json:"text" jsonschema:"one durable fact about the PROJECT (domain constraint, convention, user correction) that future runs must honor; short and declarative"`
+}
+
 func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 	activity := func(name string) { rs.CoordinatorActivity(name) }
 
@@ -362,13 +366,29 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "record_note",
-		Description: "Persist a short note to yourself across decision rounds (strategy, what you tried, what to " +
-			"avoid). You start each round with NO memory beyond the task ledger and these notes — record anything " +
-			"a future round must know.",
+		Description: "Persist a short RUN-scoped note to yourself (strategy, dead ends, decisions). Your live " +
+			"session remembers on its own, but it does not survive a restart — a rebuilt session knows only the " +
+			"ledger, the conversation record, and these notes. For durable PROJECT facts use record_project_fact " +
+			"instead.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in recordNoteIn) (*mcp.CallToolResult, any, error) {
 		activity("record_note")
 		rs.AddNote(in.Text)
 		return okf(rs, "Note recorded."), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "record_project_fact",
+		Description: "Append one durable fact to PROJECT.md in the exchange directory — the cross-run memory of " +
+			"the PROJECT itself: domain constraints, conventions, and user corrections (e.g. \"data X changes " +
+			"quarterly, never poll it\", \"the user wants options staged for review before integration\"). When " +
+			"the user corrects a wrong assumption, record the correction IMMEDIATELY. Workers see PROJECT.md in " +
+			"every task prompt; future runs load it too.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in recordProjectFactIn) (*mcp.CallToolResult, any, error) {
+		activity("record_project_fact")
+		if err := rs.RecordProjectFact(in.Text); err != nil {
+			return toolErr("%v", err), nil, nil
+		}
+		return okf(rs, "Project fact recorded in PROJECT.md."), nil, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -450,10 +470,11 @@ type askAgentIn struct {
 }
 
 type reportResultIn struct {
-	Status      string   `json:"status" jsonschema:"ok | error"`
-	FailureKind string   `json:"failure_kind,omitempty" jsonschema:"required when status=error: spec-unclear | blocked | missing-dependency | conflict"`
-	Summary     string   `json:"summary" jsonschema:"SHORT: what you did and which files you delivered, or what stopped you — the substance lives in the artifacts, not here"`
-	Artifacts   []string `json:"artifacts,omitempty" jsonschema:"paths relative to the exchange directory"`
+	Status       string   `json:"status" jsonschema:"ok | error"`
+	FailureKind  string   `json:"failure_kind,omitempty" jsonschema:"required when status=error: spec-unclear | blocked | missing-dependency | conflict"`
+	Summary      string   `json:"summary" jsonschema:"SHORT: what you did and which files you delivered, or what stopped you — the substance lives in the artifacts, not here"`
+	Artifacts    []string `json:"artifacts,omitempty" jsonschema:"paths relative to the exchange directory"`
+	Observations string   `json:"observations,omitempty" jsonschema:"anything the contract did not cover that the coordinator should know: a spec that seems wrong, a coupling you noticed, a default you had to invent. Speaking up here is part of the job"`
 }
 
 func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskID string) {
@@ -502,6 +523,7 @@ func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskID string) {
 		}
 		if err := rs.ReportResult(taskID, ReportedResult{
 			Status: status, FailureKind: kind, Summary: in.Summary, Artifacts: in.Artifacts,
+			Observations: strings.TrimSpace(in.Observations),
 		}); err != nil {
 			return toolErr("%v", err), nil, nil
 		}

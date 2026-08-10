@@ -184,10 +184,11 @@ type taskCtrl struct {
 // ReportedResult is a worker's final work report, delivered structurally
 // through the report_result tool instead of being parsed out of reply text.
 type ReportedResult struct {
-	Status      string
-	FailureKind string
-	Summary     string
-	Artifacts   []string
+	Status       string
+	FailureKind  string
+	Summary      string
+	Artifacts    []string
+	Observations string // dissent channel: what the contract did not cover
 }
 
 func (rs *RunSession) newTaskCtrl() *taskCtrl {
@@ -1043,6 +1044,10 @@ func (rs *RunSession) ReportResult(taskID string, r ReportedResult) error {
 		return fmt.Errorf("task %s is not active", taskID)
 	}
 	ctrl.reported = &r
+	// Observations land on the task the moment they are voiced — they are the
+	// worker's dissent channel and must survive whatever way the task settles
+	// (a later report in the same task replaces them, like the report itself).
+	t.Observations = r.Observations
 	return nil
 }
 
@@ -1110,6 +1115,9 @@ type TaskView struct {
 	Turns      int      `json:"turns"`
 	CostUSD    float64  `json:"cost_usd"`
 	Acceptance string   `json:"acceptance,omitempty"` // executed-check summary, e.g. "2/2 checks passed"
+	// Observations is the worker speaking outside the contract — a spec that
+	// seems wrong, a coupling worth knowing, a default it had to invent.
+	Observations string `json:"observations,omitempty"`
 
 	// Failure routing, filled when status is failed. Route says what the
 	// budget engine will actually permit: "rework-allowed" only for kind
@@ -1123,6 +1131,7 @@ func (rs *RunSession) viewLocked(t *model.Task) TaskView {
 		ID: t.ID, Agent: t.Agent, Model: t.Model, Title: t.Title, Status: t.Status,
 		Summary: t.Summary, Error: t.Error, Artifacts: t.Artifacts,
 		Activity: t.Activity, Depth: t.Depth, Turns: t.Turns, CostUSD: t.CostUSD,
+		Observations: t.Observations,
 	}
 	if len(t.AcceptanceResults) > 0 {
 		v.Acceptance = SummarizeResults(t.AcceptanceResults)
@@ -1696,6 +1705,68 @@ func (rs *RunSession) AddNote(text string) {
 	}
 	rs.notifyLocked()
 	rs.mu.Unlock()
+}
+
+// ---- project memory ----
+
+// projectMemoryFile is the durable, cross-run memory of the PROJECT, living in
+// the exchange directory where the user can read and edit it. run-scoped
+// strategy goes in notes; what the NEXT run must not relearn goes here.
+const projectMemoryFile = "PROJECT.md"
+
+// projectMemoryCap bounds how much of PROJECT.md is inlined into prompts. The
+// head is kept: facts accumulate chronologically, and the oldest ones are the
+// foundational conventions.
+const projectMemoryCap = 4000
+
+// RecordProjectFact appends one durable fact to the exchange directory's
+// PROJECT.md, creating it with a header on first use. Audited like any other
+// coordinator action.
+func (rs *RunSession) RecordProjectFact(text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fmt.Errorf("fact is empty")
+	}
+	dir := rs.Workspace()
+	path := filepath.Join(dir, projectMemoryFile)
+	line := "- " + text + "\n"
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		line = "# Project memory\n\nDurable facts about this project, recorded across runs — domain\n" +
+			"constraints, conventions, and user corrections. Workers must honor them.\n\n" + line
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("cannot write %s: %v", path, err)
+	}
+	if _, err := f.WriteString(line); err != nil {
+		f.Close()
+		return fmt.Errorf("cannot write %s: %v", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	rs.event("project_fact", "", "project fact recorded: "+firstLine(text, 120))
+	return nil
+}
+
+// ProjectMemory returns the (capped) content of the exchange directory's
+// PROJECT.md, or "" when none exists.
+func (rs *RunSession) ProjectMemory() string {
+	return ReadProjectMemory(rs.Workspace())
+}
+
+// ReadProjectMemory reads a workspace's PROJECT.md for prompt inlining,
+// clipped to projectMemoryCap.
+func ReadProjectMemory(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, projectMemoryFile))
+	if err != nil {
+		return ""
+	}
+	s := strings.TrimSpace(string(data))
+	if len(s) > projectMemoryCap {
+		s = s[:projectMemoryCap] + "\n…[truncated — read the full PROJECT.md in the exchange directory]"
+	}
+	return s
 }
 
 // ---- user chat ----

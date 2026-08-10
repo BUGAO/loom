@@ -184,7 +184,8 @@ coordinator 的会话没有任何文件工具:它读产物的唯一通道是 hub
 - `report_progress` — worker → 台账,中途进度,不结束任务
 - `ask_coordinator` — worker 反问,任务转 `input-required`,worker **卡在这次工具调用里**等答复,不消耗新回合、不丢上下文
 - `send_message` — 对 `input-required` 任务是立即答复;对 `working` 任务入队,在下一个回合边界作为追加一轮投递(ACP 无法打断进行中的回合),返回值会告诉 coordinator 是哪一种
-- `inspect` / `record_note` — coordinator 专属:审计化读产物;跨轮便签
+- `inspect` / `record_note` / `record_project_fact` — coordinator 专属:审计化读产物;run 级便签;**项目级持久记忆**(追加到交换目录的 PROJECT.md,跨 run 生效,worker 派单时自动注入——领域约束、约定、用户纠正都记这里)
+- `report_result` 带 **observations 异议通道** — worker 按规格完成之外,把"规格似乎不对/发现了未提及的耦合/我自行发明了某个默认值"说出来;台账视图透出,coordinator 被要求逐条读
 - `handoff` / `ask_agent` — worker 之间直接交接与血缘内问答(需开 `allow_peer_handoff`;关闭时这两个工具**根本不存在**,而不是靠提示词劝阻)。这是对「交接统一收口到 brain」前提的**受控偏离**:默认关闭,开启后交接仍走同一台账、同一预算,coordinator 全程可见
 
 **独立校验者(fresh context 由机制保证)**

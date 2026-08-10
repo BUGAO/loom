@@ -339,6 +339,11 @@ type Task struct {
 	Error       string        `json:"error,omitempty"`
 	FailureKind string        `json:"failure_kind,omitempty"` // set when Status == failed
 	Activity    string        `json:"activity,omitempty"`
+	// Observations is the worker's dissent channel: things the contract did not
+	// cover — a spec that seems wrong, a coupling the coordinator should know
+	// about, a default the worker had to invent. "Completed with observations"
+	// often means the spec, not the work, needs attention.
+	Observations string `json:"observations,omitempty"`
 
 	// Acceptance is the machine-executable contract fixed at delegation time;
 	// AcceptanceResults is what actually happened when the engine ran it.

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"loom/internal/model"
 )
 
 // A fresh-session round prompt must carry the conversation so far — the whole
@@ -114,5 +116,57 @@ func TestContinuationPromptIsDelta(t *testing.T) {
 		if strings.Contains(p, section) {
 			t.Errorf("continuation prompt carries %q — that is fresh-session freight", section)
 		}
+	}
+}
+
+// A worker's observations travel: report_result → task → ledger view — the
+// dissent channel must reach the coordinator even though the contract passed.
+func TestObservationsReachTheLedgerView(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	task := mustDelegate(t, rs, "alpha")
+	if err := rs.TaskStarted(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.ReportResult(task.ID, ReportedResult{
+		Status: "ok", Summary: "done as specified",
+		Observations: "the selector is cosmetic: league is fixed at boot, switching changes nothing",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	v, ok := rs.View(task.ID)
+	if !ok {
+		t.Fatal("task view missing")
+	}
+	if !strings.Contains(v.Observations, "cosmetic") {
+		t.Fatalf("observations did not reach the task view: %+v", v)
+	}
+}
+
+// Project facts persist to PROJECT.md in the exchange directory and surface in
+// both the coordinator's fresh round prompt and every worker prompt.
+func TestProjectMemoryRoundTrip(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	if err := rs.RecordProjectFact("leagues last 3+ months — fetch the list once per page load, never poll"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.RecordProjectFact("all ports come from the root config.yaml"); err != nil {
+		t.Fatal(err)
+	}
+
+	mem := rs.ProjectMemory()
+	if !strings.Contains(mem, "never poll") || !strings.Contains(mem, "config.yaml") {
+		t.Fatalf("PROJECT.md content wrong:\n%s", mem)
+	}
+
+	p := RoundPrompt(rs.run, rs, 1, nil, nil)
+	if !strings.Contains(p, "## Project memory") || !strings.Contains(p, "never poll") {
+		t.Error("fresh round prompt does not carry project memory")
+	}
+
+	task := mustDelegate(t, rs, "writer")
+	agent := &model.Agent{Name: "writer", Tools: "Read,Write"}
+	wp := WorkerPrompt(task, agent, rs.run, rs.Workspace(), false)
+	if !strings.Contains(wp, "## Project memory") || !strings.Contains(wp, "never poll") {
+		t.Error("worker prompt does not carry project memory")
 	}
 }

@@ -411,3 +411,25 @@ D21 的「每轮全新会话」把跨轮记忆全押在 `record_note` 上,实用
 - `record_note` 语义收窄:记台账和对话都复原不了的东西(策略、死胡同、决策),不再是唯一记忆通道。
 - 测试:多轮激活恰好开 1 条 coordinator 会话;注入会话中途死亡 → 重建后 run 照常收敛,审计留痕;
   历史节的排重(新消息不重复出现)、截断与窗口折叠;continuation prompt 不带全量台账/便签/历史。
+
+## D29 `[体验整改]` 决策门、约束出处、异议通道、项目记忆(poe2_trade 复盘)
+
+poe2_trade run 暴露的两类失败(用户要求"4 个 demo 让我选"被 coordinator 用"更好方案"越权直接集成;
+"keep poe.league as-is" 这条凭空发明的冻结约束把 league→通货耦合的修复锁死,worker 眼看着问题却被合同
+禁止修,还自行发明了 30min 轮询)。四项对策:
+
+- **用户保留决策门(prompt)**:用户话里出现"让我选/review 后再改/先看再定",即为硬门——staged 产物
+  (不并入目标项目)+ ask_user + 停轮;发现更好方案只能作为额外选项,越权替用户决定按失败论。
+  此类等待不算 stalling,不占 one-ask-round 限额。
+- **冻结性约束需出处(prompt)**:"keep X as-is" 类约束必须引用用户原话或侦察产物;对既有代码的改动
+  先派廉价 impact survey,指令与约束都从 survey 写。凭想象冻结架构 = 把 worker 锁在该修的东西外面,
+  而验收检查全绿。
+- **worker 异议通道(机制)**:`report_result` 新增 `observations` 字段 → 落 Task → TaskView 透出进
+  round prompt。"按规格完成但规格似乎不对/有未提及的耦合/我发明了某个默认值"从此有话筒;
+  coordinator 被要求逐条读("completed with observations 往往意味着规格而非工作需要修")。
+- **项目级持久记忆(机制)**:交换目录 PROJECT.md,coordinator 用 `record_project_fact` 追加(审计留痕),
+  内容注入 coordinator 重建轮与每个 worker prompt(4KB 截断,保头部)。记领域约束、约定、用户纠正;
+  run 级策略仍走 record_note。用户可直接编辑该文件。
+- 顺带修复 CoordinatorPrompt 审查发现的矛盾:「工具被拒→原轮修正重试」曾把 budget 拒绝也包进去,
+  与「预算拒绝→收敛勿绕」直接冲突,现明确 budget 拒绝是唯一例外;record_note 工具描述里残留的
+  "每轮无记忆"措辞(D28 前)更新;Deliverable folder 与 Planning 节的重复瘦身。
