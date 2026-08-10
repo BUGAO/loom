@@ -244,13 +244,14 @@ func (c *acpClient) WriteTextFile(ctx context.Context, p acp.WriteTextFileReques
 // claude-code-acp executes Bash through the ACP terminal methods, so a client
 // without them silently kills every shell-using agent: the tool call dies,
 // the turn collapses, and the missing envelope fails the task. The client
-// therefore implements a real terminal: one OS process per terminal id, output
-// in a bounded buffer, exit status reported honestly.
+// therefore implements a real terminal: one process group per terminal id,
+// output in a bounded buffer, exit status reported honestly.
 
-// termProc is one terminal-hosted process.
+// termProc is one terminal-hosted process group.
 type termProc struct {
 	mu        sync.Mutex
 	cmd       *exec.Cmd
+	pgid      int // the shell's process group; descendants live and die with it
 	buf       bytes.Buffer
 	limit     int
 	truncated bool
@@ -283,6 +284,23 @@ func (t *termProc) snapshot() (string, bool, *acp.TerminalExitStatus) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.buf.String(), t.truncated, t.exit
+}
+
+// signalGroup signals the terminal's entire process group, not just the shell.
+// The leader having exited says nothing about the group: `server &` leaves the
+// backgrounded server in the group after sh exits, and that is exactly the
+// process that must not outlive the session (a leftover from one run squatted
+// on its port and derailed the next run's verification for a full task
+// timeout). ESRCH just means the group is already empty.
+func (t *termProc) signalGroup(sig syscall.Signal) {
+	if t.pgid > 0 {
+		syscall.Kill(-t.pgid, sig)
+	}
+}
+
+// groupAlive reports whether any process in the terminal's group survives.
+func (t *termProc) groupAlive() bool {
+	return t.pgid > 0 && syscall.Kill(-t.pgid, 0) == nil
 }
 
 func (c *acpClient) terminal(id string) *termProc {
@@ -336,10 +354,20 @@ func (c *acpClient) CreateTerminal(ctx context.Context, p acp.CreateTerminalRequ
 	}
 	cmd.Stdout = t
 	cmd.Stderr = t
+	// Each terminal is its own process group so cleanup can reach descendants.
+	// A non-interactive sh has no job control: even `&`-backgrounded children
+	// stay in this group, where a kill(-pgid) still finds them after sh exits.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// A backgrounded child inherits the output pipe; without a bound, Wait
+	// blocks until that child exits too, and `server &` hangs the tool call
+	// until the task times out. Once the shell itself has exited, give the
+	// pipe a short drain and report the exit.
+	cmd.WaitDelay = 2 * time.Second
 	if err := cmd.Start(); err != nil {
 		return acp.CreateTerminalResponse{}, fmt.Errorf("start %s: %w", p.Command, err)
 	}
 	t.cmd = cmd
+	t.pgid = cmd.Process.Pid
 
 	c.mu.Lock()
 	if c.terminals == nil {
@@ -403,12 +431,7 @@ func (c *acpClient) KillTerminal(ctx context.Context, p acp.KillTerminalRequest)
 	if t == nil {
 		return acp.KillTerminalResponse{}, fmt.Errorf("unknown terminal %s", p.TerminalId)
 	}
-	t.mu.Lock()
-	proc := t.cmd.Process
-	t.mu.Unlock()
-	if proc != nil {
-		proc.Kill()
-	}
+	t.signalGroup(syscall.SIGKILL)
 	return acp.KillTerminalResponse{}, nil
 }
 
@@ -418,21 +441,21 @@ func (c *acpClient) ReleaseTerminal(ctx context.Context, p acp.ReleaseTerminalRe
 	delete(c.terminals, p.TerminalId)
 	c.mu.Unlock()
 	if t != nil {
-		t.mu.Lock()
-		proc := t.cmd.Process
-		exited := t.exit != nil
-		t.mu.Unlock()
-		if proc != nil && !exited {
-			proc.Kill()
-		}
+		// Unconditional: the shell having exited doesn't mean its group is
+		// empty — see signalGroup.
+		t.signalGroup(syscall.SIGKILL)
 	}
 	return acp.ReleaseTerminalResponse{}, nil
 }
 
-// killTerminals reaps every process still owned by this session; called on
-// session close so no agent shell outlives its task. It also latches the
+// killTerminals reaps every process group still owned by this session; called
+// on session close so nothing an agent shell started outlives its task — not
+// the shells, and not their backgrounded descendants. It also latches the
 // session closed, so a CreateTerminal racing the close cannot register a
 // process after the reaping ran.
+//
+// SIGTERM first with a short grace so servers can flush (same courtesy
+// `loom stop` extends to the daemon), then SIGKILL for whatever remains.
 func (c *acpClient) killTerminals() {
 	c.mu.Lock()
 	c.termsClosed = true
@@ -440,13 +463,24 @@ func (c *acpClient) killTerminals() {
 	c.terminals = nil
 	c.mu.Unlock()
 	for _, t := range terms {
-		t.mu.Lock()
-		proc := t.cmd.Process
-		exited := t.exit != nil
-		t.mu.Unlock()
-		if proc != nil && !exited {
-			proc.Kill()
+		t.signalGroup(syscall.SIGTERM)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		alive := false
+		for _, t := range terms {
+			if t.groupAlive() {
+				alive = true
+				break
+			}
 		}
+		if !alive {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	for _, t := range terms {
+		t.signalGroup(syscall.SIGKILL)
 	}
 }
 

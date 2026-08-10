@@ -7,8 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -338,6 +340,77 @@ func TestTerminalOutputBounded(t *testing.T) {
 	if !out.Truncated {
 		t.Fatal("truncation must be reported")
 	}
+}
+
+// startBackgroundedChild runs the incident's shape — `server & …` where the
+// shell exits at once, leaving only the backgrounded child — and returns that
+// child's pid once it is confirmed alive.
+func startBackgroundedChild(t *testing.T, c *acpClient) int {
+	t.Helper()
+	pidfile := filepath.Join(t.TempDir(), "pid")
+	res, err := c.CreateTerminal(context.Background(), acp.CreateTerminalRequest{
+		Command: fmt.Sprintf("sleep 60 & echo $! > %s", pidfile),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.WaitForTerminalExit(context.Background(), acp.WaitForTerminalExitRequest{TerminalId: res.TerminalId}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(pidfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatalf("bad pidfile %q: %v", b, err)
+	}
+	if syscall.Kill(pid, 0) != nil {
+		t.Fatalf("background child %d should be alive after its shell exits", pid)
+	}
+	return pid
+}
+
+// waitProcessGone fails the test (and reaps the straggler) if pid survives.
+func waitProcessGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if syscall.Kill(pid, 0) != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	syscall.Kill(pid, syscall.SIGKILL)
+	t.Fatalf("pid %d survived the group kill", pid)
+}
+
+// The poe2_trade incident, distilled: a worker ran `server &`, the shell
+// exited, and the server outlived the session to squat on its port — the old
+// cleanup skipped terminals whose shell had exited, and could only reach the
+// shell's own pid anyway. Session close must reap the whole process group.
+func TestKillTerminalsReapsBackgroundedGrandchild(t *testing.T) {
+	c := termClient("Bash")
+	pid := startBackgroundedChild(t, c)
+	c.killTerminals()
+	waitProcessGone(t, pid)
+}
+
+// ReleaseTerminal had the same exited-shell short-circuit; it too must reap
+// the group, not just the (long-gone) shell.
+func TestReleaseTerminalReapsBackgroundedGrandchild(t *testing.T) {
+	c := termClient("Bash")
+	pid := startBackgroundedChild(t, c)
+	c.mu.Lock()
+	var id string
+	for k := range c.terminals {
+		id = k
+	}
+	c.mu.Unlock()
+	if _, err := c.ReleaseTerminal(context.Background(), acp.ReleaseTerminalRequest{TerminalId: id}); err != nil {
+		t.Fatal(err)
+	}
+	waitProcessGone(t, pid)
 }
 
 // A session whose allowlist grants no shell gets no terminal — the second

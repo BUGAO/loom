@@ -2,12 +2,14 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"loom/internal/model"
@@ -129,7 +131,30 @@ func runCheck(ctx context.Context, workspace string, c model.AcceptanceCheck) mo
 		defer cancel()
 		cmd := exec.CommandContext(cctx, "sh", "-c", c.Command)
 		cmd.Dir = workspace
+		// Same discipline as the ACP terminal (acp_backend.go): the check runs
+		// in its own process group. A check that backgrounds a server (`bin &`)
+		// leaves that child holding the output pipe after sh exits; without a
+		// WaitDelay bound, CombinedOutput blocks on the pipe forever — past the
+		// check timeout, past the task timeout — and the task never settles.
+		// Killing only cmd.Process on cancel misses the same child, so cancel
+		// signals the whole group.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error {
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		cmd.WaitDelay = 2 * time.Second
 		out, err := cmd.CombinedOutput()
+		// The verdict is decided; nothing the check started may outlive it.
+		// ESRCH just means the group is already empty.
+		if cmd.Process != nil {
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		// WaitDelay expiry with a clean exit means the shell passed but a
+		// backgrounded child kept the pipe open — the shell's status is the
+		// verdict, not the leftover's.
+		if errors.Is(err, exec.ErrWaitDelay) {
+			err = nil
+		}
 		tail := strings.TrimSpace(string(out))
 		if len(tail) > maxCheckOutput {
 			tail = "…" + tail[len(tail)-maxCheckOutput:]

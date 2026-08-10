@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -123,6 +125,72 @@ func TestRunChecksKinds(t *testing.T) {
 		if pass != c.want {
 			t.Errorf("case %d (%s): pass=%v want %v (%s)", i, c.check.Kind, pass, c.want, results[0].Detail)
 		}
+	}
+}
+
+// A check that backgrounds a server must not hang the settle: the child
+// inherits the output pipe, and before WaitDelay was set, CombinedOutput
+// blocked on it forever — a real run froze at "working" this way, with the
+// worker's report_result already delivered. The shell's own clean exit is the
+// verdict, and the leftover child must be reaped with the group.
+func TestRunChecksBackgroundChildNeitherHangsNorSurvives(t *testing.T) {
+	ws := t.TempDir()
+	pidFile := filepath.Join(ws, "child.pid")
+	check := model.AcceptanceCheck{
+		Kind:       model.CheckCommand,
+		Command:    fmt.Sprintf("sleep 300 & echo $! > %s; exit 0", pidFile),
+		TimeoutSec: 10,
+	}
+	done := make(chan bool, 1)
+	go func() {
+		_, pass := RunChecks(context.Background(), ws, []model.AcceptanceCheck{check})
+		done <- pass
+	}()
+	select {
+	case pass := <-done:
+		if !pass {
+			t.Fatalf("the shell exited 0; the backgrounded child must not fail the check")
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatalf("RunChecks hung on the backgrounded child's inherited pipe")
+	}
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("check did not record the child pid: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatalf("bad pid %q: %v", raw, err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			syscall.Kill(pid, syscall.SIGKILL)
+			t.Fatalf("backgrounded child %d outlived its check", pid)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// A check that overruns its timeout is killed as a group, so a stuck child
+// cannot pin the settle past the check's own deadline either.
+func TestRunChecksTimeoutKillsGroup(t *testing.T) {
+	ws := t.TempDir()
+	check := model.AcceptanceCheck{
+		Kind:       model.CheckCommand,
+		Command:    "sleep 300",
+		TimeoutSec: 1,
+	}
+	start := time.Now()
+	results, pass := RunChecks(context.Background(), ws, []model.AcceptanceCheck{check})
+	if pass {
+		t.Fatalf("a timed-out check must fail, got %+v", results)
+	}
+	if elapsed := time.Since(start); elapsed > 6*time.Second {
+		t.Fatalf("timed-out check took %s to settle", elapsed)
+	}
+	if !strings.Contains(results[0].Detail, "timed out") {
+		t.Fatalf("detail should say the command timed out, got %q", results[0].Detail)
 	}
 }
 
