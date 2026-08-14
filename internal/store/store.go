@@ -406,6 +406,274 @@ func (s *Store) ListRuns() ([]*model.Run, error) {
 	return out, nil
 }
 
+// ---- amendments ----
+// A coordinator's proposed revision of an agent's system prompt. Stored as
+// data until a human decides; approval is the ONLY path that touches agent.md.
+
+func (s *Store) amendmentPath(id string) string {
+	return filepath.Join(s.dir, "amendments", id+".json")
+}
+
+// SaveAmendment persists a new proposal. IDs and timestamps are assigned here;
+// status always starts pending regardless of what the caller set.
+func (s *Store) SaveAmendment(a *model.Amendment) error {
+	if a.ID == "" {
+		a.ID = newID("amend")
+	}
+	if err := safeName(a.ID); err != nil {
+		return err
+	}
+	if a.CreatedAt.IsZero() {
+		a.CreatedAt = time.Now()
+	}
+	a.Status = model.AmendmentPending
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.MkdirAll(filepath.Join(s.dir, "amendments"), 0o755); err != nil {
+		return err
+	}
+	return writeJSONAtomic(s.amendmentPath(a.ID), a)
+}
+
+func (s *Store) LoadAmendment(id string) (*model.Amendment, error) {
+	if err := safeName(id); err != nil {
+		return nil, err
+	}
+	var a model.Amendment
+	if err := readJSON(s.amendmentPath(id), &a); err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// ListAmendments returns every amendment, newest first.
+func (s *Store) ListAmendments() ([]*model.Amendment, error) {
+	entries, err := os.ReadDir(filepath.Join(s.dir, "amendments"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []*model.Amendment
+	for _, e := range entries {
+		var a model.Amendment
+		if err := readJSON(filepath.Join(s.dir, "amendments", e.Name()), &a); err != nil {
+			continue
+		}
+		out = append(out, &a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// DecideAmendment settles a pending proposal. Approving applies the proposed
+// prompt to the agent — through SaveAgent, so AGENTS.md regenerates like any
+// human edit — but refuses a STALE proposal: one whose snapshot no longer
+// matches the agent's current prompt was reasoned against text that no longer
+// exists, and silently applying it would overwrite a human's newer edit.
+func (s *Store) DecideAmendment(id string, approve bool) (*model.Amendment, error) {
+	a, err := s.LoadAmendment(id)
+	if err != nil {
+		return nil, err
+	}
+	if a.Status != model.AmendmentPending {
+		return nil, fmt.Errorf("amendment %s is already %s", id, a.Status)
+	}
+	if approve {
+		agent, err := s.LoadAgent(a.Agent)
+		if err != nil {
+			return nil, fmt.Errorf("agent %q no longer exists: %w", a.Agent, err)
+		}
+		if agent.SystemPrompt != a.Current {
+			return nil, fmt.Errorf("agent %q's prompt changed after this proposal was made; reject it and ask for a fresh one", a.Agent)
+		}
+		agent.SystemPrompt = a.Proposed
+		if err := s.SaveAgent(agent); err != nil {
+			return nil, err
+		}
+		a.Status = model.AmendmentApproved
+	} else {
+		a.Status = model.AmendmentRejected
+	}
+	a.DecidedAt = time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := writeJSONAtomic(s.amendmentPath(a.ID), a); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// ---- lessons ----
+// Behavior rules distilled from run retrospectives, workflow-scoped. Stored as
+// data until the user decides; only approved lessons are injected into future
+// runs — proposal never equals effect (same posture as amendments).
+
+func (s *Store) lessonPath(id string) string {
+	return filepath.Join(s.dir, "lessons", id+".json")
+}
+
+// SaveLesson persists one lesson. IDs and timestamps are assigned here; an
+// empty status starts pending (a coordinator proposal awaiting the user). A
+// caller may preset StatusApproved for user-authored rules — the human writing
+// the rule IS the approval. A proposal with Replaces must name approved rules
+// of the same workflow; their texts are snapshotted here so approval can
+// refuse a stale swap. Empty text is only legal as a retirement (Replaces
+// non-empty).
+func (s *Store) SaveLesson(l *model.Lesson) error {
+	l.Text = strings.TrimSpace(l.Text)
+	if l.Text == "" && len(l.Replaces) == 0 {
+		return fmt.Errorf("lesson text is empty")
+	}
+	if l.WorkflowID == "" {
+		return fmt.Errorf("lesson has no workflow")
+	}
+	l.ReplacedTexts = nil
+	for _, id := range l.Replaces {
+		target, err := s.LoadLesson(id)
+		if err != nil {
+			return fmt.Errorf("rule %s it claims to replace does not exist", id)
+		}
+		if target.WorkflowID != l.WorkflowID {
+			return fmt.Errorf("rule %s belongs to another workflow", id)
+		}
+		if target.Status != model.AmendmentApproved {
+			return fmt.Errorf("rule %s is %s — only approved standing rules can be replaced", id, target.Status)
+		}
+		l.ReplacedTexts = append(l.ReplacedTexts, target.Text)
+	}
+	if l.ID == "" {
+		l.ID = newID("lesson")
+	}
+	if err := safeName(l.ID); err != nil {
+		return err
+	}
+	if l.CreatedAt.IsZero() {
+		l.CreatedAt = time.Now()
+	}
+	if l.Status == "" {
+		l.Status = model.AmendmentPending
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.MkdirAll(filepath.Join(s.dir, "lessons"), 0o755); err != nil {
+		return err
+	}
+	return writeJSONAtomic(s.lessonPath(l.ID), l)
+}
+
+func (s *Store) LoadLesson(id string) (*model.Lesson, error) {
+	if err := safeName(id); err != nil {
+		return nil, err
+	}
+	var l model.Lesson
+	if err := readJSON(s.lessonPath(id), &l); err != nil {
+		return nil, err
+	}
+	return &l, nil
+}
+
+// ListLessons returns every lesson, newest first.
+func (s *Store) ListLessons() ([]*model.Lesson, error) {
+	entries, err := os.ReadDir(filepath.Join(s.dir, "lessons"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []*model.Lesson
+	for _, e := range entries {
+		var l model.Lesson
+		if err := readJSON(filepath.Join(s.dir, "lessons", e.Name()), &l); err != nil {
+			continue
+		}
+		out = append(out, &l)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// DecideLesson settles a pending proposal: approve puts it into the injection
+// set, reject archives it. Deciding twice is refused, same as amendments.
+// Approving a superseding proposal swaps it for its targets — but refuses a
+// STALE one: a target the user edited (or already replaced) since the
+// proposal was made carries decisions the proposal never saw, and silently
+// discarding them would let an agent overrule the human.
+func (s *Store) DecideLesson(id string, approve bool) (*model.Lesson, error) {
+	l, err := s.LoadLesson(id)
+	if err != nil {
+		return nil, err
+	}
+	if l.Status != model.AmendmentPending {
+		return nil, fmt.Errorf("lesson %s is already %s", id, l.Status)
+	}
+	if approve {
+		for i, tid := range l.Replaces {
+			target, err := s.LoadLesson(tid)
+			if err != nil {
+				return nil, fmt.Errorf("rule %s it replaces no longer exists; reject this proposal and ask for a fresh one", tid)
+			}
+			if i < len(l.ReplacedTexts) && target.Text != l.ReplacedTexts[i] {
+				return nil, fmt.Errorf("rule %s changed after this proposal was made; reject it and ask for a fresh one", tid)
+			}
+		}
+		l.Status = model.AmendmentApproved
+	} else {
+		l.Status = model.AmendmentRejected
+	}
+	l.DecidedAt = time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := writeJSONAtomic(s.lessonPath(l.ID), l); err != nil {
+		return nil, err
+	}
+	if approve {
+		// The swap: superseded rules leave the set. Their texts live on in
+		// this record's ReplacedTexts for the audit trail.
+		for _, tid := range l.Replaces {
+			os.Remove(s.lessonPath(tid))
+		}
+	}
+	return l, nil
+}
+
+// UpdateLessonText rewrites a lesson's text in place — the human revising the
+// record owns it; status and provenance stay as they are.
+func (s *Store) UpdateLessonText(id, text string) (*model.Lesson, error) {
+	if strings.TrimSpace(text) == "" {
+		return nil, fmt.Errorf("lesson text is empty")
+	}
+	l, err := s.LoadLesson(id)
+	if err != nil {
+		return nil, err
+	}
+	l.Text = text
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := writeJSONAtomic(s.lessonPath(l.ID), l); err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+// DeleteLesson removes a lesson entirely (an approved rule the user retires,
+// or a rejected one they want gone from the archive).
+func (s *Store) DeleteLesson(id string) error {
+	if err := safeName(id); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.Remove(s.lessonPath(id)); os.IsNotExist(err) {
+		return fmt.Errorf("lesson %s not found", id)
+	} else if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s *Store) WriteNodeOutput(runID, nodeID, content string) error {
 	if err := safeName(runID); err != nil {
 		return err

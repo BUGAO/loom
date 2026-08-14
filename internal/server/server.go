@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"loom/internal/engine"
 	"loom/internal/hub"
@@ -67,7 +68,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/runs/{id}/cancel", s.cancelRun)
 	mux.HandleFunc("POST /api/runs/{id}/retry/{node}", s.retryNode)
 	mux.HandleFunc("POST /api/runs/{id}/resume", s.resumeRun)
+	mux.HandleFunc("POST /api/runs/{id}/feedback", s.setRunFeedback)
 	mux.HandleFunc("POST /api/runs/{id}/tasks/{task}/message", s.sendTaskMessage)
+
+	mux.HandleFunc("GET /api/amendments", s.listAmendments)
+	mux.HandleFunc("POST /api/amendments/{id}/approve", s.approveAmendment)
+	mux.HandleFunc("POST /api/amendments/{id}/reject", s.rejectAmendment)
+
+	mux.HandleFunc("GET /api/lessons", s.listLessons)
+	mux.HandleFunc("POST /api/workflows/{id}/lessons", s.addLesson)
+	mux.HandleFunc("POST /api/workflows/{id}/lessons/consolidate", s.consolidateLessons)
+	mux.HandleFunc("POST /api/lessons/{id}/approve", s.approveLesson)
+	mux.HandleFunc("POST /api/lessons/{id}/reject", s.rejectLesson)
+	mux.HandleFunc("PUT /api/lessons/{id}", s.editLesson)
+	mux.HandleFunc("DELETE /api/lessons/{id}", s.deleteLesson)
 	mux.HandleFunc("GET /api/runs/{id}/events", s.streamRun)
 	mux.HandleFunc("GET /api/runs/{id}/nodes/{node}/output", s.nodeOutput)
 	mux.HandleFunc("GET /api/runs/{id}/uploads/{name}", s.getUpload)
@@ -122,6 +136,8 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 		"runtimes":        model.RuntimeCatalog,
 		"default_runtime": model.DefaultRuntime,
 		"default_dry_run": s.defaultDryRun,
+		"max_lessons":     engine.MaxLessons,
+		"lessons_nudge":   engine.LessonsConsolidateNudge,
 	})
 }
 
@@ -259,9 +275,9 @@ func (s *Server) promptPreview(w http.ResponseWriter, r *http.Request) {
 	}
 	var prompt string
 	if wf.EffectiveMode() == model.ModeDynamic {
-		prompt = hub.CoordinatorPrompt(&model.Run{}, wf, wf.EffectiveBudget(), s.engine.OutputRoot(), "", pool)
+		prompt = hub.CoordinatorPrompt(&model.Run{}, wf, wf.EffectiveBudget(), s.engine.OutputRoot(), "", pool, s.engine.LessonsFor(wf.ID))
 	} else {
-		prompt = planner.BuildPrompt("<用户发起运行时输入的目标>", pool, wf.Planner, "", wf.AllowAgentCreation)
+		prompt = planner.BuildPrompt("<用户发起运行时输入的目标>", pool, wf.Planner, "", wf.AllowAgentCreation, engine.LessonTexts(s.engine.LessonsFor(wf.ID)))
 	}
 	writeJSON(w, 200, map[string]string{"mode": wf.EffectiveMode(), "prompt": prompt})
 }
@@ -565,6 +581,196 @@ func (s *Server) rejectRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.engine.Reject(r.PathValue("id"), body.Reason); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// setRunFeedback lands the user's post-run verdict. For a real dynamic run
+// this is CONVERSATIONAL: the session reopens in postmortem mode and the
+// coordinator digests the feedback — clarifies, persists facts/amendments,
+// writes the retrospective RECORD via conclude_feedback (kept on the run,
+// never injected), and proposes the behavior rules it yields, which await
+// the user's confirmation in the lessons queue. Static and dry runs have no
+// conversational agent, so they keep the verbatim record. Active runs refuse
+// it — the live chat is the channel then. An empty text clears the stored
+// record without waking anyone, and direct=true edits the stored record
+// verbatim (the manager UI's path: the human revising the record is the
+// record's owner — no coordinator needs to interpret that).
+func (s *Server) setRunFeedback(w http.ResponseWriter, r *http.Request) {
+	body, ok := readBody[struct {
+		Text   string `json:"text"`
+		Direct bool   `json:"direct"`
+	}](w, r)
+	if !ok {
+		return
+	}
+	id := r.PathValue("id")
+	if s.engine.IsActive(id) {
+		writeErr(w, 400, fmt.Errorf("run %s is active — tell the main agent directly in the session chat", id))
+		return
+	}
+	run, err := s.store.LoadRun(id)
+	if err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	text := strings.TrimSpace(body.Text)
+
+	if text != "" && !body.Direct && run.EffectiveMode() == model.ModeDynamic && !run.EffectiveDryRun() {
+		reopened, err := s.engine.ReopenFeedback(id, text)
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, 200, reopened)
+		return
+	}
+
+	run.Feedback = text
+	run.FeedbackAt = time.Now()
+	msg := "user feedback recorded"
+	if run.Feedback == "" {
+		run.FeedbackAt = time.Time{}
+		msg = "user feedback cleared"
+	}
+	run.Events = append(run.Events, model.Event{Ts: time.Now(), Type: "info", Msg: msg})
+	if err := s.store.SaveRun(run); err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	if data, err := json.Marshal(run); err == nil {
+		s.broker.Publish(run.ID, data)
+	}
+	writeJSON(w, 200, run)
+}
+
+// ---- amendments ----
+
+func (s *Server) listAmendments(w http.ResponseWriter, r *http.Request) {
+	ams, err := s.store.ListAmendments()
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	if ams == nil {
+		ams = []*model.Amendment{}
+	}
+	writeJSON(w, 200, ams)
+}
+
+func (s *Server) approveAmendment(w http.ResponseWriter, r *http.Request) {
+	a, err := s.store.DecideAmendment(r.PathValue("id"), true)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, a)
+}
+
+func (s *Server) rejectAmendment(w http.ResponseWriter, r *http.Request) {
+	a, err := s.store.DecideAmendment(r.PathValue("id"), false)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, a)
+}
+
+// ---- lessons ----
+// Behavior rules distilled from run retrospectives. The coordinator proposes
+// (pending), the user decides; only approved rules are injected into future
+// runs. A user-authored rule is born approved — writing it IS the approval.
+
+func (s *Server) listLessons(w http.ResponseWriter, r *http.Request) {
+	ls, err := s.store.ListLessons()
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	if wfID := r.URL.Query().Get("workflow_id"); wfID != "" {
+		var filtered []*model.Lesson
+		for _, l := range ls {
+			if l.WorkflowID == wfID {
+				filtered = append(filtered, l)
+			}
+		}
+		ls = filtered
+	}
+	if ls == nil {
+		ls = []*model.Lesson{}
+	}
+	writeJSON(w, 200, ls)
+}
+
+func (s *Server) addLesson(w http.ResponseWriter, r *http.Request) {
+	body, ok := readBody[struct {
+		Text string `json:"text"`
+	}](w, r)
+	if !ok {
+		return
+	}
+	wfID := r.PathValue("id")
+	if _, err := s.store.LoadWorkflow(wfID); err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	l := &model.Lesson{WorkflowID: wfID, Text: strings.TrimSpace(body.Text), Status: model.AmendmentApproved, DecidedAt: time.Now()}
+	if err := s.store.SaveLesson(l); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, l)
+}
+
+// consolidateLessons wakes the workflow's newest finished real dynamic
+// session as a maintenance pass over the standing rules; everything it
+// proposes still queues for the user's confirmation.
+func (s *Server) consolidateLessons(w http.ResponseWriter, r *http.Request) {
+	run, err := s.engine.ReopenConsolidate(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, run)
+}
+
+func (s *Server) approveLesson(w http.ResponseWriter, r *http.Request) {
+	l, err := s.store.DecideLesson(r.PathValue("id"), true)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, l)
+}
+
+func (s *Server) rejectLesson(w http.ResponseWriter, r *http.Request) {
+	l, err := s.store.DecideLesson(r.PathValue("id"), false)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, l)
+}
+
+func (s *Server) editLesson(w http.ResponseWriter, r *http.Request) {
+	body, ok := readBody[struct {
+		Text string `json:"text"`
+	}](w, r)
+	if !ok {
+		return
+	}
+	l, err := s.store.UpdateLessonText(r.PathValue("id"), strings.TrimSpace(body.Text))
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, l)
+}
+
+func (s *Server) deleteLesson(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.DeleteLesson(r.PathValue("id")); err != nil {
 		writeErr(w, 400, err)
 		return
 	}

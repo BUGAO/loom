@@ -117,7 +117,7 @@ func serve() {
 		"planner": &llm.Claude{},
 	}
 	if cmd := resolveACP(flagACP); cmd != "" {
-		backends["claude"] = &llm.ACP{Command: cmd}
+		backends["claude"] = &llm.ACP{Command: cmd, ProtectDir: flagData}
 		fmt.Printf("claude runtime: ACP via %s\n", cmd)
 	} else {
 		log.Printf("warning: claude-code-acp not found (run `loom doctor`); claude runtime degrades to CLI single-shot — dynamic workflows will refuse to start")

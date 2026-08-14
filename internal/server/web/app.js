@@ -284,6 +284,7 @@ async function wfListPage() {
       <span class="badge">${wf.mode === "dynamic" ? "dynamic · main agent 对话式编排" : "static · planner 组装 DAG"}</span>
       <span style="flex:1"></span>
       ${wf.mode === "dynamic" ? '<button class="small" id="wf-new-session" title="开始一个全新会话(新 run)">+ 新会话</button>' : ""}
+      <button class="small" id="wf-feedback" title="复盘记录与行为规范:待确认的规范在这里批;已确认的注入之后每次 run">复盘</button>
       <button class="small" onclick="location.hash='#/workflows/${esc(wf.id)}/edit'">设置</button>
       <a class="btn small" href="#/runs" onclick="sessionStorage.setItem('wfFilter','${esc(wf.id)}')">历史</a>`;
     const nb = head.querySelector("#wf-new-session");
@@ -294,6 +295,16 @@ async function wfListPage() {
       sessionStorage.setItem(sesKey(), "new");
       renderSessions(); renderRight(); resub();
     });
+    const fbBtn = head.querySelector("#wf-feedback");
+    fbBtn.addEventListener("click", () => feedbackModal(wf));
+    // Badge: pending rules need the user's decision — that's the number that
+    // matters here, not how many retrospectives exist.
+    api("/lessons?workflow_id=" + wf.id).then((ls) => {
+      const pending = ls.filter((l) => l.status === "pending").length;
+      const approved = ls.filter((l) => l.status === "approved").length;
+      if (pending) fbBtn.innerHTML = `复盘 · <b style="color:var(--accent)">待确认 ${pending}</b>`;
+      else if (approved) fbBtn.textContent = `复盘 (${approved})`;
+    }).catch(() => {});
   };
 
   // Sessions are first-class and visible: one chip per run, click to continue
@@ -434,7 +445,7 @@ async function wfListPage() {
       ts: m.ts,
       html: `
       <div class="cmsg ${m.from === "user" ? "me" : "agent"}">
-        <div class="cwho">${m.from === "user" ? "你" : "main agent"} · ${fmtTime(m.ts)}</div>
+        <div class="cwho">${m.from === "user" ? (m.kind === "feedback" ? "你 · 复盘反馈" : m.kind === "consolidate" ? "你 · 规范整理" : "你") : "main agent"} · ${fmtTime(m.ts)}</div>
         <div class="cbody">${esc(m.text)}${m.images?.length ? `<div class="cimgs">${chatImgs(m)}</div>` : ""}</div>
       </div>`,
     }));
@@ -450,6 +461,27 @@ async function wfListPage() {
     if (terminalRun(run) && run.mode === "dynamic") {
       const label = run.status === "succeeded" ? "已交付" : RUN_LABEL[run.status] || run.status;
       tail = `<div class="cmsg agent"><div class="cwho">系统</div><div class="cbody" style="color:var(--muted)">会话${label}${run.status === "failed" && run.error ? ":" + esc(run.error) : ""}。继续发消息会在同一会话唤醒 main agent 接着做。</div></div>`;
+      // The feedback loop's landing point. Real dynamic runs digest feedback
+      // CONVERSATIONALLY: submitting wakes the coordinator in postmortem mode.
+      // Its conclusion is a RECORD (never injected); the behavior rules it
+      // distills wait in the 复盘 panel for the user's confirmation — only
+      // confirmed rules ride into future runs. Dry runs have a scripted
+      // coordinator, so they keep the verbatim record.
+      const dryish = run.dry_run || run.backend === "mock";
+      const distilled = run.feedback
+        ? `<div style="font-size:12.5px;margin-bottom:6px">复盘记录(仅存档,不注入):<i>${esc(run.feedback)}</i></div>` : "";
+      tail += dryish ? `
+        <div class="cmsg agent"><div class="cwho">复盘反馈${run.feedback ? " · 已记录 ✓" : ""}</div><div class="cbody">
+          <div class="muted" style="font-size:12px;margin-bottom:6px">演示模式没有真的 main agent:反馈原文保存为复盘记录,不注入。要注入之后 run 的行为规范,在 workflow 的「复盘」面板手动添加。</div>
+          <textarea id="fb-input" rows="2" placeholder="例:报告把结论埋在最后——下次先给结论" style="width:100%;resize:vertical">${esc(run.feedback || "")}</textarea>
+          <div class="row" style="margin-top:6px"><button class="small primary" data-act="feedback">保存反馈</button></div>
+        </div></div>` : `
+        <div class="cmsg agent"><div class="cwho">复盘反馈</div><div class="cbody">
+          ${distilled}
+          <div class="muted" style="font-size:12px;margin-bottom:6px">提交后唤醒 main agent 消化这条反馈:指代不清它会反问;值得沉淀的进项目记忆或修订提案;复盘结论只存档,从中提炼的行为规范会等你在「复盘」面板逐条确认——确认后才注入之后的 run,事件经过不会被注入。</div>
+          <textarea id="fb-input" rows="2" placeholder="例:报告把结论埋在最后——下次先给结论" style="width:100%;resize:vertical"></textarea>
+          <div class="row" style="margin-top:6px"><button class="small primary" data-act="feedback">发起复盘</button></div>
+        </div></div>`;
     }
     if (run.status === "awaiting_approval" && run.proposal) {
       tail = `
@@ -479,7 +511,12 @@ async function wfListPage() {
     if (!st || !log) return;
     st.innerHTML = renderStatus();
     const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+    const prevFb = log.querySelector("#fb-input")?.value; // survive re-renders
     log.innerHTML = renderChat();
+    if (prevFb !== undefined) {
+      const fb = log.querySelector("#fb-input");
+      if (fb) fb.value = prevFb;
+    }
     if (atBottom) log.scrollTop = log.scrollHeight;
     // Dry-run is a property fixed at session birth; the toggle only applies
     // to a session being composed, so it only shows then.
@@ -581,6 +618,22 @@ async function wfListPage() {
   const wireAct = (btn) => btn.addEventListener("click", async () => {
     const act = btn.dataset.act;
     let body = {};
+    if (act === "feedback") {
+      const dryish = run.dry_run || run.backend === "mock";
+      const text = $main.querySelector("#fb-input")?.value ?? "";
+      if (!dryish && !text.trim()) return toast("请先写下反馈内容");
+      try {
+        run = await api(`/runs/${run.id}/feedback`, { method: "POST", body: { text } });
+        if (dryish) {
+          toast("反馈已保存为复盘记录(不注入)");
+        } else {
+          toast("已发起复盘,main agent 正在消化;提炼出的规范会等你在「复盘」面板确认");
+          resub(); // the session just reactivated; follow it live
+        }
+        renderRight();
+      } catch (e) { toast(e.message); }
+      return;
+    }
     if (act === "reject") {
       const reason = await modalDialog({
         title: "拒绝该计划", inputPlaceholder: "拒绝理由(会告知 main agent)…",
@@ -776,6 +829,11 @@ async function wfEditPage(id) {
             <option value="none" ${b.approval_policy === "none" ? "selected" : ""}>无审批(仅靠预算兜底)</option>
           </select></label>
       </div>
+      <label class="field"><span>常驻 implementer(pair 模式)— 该 agent 的所有任务共用一个持久会话串行执行,cwd 为交换目录,项目理解跨任务累积;留空关闭</span>
+        <select id="f-pair-agent">
+          <option value="">(关闭)</option>
+          ${agents.map((a) => `<option value="${esc(a.name)}" ${wf.pair_agent === a.name ? "selected" : ""}>${esc(a.name)}</option>`).join("")}
+        </select></label>
       <label class="field"><span>预算护栏 — 由引擎硬执行,不依赖 coordinator 自觉。这是 dynamic 模式唯一的终止保证。</span></label>
       <div class="row">
         <label class="field" style="flex:1"><span>最大任务数</span>
@@ -925,6 +983,7 @@ async function wfEditPage(id) {
         model: val("#f-coord-model", wf.coordinator?.model || "").trim(),
         system_prompt: val("#f-coord-sp", wf.coordinator?.system_prompt || "").trim(),
       };
+      wf.pair_agent = val("#f-pair-agent", wf.pair_agent || "");
       wf.budget = {
         max_tasks: +val("#f-max-tasks", 30),
         max_delegation_depth: +val("#f-max-depth", 3),
@@ -1066,6 +1125,18 @@ async function runPage(id) {
         </div>
         ${run.error ? `<div style="color:var(--bad);font-size:13px;margin-top:8px">${esc(run.error)}</div>` : ""}
       </div>
+      ${terminal ? (dyn && !(run.dry_run || run.backend === "mock") ? `
+      <div class="panel" style="margin-top:14px">
+        ${run.feedback ? `<div style="font-size:12.5px;margin-bottom:6px">📮 复盘记录(仅存档,不注入):<i>${esc(run.feedback)}</i></div>` : ""}
+        <div class="muted" style="font-size:12px;margin-bottom:6px">📮 复盘反馈:提交后唤醒 main agent 消化——指代不清会反问,值得沉淀的进项目记忆/修订提案;结论只存档,提炼的行为规范在 workflow「复盘」面板确认后才注入之后的 run</div>
+        <textarea id="fb-input" rows="2" placeholder="例:报告把结论埋在最后——下次先给结论" style="width:100%;resize:vertical"></textarea>
+        <div class="row" style="margin-top:6px"><button class="small primary" data-act="feedback">发起复盘</button></div>
+      </div>` : `
+      <div class="panel" style="margin-top:14px">
+        <div class="muted" style="font-size:12px;margin-bottom:6px">📮 复盘反馈${run.feedback ? "(已记录 ✓)" : ""} — ${dyn ? "演示模式没有真的 main agent," : "static 模式没有对话角色,"}原文保存为复盘记录(不注入);要注入之后 run 的行为规范,在 workflow「复盘」面板手动添加</div>
+        <textarea id="fb-input" rows="2" placeholder="例:报告把结论埋在最后——下次先给结论" style="width:100%;resize:vertical">${esc(run.feedback || "")}</textarea>
+        <div class="row" style="margin-top:6px"><button class="small primary" data-act="feedback">保存反馈</button></div>
+      </div>`) : ""}
       ${dyn && run.status === "awaiting_approval" && run.proposal ? renderProposal(run.proposal) : ""}
       ${!dyn && run.plan?.agents?.length ? `
       <div class="panel" style="margin-top:14px">
@@ -1101,6 +1172,12 @@ async function runPage(id) {
       btn.addEventListener("click", async () => {
         const act = btn.dataset.act;
         let body = {};
+        if (act === "feedback") {
+          const text = $main.querySelector("#fb-input")?.value ?? "";
+          const conversational = dyn && !(run.dry_run || run.backend === "mock");
+          if (conversational && !text.trim()) return toast("请先写下反馈内容");
+          body = { text };
+        }
         if (act === "reject") {
           const reason = await modalDialog({
             title: "拒绝该计划", inputPlaceholder: "拒绝理由(会告知 coordinator)…",
@@ -1109,8 +1186,13 @@ async function runPage(id) {
           if (reason === null) return;
           body = { reason };
         }
-        try { await api(`/runs/${run.id}/${act}`, { method: "POST", body }); }
-        catch (e) { toast(e.message); }
+        try {
+          await api(`/runs/${run.id}/${act}`, { method: "POST", body });
+          if (act === "feedback") {
+            toast(dyn && !(run.dry_run || run.backend === "mock")
+              ? "已发起复盘,main agent 正在消化;提炼出的规范会等你在「复盘」面板确认" : "反馈已保存为复盘记录(不注入)");
+          }
+        } catch (e) { toast(e.message); }
       }));
     $main.querySelectorAll(".dag-node, .tnode").forEach((g) =>
       g.addEventListener("click", () => { selectedNode = g.dataset.node; render(); }));
@@ -1390,18 +1472,45 @@ function renderDag(run, selected) {
 // ---------- agents ----------
 
 async function agentsPage() {
-  const [agents, costs] = await Promise.all([
+  const [agents, costs, amendments] = await Promise.all([
     api("/agents"),
     api("/costs/summary?by=agent").catch(() => ({ agents: [] })),
+    api("/amendments").catch(() => []),
   ]);
   // Cumulative spend per agent across every run it has ever served — the
   // cross-workflow view the run pages structurally cannot give.
   const spend = Object.fromEntries((costs.agents || []).map((b) => [b.key, b]));
+  // Pending amendments: a coordinator's proposed revision of an agent's
+  // definition. Nothing applies without the approve button below — that click
+  // IS the security boundary between "agent surfaced evidence" and "identity
+  // changed".
+  const pending = (amendments || []).filter((am) => am.status === "pending");
+  const amendCard = (am) => `
+    <div class="panel" style="border-left:3px solid var(--warn)">
+      <div class="row" style="align-items:baseline;gap:8px">
+        <b>${esc(am.agent)}</b>
+        <span class="muted" style="font-size:12px">main agent 提议修订该 agent 的 system prompt · ${fmtTime(am.created_at)}${am.run_id ? ` · 来自 <a href="#/runs/${esc(am.run_id)}" class="mono" style="font-size:11px">${esc(am.run_id)}</a>` : ""}</span>
+      </div>
+      <div style="font-size:13px;margin:8px 0"><b>理由:</b>${esc(am.rationale)}</div>
+      <details style="margin-bottom:8px"><summary style="cursor:pointer;font-size:12.5px">当前 prompt(修订将整体替换它)</summary>
+        <pre style="white-space:pre-wrap;font-size:12px;max-height:220px;overflow:auto">${esc(am.current)}</pre></details>
+      <details open style="margin-bottom:10px"><summary style="cursor:pointer;font-size:12.5px">提议的新 prompt</summary>
+        <pre style="white-space:pre-wrap;font-size:12px;max-height:220px;overflow:auto">${esc(am.proposed)}</pre></details>
+      <div class="row">
+        <button class="small primary" data-am-approve="${esc(am.id)}">✓ 批准并应用</button>
+        <button class="small danger" data-am-reject="${esc(am.id)}">✗ 拒绝</button>
+      </div>
+    </div>`;
   $main.innerHTML = `
     <div class="page-head">
       <h1>Agent 池 <span class="muted" style="font-size:13px">(${agents.length} 个可复用 executor)</span></h1>
       <button class="primary" id="ag-new">+ 新建 Agent</button>
     </div>
+    ${pending.length ? `
+    <div style="margin-bottom:14px">
+      <div class="muted" style="font-size:12.5px;margin-bottom:8px">📝 待审修订提案(${pending.length})— agent 永远不能自改定义;批准才会生效,并同步重生成 AGENTS.md</div>
+      ${pending.map(amendCard).join("")}
+    </div>` : ""}
     <div class="grid">
       ${agents.map((a) => `
         <div class="panel agent-card">
@@ -1418,6 +1527,19 @@ async function agentsPage() {
           </div>
         </div>`).join("")}
     </div>`;
+  $main.querySelectorAll("[data-am-approve]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      if (!(await confirmModal("批准修订", `agent「${pending.find((x) => x.id === b.dataset.amApprove)?.agent}」的 system prompt 将被提议版本整体替换。`, "批准并应用"))) return;
+      try { await api(`/amendments/${b.dataset.amApprove}/approve`, { method: "POST", body: {} }); toast("已应用"); }
+      catch (e) { toast(e.message); }
+      agentsPage();
+    }));
+  $main.querySelectorAll("[data-am-reject]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      try { await api(`/amendments/${b.dataset.amReject}/reject`, { method: "POST", body: {} }); toast("已拒绝"); }
+      catch (e) { toast(e.message); }
+      agentsPage();
+    }));
   $main.querySelector("#ag-new").onclick = () => agentModal(null, agents);
   $main.querySelectorAll("[data-edit]").forEach((b) =>
     b.addEventListener("click", () => agentModal(agents.find((a) => a.name === b.dataset.edit), agents)));
@@ -1427,6 +1549,214 @@ async function agentsPage() {
       await api("/agents/" + b.dataset.del, { method: "DELETE" });
       agentsPage();
     }));
+}
+
+// The workflow's retrospective panel, two tiers with different fates:
+// behavior rules (lessons) — proposed by the coordinator from postmortems,
+// injected into future runs ONLY once the user confirms each — and per-run
+// retrospective records (run.feedback), which are archives: readable,
+// editable, never injected. Confirmation is the only path from a
+// retrospective to the next run's prompt.
+async function feedbackModal(wf) {
+  let runs = [], lessons = [];
+  try { runs = await api("/runs?workflow_id=" + wf.id); } catch {}
+  try { lessons = await api("/lessons?workflow_id=" + wf.id); } catch {}
+  const records = runs.filter((r) => r.feedback); // newest first
+  const pending = lessons.filter((l) => l.status === "pending");
+  const approved = lessons.filter((l) => l.status === "approved");
+  const injectN = meta.max_lessons || 20;
+  const fmtDay = (t) => new Date(t).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  const runLink = (id) => id ? `<a href="#/runs/${esc(id)}" class="mono" style="font-size:11px" onclick="document.getElementById('overlay').innerHTML=''">来源 ${esc(id.slice(-8))}</a>` : "";
+
+  // A pending proposal comes in three shapes: a plain new rule, a replacement
+  // (old rules shown struck through above the new text), and a pure
+  // retirement (old rules go, nothing added).
+  const pendingItem = (l) => {
+    const isRepl = (l.replaces || []).length > 0;
+    const retire = isRepl && !l.text;
+    return `
+    <div style="border:1px solid var(--accent);border-radius:10px;padding:10px 12px;margin-bottom:10px" data-ls="${esc(l.id)}">
+      <div class="row" style="align-items:baseline;gap:8px;margin-bottom:6px">
+        <span class="badge" style="color:var(--accent)">${retire ? "提议退役" : isRepl ? "提议替换" : "待确认"}</span>
+        ${runLink(l.run_id)}
+        <span class="muted" style="font-size:12px">${fmtDay(l.created_at)}</span>
+      </div>
+      ${isRepl ? `<div style="font-size:12.5px;margin-bottom:4px">${(l.replaced_texts || []).map((t) =>
+        `<div class="muted" style="text-decoration:line-through;white-space:pre-wrap">${esc(t)}</div>`).join("")}</div>` : ""}
+      ${retire
+        ? '<div class="muted" style="font-size:12.5px">退役后这些规范不再注入,也没有替代条目。</div>'
+        : `${isRepl ? '<div class="muted" style="font-size:11px;margin-bottom:2px">↓ 替换为</div>' : ""}
+      <div class="ls-text" style="font-size:13px;white-space:pre-wrap">${esc(l.text)}</div>
+      <textarea class="ls-edit" rows="2" style="width:100%;resize:vertical;display:none">${esc(l.text)}</textarea>`}
+      <div class="row" style="margin-top:8px">
+        <button class="small primary" data-ls-approve>✓ ${retire ? "确认退役" : isRepl ? "替换并采纳" : "采纳(注入之后的 run)"}</button>
+        ${retire ? "" : '<button class="small" data-ls-edit>改后采纳</button>'}
+        <button class="small danger" data-ls-reject>✗ 不采纳</button>
+      </div>
+    </div>`;
+  };
+  const approvedItem = (l, i) => `
+    <div style="border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-bottom:10px" data-ls="${esc(l.id)}">
+      <div class="row" style="align-items:baseline;gap:8px;margin-bottom:6px">
+        ${i < injectN
+          ? '<span class="badge" style="color:var(--accent)" title="注入之后每次 run 的开局(main agent 可见,worker 不可见)">注入中</span>'
+          : `<span class="badge" title="超出注入上限 ${injectN} 条,最新的优先">超限存档</span>`}
+        ${l.run_id ? runLink(l.run_id) : '<span class="muted" style="font-size:11px">手动添加</span>'}
+        <span class="muted" style="font-size:12px">${fmtDay(l.decided_at || l.created_at)}</span>
+      </div>
+      <div class="ls-text" style="font-size:13px;white-space:pre-wrap">${esc(l.text)}</div>
+      <textarea class="ls-edit" rows="2" style="width:100%;resize:vertical;display:none">${esc(l.text)}</textarea>
+      <div class="row" style="margin-top:8px">
+        <button class="small" data-ls-edit>编辑</button>
+        <button class="small primary" data-ls-save style="display:none">保存</button>
+        <button class="small danger" data-ls-del>移除</button>
+      </div>
+    </div>`;
+  const recordItem = (r) => `
+    <div style="border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-bottom:10px" data-fb="${esc(r.id)}">
+      <div class="row" style="align-items:baseline;gap:8px;margin-bottom:6px">
+        <a href="#/runs/${esc(r.id)}" class="mono" style="font-size:11px" onclick="document.getElementById('overlay').innerHTML=''">${esc(r.id)}</a>
+        <span class="muted" style="font-size:12px">${fmtDay(r.feedback_at || r.created_at)} · ${esc((r.goal || "").replace(/\s+/g, " ").slice(0, 24))}</span>
+      </div>
+      <div class="fb-text" style="font-size:13px;white-space:pre-wrap">${esc(r.feedback)}</div>
+      <textarea class="fb-edit" rows="2" style="width:100%;resize:vertical;display:none">${esc(r.feedback)}</textarea>
+      <div class="row" style="margin-top:8px">
+        <button class="small" data-fb-edit>编辑</button>
+        <button class="small primary" data-fb-save style="display:none">保存</button>
+        <button class="small danger" data-fb-clear>清除</button>
+      </div>
+    </div>`;
+
+  $overlay.innerHTML = `
+    <div class="modal-bg">
+      <div class="modal">
+        <h2>复盘 · ${esc(wf.name)}</h2>
+        <div class="muted" style="font-size:12.5px;margin-bottom:12px">复盘产出分两层:<b>行为规范</b>是从复盘里提炼的具体做法,经你确认后注入之后每次 run 的开局;<b>复盘记录</b>是每次 run 的结论存档,只供查阅,永不注入。</div>
+        ${pending.length ? `<h3 style="margin:14px 0 8px">待确认的行为规范</h3>${pending.map(pendingItem).join("")}` : ""}
+        <h3 style="margin:14px 0 8px">生效中的规范(注入每次 run)</h3>
+        ${approved.length >= (meta.lessons_nudge || 12) ? `
+        <div style="border:1px solid var(--accent);border-radius:10px;padding:8px 12px;margin-bottom:10px;font-size:12.5px">
+          生效规范已有 ${approved.length} 条,重复或矛盾的条目会拖累每一个 run 的开局 —— 建议发起一次整理:
+          main agent 通读全部规范,提出合并/改写/退役方案,仍然逐条经你确认。
+          <div class="row" style="margin-top:6px"><button class="small primary" id="ls-consolidate">发起整理</button></div>
+        </div>` : ""}
+        ${approved.map(approvedItem).join("") || '<div class="empty" style="padding:10px">还没有生效的规范 — 复盘后 main agent 会提炼并送来待确认,也可以在下面手动添加。</div>'}
+        <div class="row" style="margin-top:8px">
+          <input id="ls-new" placeholder="手动添加一条规范(立即生效),例:报告先给结论再给论证" style="flex:1">
+          <button class="small primary" id="ls-add">添加</button>
+        </div>
+        <h3 style="margin:18px 0 8px">复盘记录(存档,不注入)</h3>
+        ${records.map(recordItem).join("") || '<div class="empty" style="padding:10px">还没有复盘记录 — 会话结束后在会话尾部「发起复盘」。</div>'}
+        <div class="row modal-foot"><button id="fb-close">关闭</button></div>
+      </div>
+    </div>`;
+  $overlay.querySelector("#fb-close").onclick = () => ($overlay.innerHTML = "");
+  $overlay.querySelector(".modal-bg").addEventListener("click", (e) => {
+    if (e.target.classList.contains("modal-bg")) $overlay.innerHTML = "";
+  });
+
+  const bCons = $overlay.querySelector("#ls-consolidate");
+  if (bCons) bCons.onclick = async () => {
+    try {
+      await api(`/workflows/${wf.id}/lessons/consolidate`, { method: "POST", body: {} });
+      $overlay.innerHTML = "";
+      toast("已唤醒 main agent 整理规范;提案会回到「复盘」面板,逐条经你确认");
+    } catch (e) { toast(e.message); }
+  };
+
+  $overlay.querySelector("#ls-add").onclick = async () => {
+    const v = $overlay.querySelector("#ls-new").value.trim();
+    if (!v) return toast("先写下规范内容");
+    try {
+      await api(`/workflows/${wf.id}/lessons`, { method: "POST", body: { text: v } });
+      toast("已添加并生效");
+      feedbackModal(wf);
+    } catch (e) { toast(e.message); }
+  };
+
+  $overlay.querySelectorAll("[data-ls]").forEach((box) => {
+    const id = box.dataset.ls;
+    const text = box.querySelector(".ls-text"), edit = box.querySelector(".ls-edit");
+    const bE = box.querySelector("[data-ls-edit]"), bS = box.querySelector("[data-ls-save]");
+    const toggleEdit = () => {
+      const on = edit.style.display === "none";
+      edit.style.display = on ? "" : "none";
+      text.style.display = on ? "none" : "";
+      if (bS) bS.style.display = on ? "" : "none";
+      return on;
+    };
+    const decide = async (approve, textOverride) => {
+      try {
+        if (textOverride !== undefined) await api(`/lessons/${id}`, { method: "PUT", body: { text: textOverride } });
+        await api(`/lessons/${id}/${approve ? "approve" : "reject"}`, { method: "POST", body: {} });
+        toast(approve ? "已确认" : "已拒绝");
+        feedbackModal(wf);
+      } catch (e) { toast(e.message); }
+    };
+    const bApprove = box.querySelector("[data-ls-approve]");
+    if (bApprove) {
+      // Pending proposal: approve as-is, approve edited, or reject. A
+      // retirement has no text/edit elements — approve deletes its targets.
+      bApprove.onclick = () => {
+        const editing = edit && edit.style.display !== "none";
+        const v = edit ? edit.value.trim() : "";
+        if (editing && !v) return toast("内容为空");
+        decide(true, editing && v !== text.textContent ? v : undefined);
+      };
+      if (bE) bE.onclick = () => { bE.textContent = toggleEdit() ? "收起" : "改后采纳"; };
+      box.querySelector("[data-ls-reject]").onclick = () => decide(false);
+      return;
+    }
+    // Approved rule: edit in place or remove from the injection set.
+    bE.onclick = () => { bE.textContent = toggleEdit() ? "取消" : "编辑"; };
+    bS.onclick = async () => {
+      const v = edit.value.trim();
+      if (!v) return toast("内容为空 — 要移除请用「移除」");
+      try {
+        await api(`/lessons/${id}`, { method: "PUT", body: { text: v } });
+        toast("已更新");
+        feedbackModal(wf);
+      } catch (e) { toast(e.message); }
+    };
+    box.querySelector("[data-ls-del]").onclick = async () => {
+      if (!(await confirmModal("移除规范", "这条规范将不再注入之后的 run。", "移除"))) return;
+      try {
+        await api(`/lessons/${id}`, { method: "DELETE" });
+        toast("已移除");
+        feedbackModal(wf);
+      } catch (e) { toast(e.message); }
+    };
+  });
+
+  $overlay.querySelectorAll("[data-fb]").forEach((box) => {
+    const id = box.dataset.fb;
+    const text = box.querySelector(".fb-text"), edit = box.querySelector(".fb-edit");
+    const bE = box.querySelector("[data-fb-edit]"), bS = box.querySelector("[data-fb-save]");
+    bE.onclick = () => {
+      const on = edit.style.display === "none";
+      edit.style.display = on ? "" : "none";
+      text.style.display = on ? "none" : "";
+      bS.style.display = on ? "" : "none";
+      bE.textContent = on ? "取消" : "编辑";
+    };
+    bS.onclick = async () => {
+      const v = edit.value.trim();
+      if (!v) return toast("内容为空 — 要移除请用「清除」");
+      try {
+        await api(`/runs/${id}/feedback`, { method: "POST", body: { text: v, direct: true } });
+        toast("已更新");
+        feedbackModal(wf);
+      } catch (e) { toast(e.message); }
+    };
+    box.querySelector("[data-fb-clear]").onclick = async () => {
+      if (!(await confirmModal("清除复盘记录", "仅删除该 run 的复盘记录存档(不删除 run 本身,也不影响已确认的规范)。", "清除"))) return;
+      try {
+        await api(`/runs/${id}/feedback`, { method: "POST", body: { text: "", direct: true } });
+        toast("已清除");
+        feedbackModal(wf);
+      } catch (e) { toast(e.message); }
+    };
+  });
 }
 
 function agentModal(agent, _all) {

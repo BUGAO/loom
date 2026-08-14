@@ -52,7 +52,16 @@ func agentsMD(a *model.Agent) string {
 ## Loom execution contract (auto-generated; do not edit — edit the agent definition instead)
 
 - This directory is YOUR private workspace. It persists across runs: keep notes,
-  drafts and reusable material here freely.
+  drafts and reusable material here freely.`)
+	if agentCanWriteFiles(a) {
+		b.WriteString(`
+- MEMORY.md in this directory is your durable CRAFT memory: loom reads it into
+  every task prompt you receive. Append short lessons about your craft as you
+  learn them (techniques, pitfalls, checklist items) — not project facts, not
+  task logs. Keep it small; its head and tail survive truncation, its middle
+  may not.`)
+	}
+	b.WriteString(`
 - Each task names the run's shared exchange directory (an absolute path).
   Upstream artifacts are there; every deliverable MUST be written there too.
 - Each task lists the exact tools granted to you. Calls to any other tool
@@ -66,6 +75,19 @@ func agentsMD(a *model.Agent) string {
   ` + "```" + `
 `)
 	return b.String()
+}
+
+// agentCanWriteFiles reports whether the agent can write files in its own home
+// with its own tools — the precondition for maintaining MEMORY.md (the hub's
+// write_artifact only reaches the exchange directory, never the home).
+func agentCanWriteFiles(a *model.Agent) bool {
+	for _, t := range strings.Split(a.Tools, ",") {
+		switch strings.TrimSpace(t) {
+		case "Write", "Edit", "MultiEdit", "Bash":
+			return true
+		}
+	}
+	return false
 }
 
 func unmarshalAgent(name, raw string) *model.Agent {

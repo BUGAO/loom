@@ -433,3 +433,129 @@ poe2_trade run 暴露的两类失败(用户要求"4 个 demo 让我选"被 coord
 - 顺带修复 CoordinatorPrompt 审查发现的矛盾:「工具被拒→原轮修正重试」曾把 budget 拒绝也包进去,
   与「预算拒绝→收敛勿绕」直接冲突,现明确 budget 拒绝是唯一例外;record_note 工具描述里残留的
   "每轮无记忆"措辞(D28 前)更新;Deliverable folder 与 Planning 节的重复瘦身。
+
+## D30 `[体验整改]` path-deny + pair 模式(常驻 implementer)
+
+**path-deny**:工具级白名单不画文件系统边界——有 Write 的 worker 能改任何 agent 的 AGENTS.md/agent.md、
+workflow 配置、run 台账,乃至自己的 settings 锁(自我修改与跨 agent 注入通道,见 AGENTS.md 讨论)。
+顺着既有的 jail 生成器加路径级条目:Write/Edit/MultiEdit/NotebookEdit 对
+`<data>/workflows/**`、`<data>/agents/*/agent.md`、`<data>/agents/*/home/.claude/**`、
+`<data>/runs/*/run.json`、`<data>/**/{AGENTS,CLAUDE}.md`、`**/.claude/settings.local.json` 一律 deny。
+边界按路径不按树:agent home 是合法草稿区,只锁控制面。Bash 无法被路径规则约束——对有 Bash 的
+agent 这是与直接用 Claude Code 相同的信任边界,诚实声明而非假装沙箱。coordinator 每次开新会话前
+清除 cwd 中被投放的 AGENTS.md/CLAUDE.md(loom 从不往 run workspace 写它们,出现即注入)。
+
+**pair 模式**:对"单仓库迭代开发",逐任务冷启动的 worker 形态是智能差距的主因之一(poe2_trade 复盘)。
+`workflow.pair_agent` 指定一个池 agent 为常驻 implementer:
+- 它的所有任务在**一个持久会话**串行执行(pairMu 串行化;会话开在 run 级 ctx 上,跨任务存活);
+  cwd = 交换目录 = 项目目录,项目的 CLAUDE.md/结构认知原生累积。
+- 凭证动态绑定:RolePair token 不携带 taskID,每次工具调用经 `RunSession.PairTask()` 解析当前任务
+  (引擎在每个 pair 任务的回合前后 Set/清除)——report_result 永远落在当前任务,审计归属不乱。
+- 会话跑 agent 默认模型(单会话无法逐任务切模型,coordinator prompt 已声明);prompt 失败 → 任务照常
+  按错误落账,会话丢弃,下一个 pair 任务重建(冷启动是故障的代价,不是设计的代价)。
+- 验收契约/预算/审计与普通 worker 完全一致;额外授予 record_project_fact。
+- CoordinatorPrompt 增 pair 节:实现类任务路由给它、指令引用用户原话、并行扇出仍走普通 worker。
+- 引擎在 StartRun/reactivate 校验 pair agent 必须在池内;UI 设置页(dynamic 表单)提供下拉选择。
+
+## D31 `[体验整改]` 反馈闭环与两级记忆(feedback → prompt;MEMORY.md;修订提案)
+
+D29 建了记忆的 v1(PROJECT.md + observations),但反馈没有落点、agent 没有自己的记忆、
+"复盘 → 改 prompt" 仍是人肉环节(poe2_trade 的教训是手写进 D29 的)。四项对策:
+
+- **PROJECT.md 截断改保头+保尾**(修 D29 隐患):原实现超 4KB 保头弃尾,而用户纠正恰好追加在尾部——
+  文件一超限,被保留的是旧事实、被丢掉的是最新纠正,与 "纠正要立刻记录" 的意图正对着干。
+  改为头(奠基约定)+ 尾(最新纠正)各留一段、中间省略,按行边界切(`clipHeadTail`,有测试断言)。
+- **run 反馈落点(机制)**:`Run.feedback` + `POST /api/runs/{id}/feedback`(仅限非活跃 run——活跃时
+  会话聊天就是通道)。同 workflow 历史 run 的反馈(最近 3 条、每条 1KB 截断、带日期与 goal 首行)注入
+  coordinator 系统 prompt 与 static planner prompt 的「User feedback on previous runs」节;prompt 指示:
+  反馈高于默认、含持久事实则转存 record_project_fact、指向 agent 定义缺陷则走修订提案。
+  **worker 永远看不到反馈原文**——main agent 负责把它翻译成指令;持久事实走 PROJECT.md。
+  UI:会话终态尾部与 run 详情页均有反馈框(static run 也覆盖)。
+- **agent 手艺记忆 MEMORY.md(约定+机制)**:agent home 本就跨 run 持久且在 path-deny 边界之外
+  (home 是 agent 自留地),补上机制:home/MEMORY.md 由 agent 自己维护(AGENTS.md 契约新增条目,
+  仅对有 Write/Edit/Bash 的 agent 生成——write_artifact 只达交换目录,写不了 home),loom 把其内容
+  注入该 agent 的每个任务 prompt(dynamic WorkerPrompt + static node prompt,2.4KB 截断偏尾部)。
+  与 PROJECT.md 的分工:PROJECT.md 记"这个项目"的事实,MEMORY.md 记"这门手艺"的经验。
+- **修订提案 propose_agent_amendment(机制)**:coordinator 发现 agent 的**常设定义**(而非本次 spec)
+  导致会复发的失败时,提交 Amendment(rationale + 完整替换 prompt + 当前 prompt 快照),存
+  `data/amendments/`,状态 pending——**只创建待审记录,什么都不改**。人在 agents 页审阅
+  (当前/提议对照 + 理由 + 来源 run)后批准才经 SaveAgent 应用(AGENTS.md 同步重生成);
+  快照与现值不符即拒绝应用(stale:提案推理所依据的文本已不存在,不许覆盖人的更新编辑)。
+  path-deny 不变量原样成立:agent 出证据,人改身份;自动自我改进被明确排除——
+  反馈可以自动收集、自动提案,生效必须过人。
+
+## D32 `[体验整改]` 反馈改对话式:复盘由 coordinator 消化,原文不再直接注入(修订 D31)
+
+D31 的反馈是"原文落库、原文注入",指代会失效("那个表格"到下个 run 没有指称对象)、没有澄清
+通道、用户得不到"被理解成什么"的确认。修订为**复盘对话**:
+
+- 对真实 dynamic run 提交反馈 = 以 postmortem 身份重开会话(`ReopenFeedback` → 复用 reactivate 管道,
+  `ChatMessage.Kind="feedback"` 全程携带)。round prompt 中反馈消息不进「New messages」,而有专属
+  「Post-run feedback (POSTMORTEM — digest, do not resume work)」节,指示四步:先**理解**(指代从
+  对话/台账/产物里解析,真歧义就反问并停轮)→ **沉淀**(事实走 record_project_fact、定义缺陷走
+  propose_agent_amendment)→ **蒸馏**(新工具 `conclude_feedback` 把教训改写成自包含的常设纠正,
+  落 `run.feedback`)→ 回复用户记了什么。明确**不许因反馈自行派活**——返工需求由用户说了算。
+- 未来 run 注入的是**蒸馏版**;用户原话留在 run.Chat 审计(聊天里带「复盘反馈」标记)。
+- 边界:static 模式没有对话角色、dry-run 的 coordinator 是脚本——两者保留原文字段(UI 文案如实
+  声明);空文本仍是"清除已存结论",不唤醒任何人;活跃 run 照旧拒绝(会话聊天就是通道)。
+- 代价:每条反馈一次 coordinator 激活。换来的是反馈在写入前被解析、确认、结构化——
+  "我说什么就存什么"不再是这个环路的形态。
+
+## D33 `[体验整改]` 复盘产物分级:记录归档、规范过人、注入只走确认(修订 D32)
+
+D32 的蒸馏结论仍是**一段自由文本直接注入**——实践里 coordinator 常把它写成事件经过的复述,
+下个 run 开局收到的是一段与新目标无关的叙事 noise;且"什么进入之后每次 run 的 prompt"这个
+决定完全没有过人。修订为**两级产物 + 确认门**(与 amendment 同构:agent 出证据,人定生效):
+
+- **复盘记录(存档层)**:`run.feedback` 语义降级为本次 run 的复盘结论存档——coordinator 经
+  `conclude_feedback(text)` 写入,UI 可读可编辑,**永不注入**。原始对话照旧留在 run.Chat。
+- **行为规范 Lesson(注入层)**:`conclude_feedback` 新增 `rules[]`——从复盘中提炼的具体做法,
+  每条必须是自包含的祈使句("报告先给结论"),单条 ≤400 字符、单次 ≤5 条(超限拒绝:规范是
+  指令不是复述)。落 `data/lessons/`(workflow 级,带来源 run),状态 pending——**只创建待审
+  记录,什么都不注入**。反馈不含可沉淀做法就一条都不提,合法且被 prompt 明确鼓励。
+- **确认门**:workflow「复盘」面板分层展示——待确认规范(采纳/改后采纳/不采纳)、生效中规范
+  (可编辑/移除,也可手动添加:人写的即人批的,直接生效)、复盘记录(仅存档)。API 走
+  `/api/lessons` 族,与 amendments 对称。
+- **注入**:`LessonsFor` 只取该 workflow **approved** 的规范(最新优先,上限 20 条),注入
+  coordinator 系统 prompt 与 static planner prompt 的「Standing rules of this workflow
+  (user-confirmed)」节。pending/rejected 与复盘记录永远到不了 prompt;worker 照旧看不到。
+- 边界:static/dry-run 无对话角色,反馈原文只作复盘记录(不再像 D31/D32 那样直注),要注入
+  的规范由用户在面板手动添加;既有 run.feedback 存量自动降级为存档,不迁移——它们本来就是
+  这次要清除的 noise,值得留的由用户提炼成规范再生效。
+- 不变量:从复盘到注入的唯一路径是用户确认;自动收集、自动提案可以,自动生效不行。
+
+## D34 `[体验整改]` 规范增长治理:新规范顶替旧规范,超阈值发起整理(补全 D33)
+
+D33 的规范集只进不出,增长模式可预见:同一条教训被反复复盘出略有不同的版本("结论先行"/"别把
+结论埋最后"/"先给 TLDR"),按"最新优先截 20 条"处理增长是错的语义——每条都是用户亲手确认的,
+静默挤出第 21 条等于系统单方面撤销人的决定。治理分两手,均不引入自动删除:
+
+- **顶替(supersede)**:`propose_rules` 从 conclude_feedback 拆出为独立工具(结论归记录、规范归
+  提案,消歧;整理场景也复用它)。每条提案可带 `replaces[]`——注入 prompt 的规范节现在带 id,
+  postmortem 提示词明确:与现有规范重叠的新规范**必须顶替而非追加**。快照/陈旧拒绝与 amendment
+  同构:SaveLesson 时快照被替目标的文本,批准时任一目标已被用户改过或已不存在 → 拒绝并要求重新
+  提案;批准即原子换入换出(被替文本留在提案记录里作审计)。`replaces` 非空 + 空文本 = 纯退役
+  (删目标、不新增)。UI 待确认区按三种形态渲染:新增/替换(旧文划线 → 新文)/退役。
+- **整理(consolidate)**:生效规范 ≥12 条(`lessons_nudge`,上限 20 之前就提醒——臃肿的规范集
+  在溢出之前就已经在拖累每个 prompt)时「复盘」面板出提示,「发起整理」= 以 `ChatConsolidate`
+  身份唤醒该 workflow 最近一个已结束的真实 dynamic 会话(run 只是载体,规范是 workflow 级的;
+  dry-run 的脚本 coordinator 读不懂规范集,跳过)。round prompt 给专属 MAINTENANCE 框架:只许
+  propose_rules(合并=一条新规范 replaces 多条、改写=新文 replaces 一条、退役=空文),优先解决
+  互相矛盾的条目,健康的规范不许碰,禁止派活、禁止 conclude_feedback(没有 run verdict)。
+  产出照旧全体 pending,逐条过人。
+- 不做的:按命中率衰减(无法可靠归因一条规范是否起效)、按时间过期(行为偏好不随时间失效)。
+- 不变量重申:提案可以自动,合并、退役、生效必须过人;陈旧提案不许覆盖人的更新编辑。
+
+## D35 `[提示词]` dynamic 实现里程碑的独立评审:建议而非门禁
+
+dynamic 模式此前对质量只有两道闸:验收命令(引擎跑,挡"跑不过")与 coordinator 的 inspect
+纪律(零 inspect 拒绝 finish_run)。但 coordinator 的 inspect 不是独立评审——它已读过作者
+汇报,视角被叙述污染;实现类里程碑要不要过 reviewer 全凭它当轮想起与否(pair 模式下 implementer
+自写自测,全链路可能没有第二双眼睛)。
+
+对策只在提示词层:coordinator prompt 新增「Independent review (your judgment, not an engine
+gate)」节——仅当池内确有 `independent` agent 时渲染(建议一个无人能执行的评审是噪音)。内容:
+实质性实现里程碑在接受前应委派独立评审、高严重度发现按 blocked 走返工、验收命令证明"能跑"
+而非"做对";机械/低风险工作可跳过,但跳过即是在决定"机器检查 + 被污染的自读"已经足够。
+**明确不做机制强制**(如 require_review 开关):评不评审是 main agent 的判断,引擎的门禁
+保持验收 + inspect 两道不加码——机制约束留给确有复发证据之后再议。

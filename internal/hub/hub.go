@@ -27,6 +27,10 @@ const ServerName = "loom"
 const (
 	RoleCoordinator = "coordinator"
 	RoleWorker      = "worker"
+	// RolePair is a resident implementer's credential: one session serving
+	// many tasks in sequence, so the task it acts for is resolved at call
+	// time from the ledger instead of being fixed at token issue.
+	RolePair = "pair"
 )
 
 // identity is what a hub token resolves to.
@@ -201,6 +205,13 @@ func (h *Hub) IssueCoordinatorToken(runID string) string {
 // hand off from anyone else's task.
 func (h *Hub) IssueWorkerToken(runID, taskID string) string {
 	return h.issue(identity{runID: runID, role: RoleWorker, taskID: taskID})
+}
+
+// IssuePairToken mints the credential for a run's resident implementer
+// session. It outlives any one task; the task it acts for at each call is
+// whatever the engine has currently bound via RunSession.SetPairTask.
+func (h *Hub) IssuePairToken(runID string) string {
+	return h.issue(identity{runID: runID, role: RolePair})
 }
 
 func (h *Hub) issue(id identity) string {

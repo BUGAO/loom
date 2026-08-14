@@ -46,6 +46,55 @@ func (e *Engine) SetOutputRoot(dir string) { e.outputRoot = dir }
 // OutputRoot reports the configured deliverable root (for prompt previews).
 func (e *Engine) OutputRoot() string { return e.outputRoot }
 
+// Lesson injection caps: how many user-confirmed behavior rules ride into a
+// new activation's opening prompt. MaxLessons is exported so the UI can say
+// truthfully which entries are being injected. Retrospective narratives
+// (run.Feedback) are records, never injected. LessonsConsolidateNudge is
+// where the UI starts suggesting a consolidation pass — well before the cap,
+// because a bloated rule set degrades every prompt long before it overflows.
+const (
+	MaxLessons              = 20
+	LessonsConsolidateNudge = 12
+)
+
+// LessonsFor collects this workflow's standing behavior rules — distilled
+// from past retrospectives and APPROVED by the user — newest first and
+// bounded, ids included so a coordinator can propose superseding one. Pending
+// proposals, rejected rules and retirement records never ride: confirmation
+// is the only path from retrospective to injection. Workers never see this
+// list: the main agent translates rules into instructions, and durable facts
+// belong in PROJECT.md.
+func (e *Engine) LessonsFor(wfID string) []*model.Lesson {
+	if wfID == "" {
+		return nil
+	}
+	lessons, err := e.store.ListLessons()
+	if err != nil {
+		return nil
+	}
+	var out []*model.Lesson
+	for _, l := range lessons { // newest first
+		if l.WorkflowID != wfID || l.Status != model.AmendmentApproved || l.Text == "" {
+			continue
+		}
+		out = append(out, l)
+		if len(out) >= MaxLessons {
+			break
+		}
+	}
+	return out
+}
+
+// LessonTexts flattens LessonsFor for prompts that cannot act on rule ids
+// (the static planner has no propose_rules channel).
+func LessonTexts(lessons []*model.Lesson) []string {
+	var out []string
+	for _, l := range lessons {
+		out = append(out, l.Text)
+	}
+	return out
+}
+
 // handle is the control surface of one active run. static runs are released
 // through approveCh; dynamic runs have no plan to approve up front, so their
 // gate lives on the ledger session instead.
@@ -152,6 +201,9 @@ func (e *Engine) StartRun(wf *model.Workflow, goal string, dryRun bool, images .
 	}
 	if wf.EffectiveMode() == model.ModeDynamic {
 		if err := e.checkDynamic(dryRun); err != nil {
+			return nil, err
+		}
+		if err := checkPairAgent(wf, pool); err != nil {
 			return nil, err
 		}
 	}
@@ -515,7 +567,7 @@ func (e *Engine) plan(ctx context.Context, wf *model.Workflow, run *model.Run,
 	if maxNodes <= 0 {
 		maxNodes = defaultMaxNodes
 	}
-	prompt := planner.BuildPrompt(run.Goal, pool, wf.Planner, prior, wf.AllowAgentCreation)
+	prompt := planner.BuildPrompt(run.Goal, pool, wf.Planner, prior, wf.AllowAgentCreation, LessonTexts(e.LessonsFor(wf.ID)))
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 {
@@ -850,6 +902,11 @@ func (e *Engine) buildNodePrompt(run *model.Run, n model.PlanNode, agent *model.
 	var b strings.Builder
 	fmt.Fprintf(&b, "You are executor agent %q running node %q (%s) of a workflow run.\n\n", n.Agent, n.Title, n.ID)
 	fmt.Fprintf(&b, "## Overall goal\n%s\n\n## Your task\n%s\n", run.Goal, n.Instruction)
+
+	if mem := hub.ReadAgentMemory(e.store.AgentHome(agent.Name)); mem != "" {
+		fmt.Fprintf(&b, "\n## Your craft memory (MEMORY.md in your private workspace)\nLessons you recorded "+
+			"on past tasks — apply them:\n%s\n", mem)
+	}
 
 	wrote := false
 	writeCtx := func(id string) {

@@ -385,6 +385,54 @@ func TestDynamicCoordinatorSessionRebuiltAfterLoss(t *testing.T) {
 	}
 }
 
+// Pair mode: all of the resident implementer's tasks share ONE persistent
+// worker session, serialized, and the run still settles every task correctly
+// through the pair token's dynamic task binding.
+func TestPairAgentSharesOneSession(t *testing.T) {
+	eng, st, wf := dynSetup(t, noApproval())
+	wf.AgentPool = []string{"researcher"} // pin the mock's agent choice
+	wf.PairAgent = "researcher"
+	if err := st.SaveWorkflow(wf); err != nil {
+		t.Fatal(err)
+	}
+	mock := eng.backends["mock"].(*llm.Mock)
+
+	run, err := eng.StartRun(wf, "build the thing", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := waitTerminal(t, st, run.ID)
+	if final.Status != model.RunSucceeded {
+		t.Fatalf("want succeeded, got %s (%s)", final.Status, final.Error)
+	}
+	if len(final.Tasks) != 2 {
+		t.Fatalf("want 2 tasks, got %d", len(final.Tasks))
+	}
+	for id, task := range final.Tasks {
+		if task.Status != model.TaskCompleted {
+			t.Errorf("task %s: %s (%s)", id, task.Status, task.Error)
+		}
+		if task.Summary == "" {
+			t.Errorf("task %s settled without a summary — pair task binding failed", id)
+		}
+	}
+	if n := mock.WorkerOpens.Load(); n != 1 {
+		t.Fatalf("2 pair tasks opened %d worker sessions, want 1", n)
+	}
+}
+
+// A misconfigured pair agent fails the run at start, not task by task.
+func TestPairAgentMustBeInPool(t *testing.T) {
+	eng, st, wf := dynSetup(t, noApproval())
+	wf.PairAgent = "nonexistent"
+	if err := st.SaveWorkflow(wf); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.StartRun(wf, "build the thing", true); err == nil {
+		t.Fatal("expected StartRun to refuse an unknown pair agent")
+	}
+}
+
 // awaitApproval polls until the run parks at the approval gate.
 func awaitApproval(t *testing.T, st *store.Store, runID string) {
 	t.Helper()

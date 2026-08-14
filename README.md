@@ -64,10 +64,11 @@ data/agents/<name>/
   agent.md               定义(frontmatter:model/tools/max_turns + 正文 = system prompt)
   home/                  该 agent 的私有 workspace(ACP 会话的 cwd,跨 run 持久)
     AGENTS.md            保存定义时自动生成:角色 prompt + loom 执行契约
+    MEMORY.md            该 agent 的手艺记忆:自己写(需有文件工具),loom 注入其每个任务 prompt
     .claude/skills/      该 agent 的私有 skills(SKILL.md,会话自动加载)
 ```
 
-节点执行时 ACP 会话在 agent 自己的 home 中启动——AGENTS.md 和私有 skills 被运行时原生加载(实测:agent 会在任务中显式调用自己的 skill)。工具白名单**双重强制**:除了应答权限请求,loom 在每次开会话前把白名单编译成 Claude Code 原生 `permissions.deny` 规则写入会话 cwd 的 `.claude/settings.local.json`(loom 托管,勿手改)——只读工具与 Task 默认不发权限请求,deny 规则是对它们唯一有效的机制层拦截;coordinator 白名单为空,因此除 hub 工具外一切被禁,派活是它唯一能做的事。跨节点协作走 run 的**交换目录** `data/runs/<id>/workspace/`:节点 prompt 中给出其绝对路径,上游产物在此,交付物必须写到此;agent 自己的 home 用于草稿和跨 run 积累。skills 可在 UI 的 agent 编辑器中直接增删改。
+节点执行时 ACP 会话在 agent 自己的 home 中启动——AGENTS.md 和私有 skills 被运行时原生加载(实测:agent 会在任务中显式调用自己的 skill)。工具白名单**双重强制**:除了应答权限请求,loom 在每次开会话前把白名单编译成 Claude Code 原生 `permissions.deny` 规则写入会话 cwd 的 `.claude/settings.local.json`(loom 托管,勿手改)——只读工具与 Task 默认不发权限请求,deny 规则是对它们唯一有效的机制层拦截;coordinator 白名单为空,因此除 hub 工具外一切被禁,派活是它唯一能做的事。deny 规则还带**路径级条目(path-deny)**:即使 Write/Edit 在白名单里,loom 自身的控制面(agent 定义与 AGENTS.md/私有 skills、workflow 配置、run 台账、会话自己的 settings 文件)对它们也是死的——agent 改不了自己的身份、别人的身份和自己的锁;Bash 无法被路径规则约束,是与直接使用 Claude Code 相同的信任边界。coordinator 每次开新会话前,其 cwd 中被投放的 AGENTS.md/CLAUDE.md 会被清除(防 worker 注入)。跨节点协作走 run 的**交换目录** `data/runs/<id>/workspace/`:节点 prompt 中给出其绝对路径,上游产物在此,交付物必须写到此;agent 自己的 home 用于草稿和跨 run 积累。skills 可在 UI 的 agent 编辑器中直接增删改。
 
 ## 运行生命周期(static)
 
@@ -184,15 +185,22 @@ coordinator 的会话没有任何文件工具:它读产物的唯一通道是 hub
 - `report_progress` — worker → 台账,中途进度,不结束任务
 - `ask_coordinator` — worker 反问,任务转 `input-required`,worker **卡在这次工具调用里**等答复,不消耗新回合、不丢上下文
 - `send_message` — 对 `input-required` 任务是立即答复;对 `working` 任务入队,在下一个回合边界作为追加一轮投递(ACP 无法打断进行中的回合),返回值会告诉 coordinator 是哪一种
-- `inspect` / `record_note` / `record_project_fact` — coordinator 专属:审计化读产物;run 级便签;**项目级持久记忆**(追加到交换目录的 PROJECT.md,跨 run 生效,worker 派单时自动注入——领域约束、约定、用户纠正都记这里)
+- `inspect` / `record_note` / `record_project_fact` — coordinator 专属:审计化读产物;run 级便签;**项目级持久记忆**(追加到交换目录的 PROJECT.md,跨 run 生效,worker 派单时自动注入——领域约束、约定、用户纠正都记这里;截断保头+保尾,最新纠正不会被截掉)
 - `report_result` 带 **observations 异议通道** — worker 按规格完成之外,把"规格似乎不对/发现了未提及的耦合/我自行发明了某个默认值"说出来;台账视图透出,coordinator 被要求逐条读
+- `propose_agent_amendment` — coordinator 认为某个 agent 的**常设定义**(而非本次 spec)导致会复发的失败时,提交修订提案(理由 + 完整替换 prompt)。**只创建待审记录,什么都不改**:人在 agents 页对照审阅后批准才生效,prompt 在提案后被人改过则拒绝应用(stale)。agent 出证据,人改身份——path-deny 不变量不动
+
+**反馈闭环(对话式)**:会话结束后(会话尾部或 run 详情页)可以对这次交付**发起复盘**——它会以 postmortem 身份唤醒 coordinator:指代不清它先反问;持久事实转存 PROJECT.md、定义缺陷走修订提案;收尾产出**分两层**:`conclude_feedback` 写复盘结论到 run 上,**只作存档、永不注入**;`propose_rules` 提炼**行为规范**(每条一句自包含的做法)进待确认队列,由你在 workflow「复盘」面板逐条采纳——**确认后才注入**之后每次 run 的开局。与现有规范重叠的新规范必须**顶替**(`replaces`,批准时旧条被你改过即拒绝——陈旧提案不许覆盖人的编辑)而非堆近似重复;生效规范超过 12 条时面板建议**发起整理**:唤醒 main agent 通读全部规范提出合并/改写/退役方案,仍然逐条过你。事件经过进不了 prompt,你的原话只留在会话记录里;worker 永远看不到反馈——main agent 负责把规范翻译成指令。复盘轮与整理轮都不许自行派活。static 模式与 dry-run 没有对话角色,反馈原文仅存档,规范由你在面板手动添加。**两级记忆**:PROJECT.md 记"这个项目"的事实(跟着交换目录走),home/MEMORY.md 记"这门手艺"的经验(跟着 agent 走,agent 自己维护、loom 每任务注入)。
+
+**pair 模式(常驻 implementer)**:workflow 可指定一个池 agent 为常驻 implementer(`pair_agent`,设置页可选)——它的所有任务在**同一个持久会话**中串行执行,cwd 直接是交换目录(即项目目录),项目理解跨任务累积,接近直接使用 Claude Code 的连续性;凭证按任务动态绑定,report_result 始终落在当前任务上。验收契约、预算、审计照旧;它额外获得 `record_project_fact`(它才是天天读代码的角色)。会话跑 agent 默认模型(单会话无法按任务切模型);会话半路死掉,任务按 blocked 落账,下一个 pair 任务自动重建会话。适合单仓库迭代开发;并行扇出的调研/评审仍交给普通 worker。
 - `handoff` / `ask_agent` — worker 之间直接交接与血缘内问答(需开 `allow_peer_handoff`;关闭时这两个工具**根本不存在**,而不是靠提示词劝阻)。这是对「交接统一收口到 brain」前提的**受控偏离**:默认关闭,开启后交接仍走同一台账、同一预算,coordinator 全程可见
 
 **独立校验者(fresh context 由机制保证)**
 
 Agent 可标记 `independent`(种子池的 reviewer 即是):对它派单时 `context_hint` 被机制拒绝,
 static 模式的节点 prompt 只给它上游**产物路径**、不给上游自述摘要——评审者的价值来自未被作者叙述污染的新鲜视角,
-这不能靠提示词自觉,只能靠输入侧裁剪。
+这不能靠提示词自觉,只能靠输入侧裁剪。dynamic 模式下,池内存在 independent agent 时 coordinator prompt
+会附上独立评审指引:实质性实现里程碑在接受前应委派独立评审(coordinator 自己的 inspect 读过作者汇报,
+不算独立),高严重度发现按 blocked 返工——这是给 main agent 的判断依据,不是引擎门禁,机械/低风险工作可跳过。
 
 **产物目录:`~/workflow-output/<主题名>/`**
 
@@ -228,8 +236,9 @@ acp 适配器缺失时 `claude` runtime 降级为 CLI 单发——static 仍可�
 - **工作流(对话式)**:左侧 workflow 列表,右侧「运行状态 + 与 main agent 的聊天窗」。**会话 = run**:对 main agent 说出目标即开启会话,它自行拆解并派发 agent;运行中随时追加消息(下一个决策轮次送达并回复);审批卡片、最终回复都在聊天流里。交付(finish_run)只是里程碑——继续发消息会在**同一会话**唤醒 main agent 接着做(同一台账、同一份便签、上次 verdict 作为上下文);会话以 chips 列表可见:点击切换续聊、× 删除,「+ 新会话」才开新 run;多个会话可并行活跃。运行记录页与 run 详情页都有「打开会话」直达续聊入口。会话全文落在本地 run.json,coordinator 挂了也能从会话原地 wrap up。设置入口进编辑器——mode 单选,static 显示 planner/replan 表单,dynamic 显示 coordinator 与预算表单
 - **运行详情(static)**:DAG 实时可视化(SSE 推送)——节点按依赖深度自动布局,状态着色,replan 世代同图呈现;点节点看指令/摘要/错误/产物/完整输出;审批、取消、从节点重试
 - **运行详情(dynamic)**:**任务树**取代 DAG——按血缘缩进的实时列表(handoff 子任务嵌在父任务下),coordinator 常驻置顶卡片(状态/当前工具/最近决策/transcript);点任务看完整消息往来(指令、进度、反问、答复、结果、同伴消息)与 token 细分;可对在途任务人工插话;审批视图展示首批任务清单与新 agent 提案
+- **复盘面板**:workflow 头部「复盘」(有待确认规范时高亮计数)打开该 workflow 的复盘台账,分两层——**行为规范**:coordinator 从复盘提炼的待确认条目在此采纳/改后采纳/拒绝(替换提案展示旧文划线对照,退役提案确认后只删不增),生效中的(注入之后每次 run 开局,最新优先,上限 20 条)可编辑/移除,也可手动添加(人写即人批,直接生效);超过 12 条时可「发起整理」;**复盘记录**:每次 run 的结论存档,可读可编辑,永不注入
 - **运行记录**:全部 run 列表,mode 标签、进度(dynamic 显示 `完成/总数+`,因为树还在长)、est. 成本、耗时
-- **Agent 池**:executor 卡片与编辑器,含私有 skills 的增删改;卡片上带该 agent 跨全部 run 的累计 est. 成本与执行次数
+- **Agent 池**:executor 卡片与编辑器,含私有 skills 的增删改;卡片上带该 agent 跨全部 run 的累计 est. 成本与执行次数;coordinator 提交的定义修订提案在此审批
 
 ## API
 
@@ -247,6 +256,12 @@ POST       /api/runs/{id}/approve|reject|cancel
 POST       /api/runs/{id}/retry/{node}     static 专用
 POST       /api/runs/{id}/resume           dynamic 专用:interrupted run 从台账恢复续跑
 POST       /api/runs/{id}/tasks/{task}/message   dynamic:人工插话(与 coordinator 走同一条台账)
+POST       /api/runs/{id}/feedback            {text}  发起复盘:真实 dynamic run 唤醒 coordinator 消化——结论存档、
+                                                      规范进待确认队列;static/dry-run 原文仅存档(仅限非活跃 run)
+GET        /api/amendments                    修订提案列表;POST /api/amendments/{id}/approve|reject
+GET        /api/lessons[?workflow_id=]        行为规范列表;POST /api/lessons/{id}/approve|reject
+POST       /api/workflows/{id}/lessons        {text}  手动添加规范(直接生效);PUT/DELETE /api/lessons/{id}
+POST       /api/workflows/{id}/lessons/consolidate    唤醒 main agent 整理规范(合并/改写/退役提案,逐条待确认)
 GET        /api/runs/{id}/events           SSE:每个引擎事件推送完整快照
 GET        /api/runs/{id}/nodes/{node}/output    节点/任务/coordinator 的完整 transcript
 GET        /api/costs/summary[?by=workflow|agent|model]

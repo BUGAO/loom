@@ -20,7 +20,11 @@ import (
 // the round prompt, rebuilt from the ledger each time.
 // outputDir is the already-resolved deliverable folder ("" when unnamed) —
 // resolved by the caller under the session lock, never read raw here.
-func CoordinatorPrompt(run *model.Run, wf *model.Workflow, budget model.BudgetConfig, outputRoot, outputDir string, pool []*model.Agent) string {
+// lessons carries the workflow's standing behavior rules — distilled from past
+// retrospectives and CONFIRMED by the user (newest first, already bounded by
+// the collector), with ids so a postmortem can propose superseding one.
+// Unconfirmed proposals and retrospective narratives never reach this prompt.
+func CoordinatorPrompt(run *model.Run, wf *model.Workflow, budget model.BudgetConfig, outputRoot, outputDir string, pool []*model.Agent, lessons []*model.Lesson) string {
 	var b strings.Builder
 	b.WriteString(`You are the coordinator of a loom workflow run. You do not do the work yourself: you decompose the
 goal, delegate to executor agents, follow up, converge, and deliver the final verdict.
@@ -150,7 +154,31 @@ A task's "observations" field is the worker speaking OUTSIDE its contract: a spe
 a coupling you did not know about, a default it had to invent. Read it on every settled task —
 "completed with observations" often means your spec, not the work, needs attention. Act on it:
 re-scope, fix the plan, or record the fact; never let an observation die unread.
+`)
 
+	// Independent-review guidance only makes sense when the pool actually has
+	// an agent whose fresh context the hub can enforce. Deliberately advisory:
+	// whether a milestone warrants the extra task is the coordinator's call —
+	// the engine gates on acceptance checks and inspections, nothing more.
+	for _, a := range pool {
+		if a.Independent {
+			b.WriteString(`
+## Independent review (your judgment, not an engine gate)
+Your own inspect is NOT an independent review: you have already read the author's report, so you
+see the work through its author's narrative. The pool has an independent agent whose fresh eyes
+are enforced mechanically — it receives only the requirement, the acceptance criteria and the
+artifact paths. For substantial implementation milestones (new features, cross-cutting changes,
+anything later work builds on), delegate it a review task BEFORE accepting the milestone, and
+route high-severity findings back as rework (blocked → retry_of). Acceptance commands prove the
+code runs; they do not catch wrong approaches, missing edge cases or misread requirements. Skip
+the review only for mechanical, low-stakes work — and when you skip it, you are deciding that
+machine checks plus your own contaminated reading are enough.
+`)
+			break
+		}
+	}
+
+	b.WriteString(`
 ## Facts discipline
 - Your tool list is complete. Never search for additional tools; there are none you may use.
 - When the goal references external paths, repos or facts you cannot see, delegate ONE cheap
@@ -168,6 +196,13 @@ changes quarterly — never poll it"), conventions ("all ports come from the roo
 above all USER CORRECTIONS — when the user tells you an assumption was wrong, record the correction
 IMMEDIATELY so no future run repeats the mistake. What does not: run-scoped strategy (that is
 record_note) and anything already enforced by code or contracts.
+
+## Improving the pool (propose_agent_amendment)
+When evidence shows a pool AGENT'S standing definition — not one task's spec — caused a failure
+that will recur (user feedback names the same weakness twice, a worker's observations expose a
+blind spot baked into its role), propose a revised system prompt with propose_agent_amendment.
+It changes nothing now: a human reviews and applies it later; you continue this run with the agent
+as it is. Never propose an amendment to dodge fixing a bad instruction of your own.
 
 ## Convergence discipline
 - After each round, ask one question: did the last batch move the overall goal forward?
@@ -208,6 +243,23 @@ why — an honest failure is worth more than a summary that papers over a gap.
 `, budget.MaxTasks, budget.MaxDelegationDepth, budget.MaxParallel, budget.MaxTurnsPerTask,
 		budget.MaxReworksPerTask, budget.RunTimeoutSec)
 
+	if wf.PairAgent != "" {
+		fmt.Fprintf(&b, `
+## Resident implementer (pair mode)
+**%s** is this run's resident implementer. All tasks you delegate to it run SEQUENTIALLY in ONE
+persistent session whose working directory is the exchange directory — its understanding of the
+project accumulates across tasks, like a live pair-programming partner. Consequences:
+- Route implementation and debugging work on the project to it; use the other agents for parallel
+  research, independent review, and verification.
+- Its instructions may build on its earlier tasks in this run ("extend what you built in the
+  previous task") — but still state precisely WHAT to do; only codebase context carries over.
+- When a task originates from a user request, QUOTE the user's relevant words VERBATIM in the
+  instruction — do not paraphrase requirements.
+- Per-task model tiering does not apply to it: its session runs on the agent's own default model.
+- Two pair tasks never run concurrently; they queue. Plan its work as a sequence.
+`, wf.PairAgent)
+	}
+
 	if budget.ApprovalPolicy == model.ApprovalInitial {
 		b.WriteString("\n## Approval gate\nThis workflow requires human approval of your initial plan. The shape of a " +
 			"good opening: ask_user first (location + open questions), get the answers, THEN propose_plan — a plan " +
@@ -222,6 +274,19 @@ why — an honest failure is worth more than a summary that papers over a gap.
 	if budget.AllowAgentCreation {
 		b.WriteString("\n## Creating agents\ncreate_agent adds a permanent, reusable specialist to the shared pool. " +
 			"Write it as a role, not as a one-off task holder — the task itself belongs in the instruction.\n")
+	}
+
+	if len(lessons) > 0 {
+		b.WriteString("\n## Standing rules of this workflow (user-confirmed)\n" +
+			"Behavior rules distilled from past retrospectives and confirmed by the user — they outrank your\n" +
+			"defaults. Plan and instruct so every one of them is honored. If one states a durable fact about\n" +
+			"the project, persist it with record_project_fact so it stops depending on this list; if one\n" +
+			"indicts an agent's standing definition, consider propose_agent_amendment. When a postmortem or a\n" +
+			"consolidation request has you proposing rules via propose_rules, reference these ids: a new rule\n" +
+			"that overlaps an existing one must SUPERSEDE it (replaces), not pile on a near-duplicate.\n")
+		for _, l := range lessons {
+			fmt.Fprintf(&b, "- [%s] %s\n", l.ID, l.Text)
+		}
 	}
 
 	b.WriteString("\n## Agent pool\n")
@@ -281,19 +346,75 @@ func writeChatHistory(b *strings.Builder, history []model.ChatMessage) {
 }
 
 // writeUserMessages renders the new-messages section shared by both prompts.
+// Post-run feedback messages get their own framing (verdicts to DIGEST, not
+// requests to resume working), and consolidation requests theirs (maintenance
+// over the standing rules, nothing else).
 func writeUserMessages(b *strings.Builder, userMsgs []model.ChatMessage) {
-	if len(userMsgs) == 0 {
-		return
-	}
-	b.WriteString("\n## New messages from the user\n")
+	var normal, feedback []model.ChatMessage
+	consolidate := false
 	for _, m := range userMsgs {
-		fmt.Fprintf(b, "- %s", m.Text)
-		if len(m.Images) > 0 {
-			fmt.Fprintf(b, " [with %d attached image(s): %s]", len(m.Images), strings.Join(m.Images, ", "))
+		switch m.Kind {
+		case model.ChatFeedback:
+			feedback = append(feedback, m)
+		case model.ChatConsolidate:
+			consolidate = true
+		default:
+			normal = append(normal, m)
 		}
-		b.WriteString("\n")
 	}
-	b.WriteString("Address these this round; your reply text will be shown to the user.\n")
+	if len(normal) > 0 {
+		b.WriteString("\n## New messages from the user\n")
+		for _, m := range normal {
+			fmt.Fprintf(b, "- %s", m.Text)
+			if len(m.Images) > 0 {
+				fmt.Fprintf(b, " [with %d attached image(s): %s]", len(m.Images), strings.Join(m.Images, ", "))
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("Address these this round; your reply text will be shown to the user.\n")
+	}
+	if len(feedback) > 0 {
+		b.WriteString("\n## Post-run feedback from the user (POSTMORTEM — digest, do not resume work)\n")
+		for _, m := range feedback {
+			fmt.Fprintf(b, "- %s\n", m.Text)
+		}
+		b.WriteString(`This is the user's verdict on the DELIVERED work. Your job this round is to close the loop, not
+to reopen the work:
+1. UNDERSTAND it. It may use references only this conversation resolves ("that table", "the second
+   option") — resolve them from the chat, the ledger and the deliverables (inspect if needed). If
+   its meaning is genuinely ambiguous, ask the user (your reply is the question) and end your turn.
+2. PERSIST what it teaches: a durable project fact goes to record_project_fact; a flaw in an
+   agent's standing definition goes to propose_agent_amendment.
+3. CONCLUDE it — two separate tools with two separate fates:
+   - conclude_feedback: the retrospective conclusion of THIS run. It is a record, not an
+     instruction: stored on the run, never injected, so it may reference this run's events.
+   - propose_rules: the behavior rules (if any) this retrospective yields — each one SHORT,
+     SELF-CONTAINED imperative directive ("lead with the conclusion", "never poll data X") that a
+     future run can follow without this conversation. NOT a recap of what happened; if the
+     feedback changes no future behavior, propose no rules. A rule that overlaps an existing
+     standing rule (they are listed with ids in your system prompt) must carry replaces — supersede
+     it, don't duplicate it. The user confirms each change before it takes effect.
+4. Reply to the user with what you recorded and which rule changes await their confirmation.
+Do NOT delegate tasks or redo the work from feedback alone — if the user wants rework, they will
+say so, and if you believe rework is warranted, propose it in your reply and wait.
+`)
+	}
+	if consolidate {
+		b.WriteString(`
+## Rule consolidation request (MAINTENANCE — do not resume work)
+The user asked you to tidy this workflow's standing rules (listed with their ids in your system
+prompt). This is maintenance over the rule set, not feedback on this run's delivery. Work only
+through propose_rules:
+- MERGE overlapping rules: one new rule with replaces=[their ids].
+- REWRITE a vague or bloated rule: sharper text with replaces=[its id].
+- RETIRE an obsolete or contradicted rule: empty text with replaces=[its ids].
+Resolve contradictions first — two rules pulling in opposite directions hurt more than any
+duplicate. Leave healthy rules untouched; propose only what improves the set, and never restate a
+rule just to have output. Every proposal stays PENDING until the user confirms it. Do not
+delegate, do not call conclude_feedback (there is no run verdict here), and reply to the user
+with a short summary of each proposed change and why.
+`)
+	}
 }
 
 // writeRunStatus renders the exchange-directory and budget lines shared by
@@ -404,8 +525,9 @@ func ContinuationPrompt(run *model.Run, rs *RunSession, round int, changedIDs []
 // WorkerPrompt renders the task instruction handed to an executor agent. It
 // mirrors the static-mode node prompt on purpose — same directory rules, same
 // result fields — but results travel through the hub's report_result tool
-// (static mode, which has no hub, keeps the text envelope).
-func WorkerPrompt(t *model.Task, agent *model.Agent, run *model.Run, workspace string, peerHandoff bool) string {
+// (static mode, which has no hub, keeps the text envelope). agentHome is the
+// agent's private home directory, read for its craft memory ("" skips it).
+func WorkerPrompt(t *model.Task, agent *model.Agent, run *model.Run, workspace, agentHome string, peerHandoff bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "You are executor agent %q working on task %q (%s) of a workflow run.\n\n", t.Agent, t.Title, t.ID)
 	fmt.Fprintf(&b, "## Overall goal of the run\n%s\n\n## Your task\n%s\n", run.Goal, t.Instruction)
@@ -417,6 +539,13 @@ func WorkerPrompt(t *model.Task, agent *model.Agent, run *model.Run, workspace s
 	if mem := ReadProjectMemory(workspace); mem != "" {
 		fmt.Fprintf(&b, "\n## Project memory\nDurable facts about this project, recorded across runs. They outrank "+
 			"generic defaults — when a choice is not specified by your task, decide in line with these:\n%s\n", mem)
+	}
+
+	if agentHome != "" {
+		if mem := ReadAgentMemory(agentHome); mem != "" {
+			fmt.Fprintf(&b, "\n## Your craft memory (MEMORY.md in your private workspace)\nLessons you recorded "+
+				"on past tasks — apply them:\n%s\n", mem)
+		}
 	}
 
 	if len(t.Acceptance) > 0 {
@@ -467,10 +596,18 @@ summary does not count as delivery.
 			"- ask_agent — ask a task in your own lineage (parent, child, sibling) a question.\n")
 	}
 
+	memoryNote := ""
+	if hasFileTools(agent) {
+		memoryNote = "\n- MEMORY.md in your private workspace is your durable CRAFT memory, read back to you at " +
+			"every task start. Before finishing, append any short lesson about your craft a future task of yours " +
+			"would benefit from — a technique, a pitfall, a checklist item. NOT project facts (those go in your " +
+			"report's observations) and not task logs; skip it when there is nothing durable to say."
+	}
+
 	fmt.Fprintf(&b, `
 ## Directories
 - Your current directory is your OWN persistent workspace (private to you; survives across runs). Use it
-  for notes and scratch work.
+  for notes and scratch work.%s
 - This run's shared exchange directory is: %s
   Upstream artifacts are there. Every deliverable of this task MUST be written there.
 
@@ -500,8 +637,21 @@ You are UNATTENDED: no human watches this session, and "stop and wait" instructi
 tool-permission refusals do not apply to the result report. If a tool call is refused, first try a
 different way (another allowed tool, a narrower command); if the task truly cannot proceed, call
 report_result NOW with status "error" (failure_kind "blocked") — never end your turn silently.
-`, workspace)
+`, memoryNote, workspace)
 	return b.String()
+}
+
+// hasFileTools reports whether the agent can write files with its own tools —
+// the precondition for maintaining its craft memory (write_artifact only
+// reaches the exchange directory, never the agent's home).
+func hasFileTools(agent *model.Agent) bool {
+	for _, t := range strings.Split(agent.Tools, ",") {
+		switch strings.TrimSpace(t) {
+		case "Write", "Edit", "MultiEdit", "Bash":
+			return true
+		}
+	}
+	return false
 }
 
 // FollowupPrompt wraps steering messages delivered at a turn boundary.

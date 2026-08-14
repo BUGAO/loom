@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -70,23 +71,35 @@ func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, 
 		run.Chat = append(run.Chat, model.ChatMessage{Ts: time.Now(), From: "user", Text: run.Goal, Images: run.GoalImages})
 	}
 
-	d := &dynamicRun{engine: e, run: run, wf: wf, dryRun: dryRun, sessions: sessions, workers: map[string]*workerHandle{}}
+	d := &dynamicRun{engine: e, run: run, wf: wf, dryRun: dryRun, sessions: sessions,
+		workers: map[string]*workerHandle{}, pairName: wf.PairAgent, runCtx: ctx}
 
 	rs := e.hub.OpenRun(ctx, hub.RunConfig{
-		Run:        run,
-		Workflow:   wf,
-		Pool:       pool,
-		Workspace:  e.store.RunWorkspace(run.ID),
-		OutputRoot: e.outputRoot,
-		Exec:       d,
-		OnChange:   func(r *model.Run) { e.store.SaveRun(r); e.publish(r) },
-		OnCost:     func(entry store.CostEntry) { e.store.AppendCost(entry) },
-		SaveAgent:  func(a *model.Agent) error { return e.materializeOne(wf, run, a) },
+		Run:           run,
+		Workflow:      wf,
+		Pool:          pool,
+		Workspace:     e.store.RunWorkspace(run.ID),
+		OutputRoot:    e.outputRoot,
+		Exec:          d,
+		OnChange:      func(r *model.Run) { e.store.SaveRun(r); e.publish(r) },
+		OnCost:        func(entry store.CostEntry) { e.store.AppendCost(entry) },
+		SaveAgent:     func(a *model.Agent) error { return e.materializeOne(wf, run, a) },
+		SaveAmendment: func(am *model.Amendment) error { return e.store.SaveAmendment(am) },
+		SaveLesson:    func(l *model.Lesson) error { return e.store.SaveLesson(l) },
 	})
 	d.rs = rs
 	h.setRunSession(rs)
 	for _, m := range opening {
-		rs.UserChat(m.Text, m.Images...) // recorded, audited, and queued for the first round
+		// Recorded, audited, and queued for the first round; feedback and
+		// consolidation messages keep their special framing.
+		switch m.Kind {
+		case model.ChatFeedback:
+			rs.UserFeedback(m.Text)
+		case model.ChatConsolidate:
+			rs.UserConsolidate(m.Text)
+		default:
+			rs.UserChat(m.Text, m.Images...)
+		}
 	}
 
 	rs.AppendEvent("run_status", "", fmt.Sprintf("coordinator started (%s)", coordModel))
@@ -127,21 +140,49 @@ func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, 
 
 // ResumeRun restarts an interrupted dynamic run from its persisted ledger.
 func (e *Engine) ResumeRun(runID string) (*model.Run, error) {
-	return e.reactivate(runID, "", true)
+	return e.reactivate(runID, "", "", true)
 }
 
 // ReopenRun continues a finished dynamic session: the run IS the session, and
 // a verdict is a milestone, not the end of the conversation. The new message
 // wakes a fresh coordinator round over the same ledger, notes and chat.
 func (e *Engine) ReopenRun(runID, text string, images ...llm.Image) (*model.Run, error) {
-	return e.reactivate(runID, text, false, images...)
+	return e.reactivate(runID, text, "", false, images...)
+}
+
+// ReopenFeedback wakes a finished dynamic session with the user's post-run
+// feedback: the coordinator's job in that activation is to DIGEST it —
+// clarify, persist facts/amendments, record the retrospective via
+// conclude_feedback and propose rules — not to resume the work.
+func (e *Engine) ReopenFeedback(runID, text string) (*model.Run, error) {
+	return e.reactivate(runID, text, model.ChatFeedback, false)
+}
+
+// ReopenConsolidate wakes this workflow's newest finished real dynamic
+// session for rule MAINTENANCE: the coordinator reads the standing rules in
+// its system prompt and proposes merges/rewrites/retirements via
+// propose_rules — every proposal still pending until the user confirms. The
+// run is only the vehicle (rules are workflow-scoped); dry runs are skipped
+// because their scripted coordinator cannot reason over the set.
+func (e *Engine) ReopenConsolidate(wfID string) (*model.Run, error) {
+	runs, err := e.store.ListRuns()
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range runs { // newest first
+		if r.WorkflowID != wfID || r.EffectiveMode() != model.ModeDynamic || r.EffectiveDryRun() || !r.Terminal() {
+			continue
+		}
+		return e.reactivate(r.ID, "Consolidate this workflow's standing rules.", model.ChatConsolidate, false)
+	}
+	return nil, fmt.Errorf("this workflow has no finished real dynamic session to host the consolidation — complete one run first")
 }
 
 // reactivate brings a non-active dynamic run back to life. Completed
 // (accepted) tasks are preserved; a fresh coordinator round picks up from the
 // task tree — possible precisely because the coordinator carries no session
 // state between rounds: the persisted run file is the whole session.
-func (e *Engine) reactivate(runID, text string, requireInterrupted bool, images ...llm.Image) (*model.Run, error) {
+func (e *Engine) reactivate(runID, text, kind string, requireInterrupted bool, images ...llm.Image) (*model.Run, error) {
 	e.mu.Lock()
 	if e.active[runID] != nil {
 		e.mu.Unlock()
@@ -174,6 +215,9 @@ func (e *Engine) reactivate(runID, text string, requireInterrupted bool, images 
 	if err != nil {
 		return nil, err
 	}
+	if err := checkPairAgent(wf, pool); err != nil {
+		return nil, err
+	}
 
 	// Any task that was in flight when the previous activation died has lost
 	// its session; it is failed as blocked (rework-eligible) so the
@@ -192,6 +236,12 @@ func (e *Engine) reactivate(runID, text string, requireInterrupted bool, images 
 	msg := "run resumed from the task ledger"
 	if !requireInterrupted {
 		msg = "session reopened by a user message"
+		switch kind {
+		case model.ChatFeedback:
+			msg = "session reopened by post-run feedback (postmortem)"
+		case model.ChatConsolidate:
+			msg = "session reopened for rule consolidation (maintenance)"
+		}
 	}
 	run.Events = append(run.Events, model.Event{Ts: time.Now(), Type: "info", Msg: msg})
 	e.store.SaveRun(run)
@@ -207,7 +257,7 @@ func (e *Engine) reactivate(runID, text string, requireInterrupted bool, images 
 		return nil, err
 	}
 	if text != "" || len(names) > 0 {
-		opening = []model.ChatMessage{{Text: text, Images: names}}
+		opening = []model.ChatMessage{{Kind: kind, Text: text, Images: names}}
 	}
 	go e.coordinate(ctx, h, wf, run, pool, dryRun, opening)
 	return run, nil
@@ -215,6 +265,21 @@ func (e *Engine) reactivate(runID, text string, requireInterrupted bool, images 
 
 // coordinatorAgentName is how the coordinator appears in the cost ledger.
 const coordinatorAgentName = "(coordinator)"
+
+// checkPairAgent verifies a configured resident implementer actually exists
+// in the run's pool — failing at start beats a run whose pair tasks all die
+// on "agent not found".
+func checkPairAgent(wf *model.Workflow, pool []*model.Agent) error {
+	if wf.PairAgent == "" {
+		return nil
+	}
+	for _, a := range pool {
+		if a.Name == wf.PairAgent {
+			return nil
+		}
+	}
+	return fmt.Errorf("pair agent %q is not in this workflow's pool", wf.PairAgent)
+}
 
 // dynamicRun holds the engine-side state of one dynamic run and implements
 // hub.Executor.
@@ -225,10 +290,20 @@ type dynamicRun struct {
 	dryRun   bool
 	sessions llm.SessionBackend // coordinator's session host
 	rs       *hub.RunSession
+	runCtx   context.Context // run-scoped; hosts sessions that outlive one task
 
 	mu      sync.Mutex
 	workers map[string]*workerHandle
 	wg      sync.WaitGroup
+
+	// Resident implementer (pair mode): one persistent session serving all of
+	// pairName's tasks in sequence. pairMu serializes those tasks and guards
+	// the session and token.
+	pairName    string
+	pairMu      sync.Mutex
+	pairSess    llm.Session
+	pairBackend string
+	pairToken   string
 }
 
 type workerHandle struct {
@@ -253,7 +328,7 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 	if dir, named := rs.OutputInfo(); named {
 		outDir = dir
 	}
-	sysPrompt := hub.CoordinatorPrompt(d.run, d.wf, budget, e.outputRoot, outDir, pool)
+	sysPrompt := hub.CoordinatorPrompt(d.run, d.wf, budget, e.outputRoot, outDir, pool, e.LessonsFor(d.wf.ID))
 
 	// The transcript survives reopens: earlier activations' rounds are the
 	// audit trail of this session, not scratch to overwrite.
@@ -286,6 +361,13 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 
 		fresh := sess == nil
 		if fresh {
+			// The runtime loads AGENTS.md/CLAUDE.md from the session cwd as
+			// instructions. loom never writes them into the run workspace, so
+			// anything found there was planted (e.g. by a worker with file
+			// tools) and is removed before it can steer the coordinator.
+			for _, f := range []string{"AGENTS.md", "CLAUDE.md"} {
+				os.Remove(filepath.Join(workspace, f))
+			}
 			s, err := d.sessions.Open(ctx, llm.SessionRequest{
 				Kind:         llm.KindCoordinator,
 				SystemPrompt: sysPrompt,
@@ -573,6 +655,16 @@ func (d *dynamicRun) waitWorkers() {
 	}
 	d.mu.Unlock()
 	d.wg.Wait()
+	d.pairMu.Lock()
+	if d.pairSess != nil {
+		d.pairSess.Close()
+		d.pairSess = nil
+	}
+	if d.pairToken != "" {
+		d.engine.hub.RevokeToken(d.pairToken)
+		d.pairToken = ""
+	}
+	d.pairMu.Unlock()
 }
 
 // execTask runs one worker task to a terminal state.
@@ -591,6 +683,11 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 	agent := d.resolveAgent(view.Agent)
 	if agent == nil {
 		rs.CompleteTask(taskID, "", nil, fmt.Errorf("agent %q not found in the pool", view.Agent))
+		return
+	}
+	// The resident implementer's tasks run on the shared pair session.
+	if d.pairName != "" && agent.Name == d.pairName {
+		d.execPairTask(ctx, rs, taskID, agent)
 		return
 	}
 	budget := rs.Budget()
@@ -642,8 +739,104 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 	if !ok {
 		return
 	}
-	prompt := hub.WorkerPrompt(&task, agent, d.run, workspace, budget.AllowPeerHandoff)
+	prompt := hub.WorkerPrompt(&task, agent, d.run, workspace, e.store.AgentHome(agent.Name), budget.AllowPeerHandoff)
+	d.runTaskTurns(taskCtx, ctx, rs, sess, taskID, taskModel, workerBackend.Name(), workspace, prompt, budget)
+}
 
+// pairNote frames a resident implementer's task on top of the standard worker
+// prompt: same contract, plus the session's continuity.
+const pairNote = `
+## Resident session
+You are this run's RESIDENT IMPLEMENTER: this session persists across tasks, and your working
+directory IS the project (the exchange directory). Build on what you already know of the codebase
+from earlier tasks instead of re-exploring it. Your task binding changes per task — report_result
+always settles the CURRENT task described above, so call it exactly once per task.
+`
+
+// execPairTask runs one of the resident implementer's tasks on the shared
+// pair session. Pair tasks serialize on pairMu: one session is one
+// conversation — that is the point (context accumulates) and the constraint.
+// The session opens lazily against the RUN context, survives task boundaries,
+// and is dropped and rebuilt if a prompt fails.
+func (d *dynamicRun) execPairTask(ctx context.Context, rs *hub.RunSession, taskID string, agent *model.Agent) {
+	e := d.engine
+	d.pairMu.Lock()
+	defer d.pairMu.Unlock()
+
+	budget := rs.Budget()
+	taskCtx, cancelTask := context.WithTimeout(ctx, time.Duration(budget.TaskTimeoutSec)*time.Second)
+	defer cancelTask()
+
+	if d.pairToken == "" {
+		d.pairToken = e.hub.IssuePairToken(d.run.ID)
+	}
+	workspace := rs.Workspace()
+	if d.pairSess == nil {
+		backend, err := e.runtimeFor(agent.Runtime, d.dryRun)
+		if err != nil {
+			rs.CompleteTask(taskID, "", nil, err)
+			return
+		}
+		sess, err := llm.Sessions(backend).Open(d.runCtx, llm.SessionRequest{
+			Kind:         llm.KindWorker,
+			SystemPrompt: agent.SystemPrompt,
+			// One session, one model: the agent's own default. The
+			// coordinator's per-task tiering cannot switch a live session.
+			Model:      agent.Model,
+			WorkDir:    workspace,
+			AddDirs:    []string{workspace},
+			Tools:      agent.Tools,
+			MaxTurns:   agent.MaxTurns,
+			MCPServers: e.hubServers(d.pairToken),
+			OnActivity: func(text string) {
+				if id := rs.PairTask(); id != "" {
+					rs.TaskActivity(id, text)
+				}
+			},
+		})
+		if err != nil {
+			rs.CompleteTask(taskID, "", nil, fmt.Errorf("open pair session: %w", err))
+			return
+		}
+		d.pairSess = sess
+		d.pairBackend = backend.Name()
+	}
+
+	if err := rs.TaskStarted(taskID); err != nil {
+		rs.CompleteTask(taskID, "", nil, err)
+		return
+	}
+	task, ok := rs.TaskSnapshot(taskID)
+	if !ok {
+		return
+	}
+	prompt := hub.WorkerPrompt(&task, agent, d.run, workspace, e.store.AgentHome(agent.Name), budget.AllowPeerHandoff) + pairNote
+
+	rs.SetPairTask(taskID)
+	defer rs.SetPairTask("")
+	if broken := d.runTaskTurns(taskCtx, ctx, rs, d.pairSess, taskID, agent.Model, d.pairBackend, workspace, prompt, budget); broken {
+		// The task was already settled by runTaskTurns; only the vehicle is
+		// gone. The next pair task gets a fresh session (with its own cold
+		// start — the price of the failure, not of the design).
+		d.pairSess.Close()
+		d.pairSess = nil
+		rs.AppendEvent("run_status", taskID, "pair session lost; the next pair task will rebuild it")
+	}
+}
+
+// runTaskTurns drives one task's prompt turns on an open session until the
+// task settles: initial instruction, a turn per steering batch, then the
+// report/envelope/acceptance settlement. It returns true when the session
+// itself failed (prompt error, timeout, cancellation) — a per-task session
+// just closes then, a resident session must be dropped and rebuilt.
+//
+// The envelope contract is the same as static mode's — no envelope means the
+// task failed, never "probably fine". And an "ok" envelope is only a claim:
+// the task completes when its acceptance checks pass, and not before.
+func (d *dynamicRun) runTaskTurns(taskCtx, ctx context.Context, rs *hub.RunSession, sess llm.Session,
+	taskID, taskModel, backendName, workspace, prompt string, budget model.BudgetConfig) bool {
+
+	e := d.engine
 	var transcript strings.Builder
 	var lastEnv envelope
 	var haveEnv bool
@@ -656,7 +849,7 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 				modelID = taskModel
 			}
 			rs.RecordTaskCost(taskID, modelID, res.Usage, res.CostUSD, res.DurationMs)
-			if res.Usage.Empty() && res.CostUSD == 0 && workerBackend.Name() == "acp" {
+			if res.Usage.Empty() && res.CostUSD == 0 && backendName == "acp" {
 				rs.AppendEvent("cost_unavailable", taskID, "token usage could not be read from the session transcript; cost recorded as 0")
 			}
 			body := res.Transcript
@@ -670,14 +863,14 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 			if taskCtx.Err() == context.DeadlineExceeded {
 				rs.CompleteTaskWith(taskID, "", nil,
 					fmt.Errorf("task exceeded its %ds timeout", budget.TaskTimeoutSec), model.FailBlocked, nil)
-				return
+				return true
 			}
 			if ctx.Err() != nil {
 				rs.CompleteTask(taskID, "", nil, fmt.Errorf("canceled"))
-				return
+				return true
 			}
 			rs.CompleteTask(taskID, "", nil, err)
-			return
+			return true
 		}
 		// The structured report_result call is the primary channel; a trailing
 		// envelope in the reply text is the fallback for sessions that never
@@ -730,7 +923,7 @@ func (d *dynamicRun) execTask(ctx context.Context, rs *hub.RunSession, taskID st
 					model.FailBlocked, results)
 			}
 		}
-		return
+		return false
 	}
 }
 

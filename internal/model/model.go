@@ -74,6 +74,12 @@ type Workflow struct {
 	// dynamic mode only
 	Coordinator *CoordinatorConfig `json:"coordinator,omitempty"`
 	Budget      *BudgetConfig      `json:"budget,omitempty"`
+	// PairAgent names a pool agent as the run's RESIDENT IMPLEMENTER: all its
+	// tasks run sequentially in one persistent session whose cwd is the
+	// exchange directory, so project understanding accumulates across tasks
+	// the way a direct Claude Code session's would. Its session runs on the
+	// agent's own default model (per-task tiering does not apply).
+	PairAgent string `json:"pair_agent,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -359,11 +365,24 @@ type Task struct {
 	EndedAt    time.Time  `json:"ended_at,omitempty"`
 }
 
+// ChatConsolidate marks a chat message as a rule-consolidation request: the
+// coordinator's job in that activation is to tidy the workflow's standing
+// rules via propose_rules (merge, rewrite, retire) — maintenance, not work,
+// and not a verdict on this run's delivery.
+const ChatConsolidate = "consolidate"
+
+// ChatFeedback marks a chat message as post-run feedback: the coordinator is
+// asked to DIGEST it (clarify, persist, distill), not to resume working.
+const ChatFeedback = "feedback"
+
 // ChatMessage is one turn of the user ↔ coordinator conversation.
 type ChatMessage struct {
 	Ts   time.Time `json:"ts"`
 	From string    `json:"from"` // "user" | "coordinator"
-	Text string    `json:"text"`
+	// Kind distinguishes special messages; "" is a normal chat turn,
+	// ChatFeedback is a post-run verdict to digest.
+	Kind string `json:"kind,omitempty"`
+	Text string `json:"text"`
 	// Images are upload filenames attached to this message. The bytes live as
 	// files under the run's uploads directory, never inline in the run record.
 	Images []string `json:"images,omitempty"`
@@ -426,6 +445,15 @@ type Run struct {
 	// it chose to persist across rounds. This — plus the task ledger — is ALL
 	// the state a new round starts from; there is no accumulated conversation.
 	CoordinatorNotes []string `json:"coordinator_notes,omitempty"`
+
+	// Feedback is this run's RETROSPECTIVE RECORD — the coordinator's digested
+	// conclusion of the user's postmortem (written via conclude_feedback; the
+	// raw words stay in Chat). It is stored and shown, never injected: what
+	// future runs open with are the workflow's user-APPROVED Lessons, which the
+	// coordinator proposes from this retrospective. Static and dry runs, which
+	// have no conversational agent, store the user's text verbatim here.
+	Feedback   string    `json:"feedback,omitempty"`
+	FeedbackAt time.Time `json:"feedback_at,omitempty"`
 }
 
 // CoordinatorState is the live state of the run's coordinator, shown as a
@@ -441,6 +469,62 @@ type CoordinatorState struct {
 	Usage      TokenUsage `json:"usage"`
 	DurationMs int64      `json:"duration_ms"`
 }
+
+// Amendment statuses.
+const (
+	AmendmentPending  = "pending"
+	AmendmentApproved = "approved"
+	AmendmentRejected = "rejected"
+)
+
+// Amendment is a proposed revision of an agent's standing definition (its
+// system prompt), created by a run's coordinator when feedback or observations
+// show the DEFINITION — not one run's spec — caused a failure. It is data
+// until a human approves it: agents can never change an identity themselves
+// (path-deny stands), and approval is the only path from proposal to effect.
+type Amendment struct {
+	ID        string `json:"id"`
+	Agent     string `json:"agent"`
+	RunID     string `json:"run_id,omitempty"` // provenance: the run whose evidence motivated this
+	Rationale string `json:"rationale"`
+	// Current snapshots the agent's system prompt at proposal time; approval
+	// refuses to apply over a prompt that changed since (a stale proposal was
+	// reasoned against text that no longer exists).
+	Current   string    `json:"current"`
+	Proposed  string    `json:"proposed"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+	DecidedAt time.Time `json:"decided_at,omitempty"`
+}
+
+// Lesson is one concrete behavior rule distilled from a run's retrospective —
+// "do X", "avoid Y" — proposed by the coordinator (or written by the user) at
+// workflow scope. It is data until the user approves it: only approved lessons
+// are injected into the opening prompt of the workflow's future runs. The
+// retrospective narrative itself stays on Run.Feedback and is never injected.
+//
+// A proposal may SUPERSEDE existing approved rules instead of piling on a
+// near-duplicate: Replaces names them, and approval swaps them out atomically.
+// An empty Text with a non-empty Replaces is a pure retirement — approving it
+// removes the targets and injects nothing. ReplacedTexts snapshots the targets
+// at proposal time; approval over a target the user has since edited is
+// refused (same stale rule as amendments — the proposal was reasoned against
+// text that no longer exists).
+type Lesson struct {
+	ID            string    `json:"id"`
+	WorkflowID    string    `json:"workflow_id"`
+	RunID         string    `json:"run_id,omitempty"` // provenance: the retrospective that produced it
+	Text          string    `json:"text"`
+	Replaces      []string  `json:"replaces,omitempty"`       // ids of approved rules this supersedes
+	ReplacedTexts []string  `json:"replaced_texts,omitempty"` // their texts at proposal time, parallel to Replaces
+	Status        string    `json:"status"`                   // pending | approved | rejected (Amendment* constants)
+	CreatedAt     time.Time `json:"created_at"`
+	DecidedAt     time.Time `json:"decided_at,omitempty"`
+}
+
+// Retirement reports whether this proposal only removes rules: approving it
+// deletes the Replaces targets and adds nothing to the injection set.
+func (l *Lesson) Retirement() bool { return l.Text == "" && len(l.Replaces) > 0 }
 
 // Proposal is what the coordinator submits at the initial approval gate.
 type Proposal struct {

@@ -105,11 +105,11 @@ func TestValidateAgentCreation(t *testing.T) {
 }
 
 func TestBuildPromptAgentCreation(t *testing.T) {
-	p := BuildPrompt("goal", pool, model.PlannerConfig{}, "", true)
+	p := BuildPrompt("goal", pool, model.PlannerConfig{}, "", true, nil)
 	if !strings.Contains(p, "Defining new agents") || !strings.Contains(p, "claude-opus-5") {
 		t.Fatal("agent-creation contract missing from prompt")
 	}
-	if q := BuildPrompt("goal", pool, model.PlannerConfig{}, "", false); strings.Contains(q, "Defining new agents") {
+	if q := BuildPrompt("goal", pool, model.PlannerConfig{}, "", false, nil); strings.Contains(q, "Defining new agents") {
 		t.Fatal("agent-creation contract leaked into non-creating prompt")
 	}
 }

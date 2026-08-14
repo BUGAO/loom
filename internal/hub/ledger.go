@@ -53,6 +53,13 @@ type RunConfig struct {
 	OnCost func(store.CostEntry)
 	// SaveAgent persists a coordinator-created agent into the shared pool.
 	SaveAgent func(*model.Agent) error
+	// SaveAmendment persists a coordinator-proposed revision of an agent's
+	// definition — as a PENDING record only; a human applies or rejects it.
+	SaveAmendment func(*model.Amendment) error
+	// SaveLesson persists one behavior rule the coordinator distilled from a
+	// postmortem — as a PENDING record only; the user approves or rejects it,
+	// and only approved lessons are injected into future runs.
+	SaveLesson func(*model.Lesson) error
 }
 
 // ErrApprovalPending is returned when work is requested before a human has
@@ -150,6 +157,10 @@ type RunSession struct {
 	// round. A non-empty queue wakes AwaitRound, and the next round's prompt
 	// carries the drained messages.
 	pendingChat []model.ChatMessage
+
+	// pairTaskID is the task the resident implementer session is currently
+	// bound to ("" between tasks); see SetPairTask.
+	pairTaskID string
 
 	// seq increments on every ledger transition; the round driver compares it
 	// across rounds to detect a coordinator that acts without effect.
@@ -1707,6 +1718,25 @@ func (rs *RunSession) AddNote(text string) {
 	rs.mu.Unlock()
 }
 
+// ---- pair (resident implementer) task binding ----
+
+// SetPairTask binds the resident implementer session to the task it is
+// currently working; "" unbinds. The engine sets it around each pair task's
+// turns, and every pair-credential tool call resolves through it.
+func (rs *RunSession) SetPairTask(taskID string) {
+	rs.mu.Lock()
+	rs.pairTaskID = taskID
+	rs.mu.Unlock()
+}
+
+// PairTask returns the task currently bound to the resident implementer
+// session, or "".
+func (rs *RunSession) PairTask() string {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.pairTaskID
+}
+
 // ---- project memory ----
 
 // projectMemoryFile is the durable, cross-run memory of the PROJECT, living in
@@ -1714,10 +1744,15 @@ func (rs *RunSession) AddNote(text string) {
 // strategy goes in notes; what the NEXT run must not relearn goes here.
 const projectMemoryFile = "PROJECT.md"
 
-// projectMemoryCap bounds how much of PROJECT.md is inlined into prompts. The
-// head is kept: facts accumulate chronologically, and the oldest ones are the
-// foundational conventions.
-const projectMemoryCap = 4000
+// projectMemoryCap bounds how much of PROJECT.md is inlined into prompts.
+// Clipping keeps the head AND the tail: facts accumulate chronologically, so
+// the oldest ones are the foundational conventions and the newest ones are the
+// latest corrections — a user correction recorded five minutes ago must never
+// be the part that truncation drops.
+const (
+	projectMemoryCap  = 4000
+	projectMemoryTail = 1600
+)
 
 // RecordProjectFact appends one durable fact to the exchange directory's
 // PROJECT.md, creating it with a header on first use. Audited like any other
@@ -1756,17 +1791,57 @@ func (rs *RunSession) ProjectMemory() string {
 }
 
 // ReadProjectMemory reads a workspace's PROJECT.md for prompt inlining,
-// clipped to projectMemoryCap.
+// clipped to projectMemoryCap with the middle elided.
 func ReadProjectMemory(dir string) string {
 	data, err := os.ReadFile(filepath.Join(dir, projectMemoryFile))
 	if err != nil {
 		return ""
 	}
-	s := strings.TrimSpace(string(data))
-	if len(s) > projectMemoryCap {
-		s = s[:projectMemoryCap] + "\n…[truncated — read the full PROJECT.md in the exchange directory]"
+	return clipHeadTail(strings.TrimSpace(string(data)), projectMemoryCap-projectMemoryTail, projectMemoryTail,
+		"…[middle truncated — read the full PROJECT.md in the exchange directory]")
+}
+
+// clipHeadTail bounds s to roughly headCap+tailCap bytes by eliding the
+// MIDDLE: for chronologically appended files both ends matter — the head holds
+// the foundations, the tail holds the most recent entries. Cuts snap to line
+// boundaries so the marker never splices two half-entries.
+func clipHeadTail(s string, headCap, tailCap int, marker string) string {
+	if len(s) <= headCap+tailCap {
+		return s
 	}
-	return s
+	head, tail := s[:headCap], s[len(s)-tailCap:]
+	if i := strings.LastIndexByte(head, '\n'); i > 0 {
+		head = head[:i]
+	}
+	if i := strings.IndexByte(tail, '\n'); i >= 0 {
+		tail = tail[i+1:]
+	}
+	return head + "\n" + marker + "\n" + tail
+}
+
+// ---- agent craft memory ----
+
+// agentMemoryFile is an agent's durable CRAFT memory, living in its private
+// home directory (which persists across runs and is not covered by path-deny —
+// the home is the agent's own). Where PROJECT.md records facts about a
+// project, MEMORY.md records lessons about the craft: techniques, pitfalls,
+// checklists the same agent will need on any future task. The agent writes it
+// itself (it needs file tools); loom reads it back into every task prompt.
+const (
+	agentMemoryFile = "MEMORY.md"
+	agentMemoryHead = 800
+	agentMemoryTail = 1600 // tail-biased: the newest lessons are the freshest
+)
+
+// ReadAgentMemory reads an agent home's MEMORY.md for prompt inlining, clipped
+// with the middle elided. "" when the agent never wrote one.
+func ReadAgentMemory(home string) string {
+	data, err := os.ReadFile(filepath.Join(home, agentMemoryFile))
+	if err != nil {
+		return ""
+	}
+	return clipHeadTail(strings.TrimSpace(string(data)), agentMemoryHead, agentMemoryTail,
+		"…[middle truncated — read the full MEMORY.md in your workspace]")
 }
 
 // ---- user chat ----
@@ -1775,6 +1850,24 @@ func ReadProjectMemory(dir string) string {
 // user talking to the coordinator is a first-class wake reason, same as a
 // task settling.
 func (rs *RunSession) UserChat(text string, images ...string) error {
+	return rs.userMessage("", text, images)
+}
+
+// UserFeedback records a post-run verdict from the user: same wake semantics
+// as UserChat, but the message is marked so the round prompt frames it as a
+// POSTMORTEM to digest, not a request to resume working.
+func (rs *RunSession) UserFeedback(text string) error {
+	return rs.userMessage(model.ChatFeedback, text, nil)
+}
+
+// UserConsolidate records a rule-consolidation request: same wake semantics,
+// framed as MAINTENANCE over the workflow's standing rules — not feedback on
+// this run, not a request to resume working.
+func (rs *RunSession) UserConsolidate(text string) error {
+	return rs.userMessage(model.ChatConsolidate, text, nil)
+}
+
+func (rs *RunSession) userMessage(kind, text string, images []string) error {
 	text = strings.TrimSpace(text)
 	if text == "" && len(images) == 0 {
 		return fmt.Errorf("message is empty")
@@ -1784,7 +1877,7 @@ func (rs *RunSession) UserChat(text string, images ...string) error {
 		rs.mu.Unlock()
 		return fmt.Errorf("this run has ended; message the workflow to start a new one")
 	}
-	m := model.ChatMessage{Ts: time.Now(), From: "user", Text: text, Images: images}
+	m := model.ChatMessage{Ts: time.Now(), From: "user", Kind: kind, Text: text, Images: images}
 	rs.run.Chat = append(rs.run.Chat, m)
 	rs.pendingChat = append(rs.pendingChat, m)
 	// An answer arrived: the coordinator is no longer waiting on the user.
@@ -1793,7 +1886,33 @@ func (rs *RunSession) UserChat(text string, images ...string) error {
 	}
 	rs.notifyLocked()
 	rs.mu.Unlock()
-	rs.event("chat", "", "user → coordinator: "+firstLine(text, 120))
+	label := "user → coordinator: "
+	switch kind {
+	case model.ChatFeedback:
+		label = "user feedback (postmortem): "
+	case model.ChatConsolidate:
+		label = "user request (rule consolidation): "
+	}
+	rs.event("chat", "", label+firstLine(text, 120))
+	return nil
+}
+
+// ConcludeFeedback records the coordinator's digested conclusion of the
+// user's post-run feedback onto the run — the RETROSPECTIVE RECORD. It is
+// stored and shown, never injected: what travels into future runs are the
+// behavior rules proposed via ProposeLessons once the user confirms them.
+// The user's raw words stay in the chat.
+func (rs *RunSession) ConcludeFeedback(text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fmt.Errorf("the distilled feedback is empty")
+	}
+	rs.mu.Lock()
+	rs.run.Feedback = text
+	rs.run.FeedbackAt = time.Now()
+	rs.notifyLocked()
+	rs.mu.Unlock()
+	rs.event("feedback_concluded", "", "coordinator distilled the run feedback: "+firstLine(text, 120))
 	return nil
 }
 

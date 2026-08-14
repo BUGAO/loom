@@ -30,13 +30,24 @@ func allowedToolSet() map[string]bool {
 
 // BuildPrompt renders the planning request: the goal, the agent registry the
 // planner may draw from, the (optional) agent-creation contract, and the
-// output contract.
-func BuildPrompt(goal string, pool []*model.Agent, cfg model.PlannerConfig, prior string, allowCreate bool) string {
+// output contract. lessons carries the workflow's standing behavior rules —
+// distilled from past retrospectives and confirmed by the user (newest first,
+// already bounded by the collector).
+func BuildPrompt(goal string, pool []*model.Agent, cfg model.PlannerConfig, prior string, allowCreate bool, lessons []string) string {
 	var b strings.Builder
 	b.WriteString("You are the planner (main agent) of a workflow orchestrator. ")
 	b.WriteString("Assemble a DAG of executor-agent nodes that accomplishes the goal. ")
 	b.WriteString("Each node is one independently verifiable unit of work assigned to one agent from the registry.\n\n")
 	fmt.Fprintf(&b, "## Goal\n%s\n\n", goal)
+	if len(lessons) > 0 {
+		b.WriteString("## Standing rules of this workflow (user-confirmed)\n")
+		b.WriteString("Behavior rules distilled from past retrospectives and confirmed by the user. They outrank " +
+			"your defaults — plan and write node instructions so every one of them is honored:\n")
+		for _, f := range lessons {
+			fmt.Fprintf(&b, "- %s\n", f)
+		}
+		b.WriteString("\n")
+	}
 	b.WriteString("## Agent registry\n")
 	for _, a := range pool {
 		fmt.Fprintf(&b, "- **%s**: %s\n", a.Name, a.Description)

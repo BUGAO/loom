@@ -45,8 +45,10 @@ type Mock struct {
 	FailCoordinatorPrompt int64
 
 	// CoordinatorOpens counts coordinator sessions opened — how tests observe
-	// that one live session served many rounds.
+	// that one live session served many rounds. WorkerOpens does the same for
+	// worker sessions (pair mode: many tasks, one open).
 	CoordinatorOpens atomic.Int64
+	WorkerOpens      atomic.Int64
 
 	coordPrompts atomic.Int64
 }
@@ -114,8 +116,11 @@ func (m *Mock) node(ctx context.Context, req Request) (*Result, error) {
 // ---- dynamic mode: a scripted MCP client ----
 
 func (m *Mock) Open(ctx context.Context, req SessionRequest) (Session, error) {
-	if req.Kind == KindCoordinator {
+	switch req.Kind {
+	case KindCoordinator:
 		m.CoordinatorOpens.Add(1)
+	case KindWorker:
+		m.WorkerOpens.Add(1)
 	}
 	if len(req.MCPServers) == 0 {
 		return &singleShotSession{be: m, req: req}, nil

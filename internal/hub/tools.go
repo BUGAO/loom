@@ -23,10 +23,16 @@ func (h *Hub) buildServer(rs *RunSession, id identity) *mcp.Server {
 		Title:   "loom orchestration hub",
 		Version: "2",
 	}, nil)
-	if id.role == RoleCoordinator {
+	switch id.role {
+	case RoleCoordinator:
 		h.addCoordinatorTools(srv, rs)
-	} else {
-		h.addWorkerTools(srv, rs, id.taskID)
+	case RolePair:
+		// The resident implementer's task binding moves between calls; every
+		// handler resolves it fresh from the ledger.
+		h.addWorkerTools(srv, rs, rs.PairTask, true)
+	default:
+		taskID := id.taskID
+		h.addWorkerTools(srv, rs, func() string { return taskID }, false)
 	}
 	return srv
 }
@@ -166,6 +172,25 @@ type recordNoteIn struct {
 
 type recordProjectFactIn struct {
 	Text string `json:"text" jsonschema:"one durable fact about the PROJECT (domain constraint, convention, user correction) that future runs must honor; short and declarative"`
+}
+
+type concludeFeedbackIn struct {
+	Text string `json:"text" jsonschema:"the retrospective conclusion of THIS run: what the feedback taught, references resolved. Stored on the run as its postmortem record — never injected into future runs. Rules the retrospective yields go through propose_rules, not here"`
+}
+
+type proposedRuleIn struct {
+	Text     string   `json:"text,omitempty" jsonschema:"one self-contained imperative directive ('do X', 'never Y') a future run can follow without this conversation — NOT a recap of events. Empty only for a pure retirement (replaces set, nothing added)"`
+	Replaces []string `json:"replaces,omitempty" jsonschema:"ids of existing standing rules this one supersedes (they are listed with ids in your system prompt). Use whenever the new rule overlaps, refines or contradicts an existing one — never pile on a near-duplicate. Approval swaps them atomically"`
+}
+
+type proposeRulesIn struct {
+	Rules []proposedRuleIn `json:"rules" jsonschema:"the proposed rule changes; only what will change future behavior"`
+}
+
+type proposeAmendmentIn struct {
+	Agent          string `json:"agent" jsonschema:"name of the pool agent whose standing definition needs revision"`
+	Rationale      string `json:"rationale" jsonschema:"the concrete evidence: which failure, observation or user feedback showed the agent's DEFINITION (not this run's spec) to be the problem"`
+	ProposedPrompt string `json:"proposed_prompt" jsonschema:"the agent's COMPLETE revised system prompt — a full replacement, not a diff. Change only what the rationale justifies"`
 }
 
 func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
@@ -392,6 +417,56 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
+		Name: "conclude_feedback",
+		Description: "Record the retrospective conclusion of THIS run after digesting a postmortem — stored on " +
+			"the run, shown to the user, never injected anywhere. Calling again replaces it. Behavior rules the " +
+			"retrospective yields go through propose_rules; durable project facts belong in " +
+			"record_project_fact, definition flaws in propose_agent_amendment.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in concludeFeedbackIn) (*mcp.CallToolResult, any, error) {
+		activity("conclude_feedback")
+		if err := rs.ConcludeFeedback(in.Text); err != nil {
+			return toolErr("%v", err), nil, nil
+		}
+		return okf(rs, "Retrospective conclusion recorded (a record, not an injection — rules go through propose_rules)."), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "propose_rules",
+		Description: "Propose changes to this workflow's standing behavior rules — new rules distilled from a " +
+			"postmortem, or merges/rewrites/retirements of the existing ones (they are listed with ids in your " +
+			"system prompt). Each rule is one short, self-contained directive; a rule overlapping an existing " +
+			"one must carry replaces instead of duplicating it, and an empty text with replaces retires rules " +
+			"outright. Everything lands PENDING: the user confirms each change, and only confirmed rules are " +
+			"injected into future runs. If nothing would change future behavior, propose nothing.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in proposeRulesIn) (*mcp.CallToolResult, any, error) {
+		activity("propose_rules")
+		n, err := rs.ProposeLessons(in.Rules)
+		if err != nil {
+			return toolErr("%v", err), nil, nil
+		}
+		if n == 0 {
+			return okf(rs, "No rules proposed — nothing changes."), nil, nil
+		}
+		return okf(rs, "%d rule change(s) await the user's confirmation; nothing is injected until they approve.", n), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "propose_agent_amendment",
+		Description: "Propose a revision of a pool agent's standing definition (its system prompt) for HUMAN review. " +
+			"Use it when user feedback or a worker's observations show the agent's DEFINITION — not this run's " +
+			"instruction — caused a failure that will recur. The proposal changes NOTHING now: it lands in a " +
+			"review queue, a human applies or rejects it later. Continue the run with the agent as it is. Never " +
+			"use this to work around a bad task spec — fix the spec instead.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in proposeAmendmentIn) (*mcp.CallToolResult, any, error) {
+		activity("propose_agent_amendment " + in.Agent)
+		if err := rs.ProposeAmendment(in.Agent, in.Rationale, in.ProposedPrompt); err != nil {
+			return toolErr("%v", err), nil, nil
+		}
+		return okf(rs, "Amendment for %q recorded for human review. It does not change the agent now — continue "+
+			"the run with the agent as it is.", in.Agent), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
 		Name: "finish_run",
 		Description: "Declare the run finished. Call this exactly once, when the goal is met or when you have " +
 			"concluded it cannot be. Success requires having inspected at least one deliverable. After calling " +
@@ -433,6 +508,102 @@ func (rs *RunSession) CreateAgent(a *model.Agent) error {
 	rs.AddAgent(a)
 	rs.event("agent_created", "", fmt.Sprintf("coordinator created agent %q (model %s, tools %q)", a.Name, a.Model, a.Tools))
 	return nil
+}
+
+// maxAmendmentPrompt bounds a proposed system prompt: a role definition, not a
+// manual — and the human has to read the whole thing to approve it.
+const maxAmendmentPrompt = 16000
+
+// ProposeAmendment records a pending revision of a pool agent's definition.
+// It writes a proposal record and nothing else — the agent is untouched until
+// a human approves. That asymmetry is the design: agents surface evidence,
+// humans change identities.
+func (rs *RunSession) ProposeAmendment(agentName, rationale, proposed string) error {
+	rationale = strings.TrimSpace(rationale)
+	proposed = strings.TrimSpace(proposed)
+	if rationale == "" || proposed == "" {
+		return fmt.Errorf("rationale and proposed_prompt are both required")
+	}
+	if len(proposed) > maxAmendmentPrompt {
+		return fmt.Errorf("proposed_prompt exceeds %d characters — an agent definition is a role, not a manual", maxAmendmentPrompt)
+	}
+	var target *model.Agent
+	for _, a := range rs.PoolAgents() {
+		if a.Name == agentName {
+			target = a
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("agent %q is not in this run's pool", agentName)
+	}
+	if strings.TrimSpace(target.SystemPrompt) == proposed {
+		return fmt.Errorf("the proposed prompt is identical to the current one — nothing to amend")
+	}
+	if rs.cfg.SaveAmendment == nil {
+		return fmt.Errorf("amendment proposals are not wired for this run")
+	}
+	am := &model.Amendment{
+		Agent: agentName, RunID: rs.run.ID, Rationale: rationale,
+		Current: target.SystemPrompt, Proposed: proposed,
+	}
+	if err := rs.cfg.SaveAmendment(am); err != nil {
+		return err
+	}
+	rs.event("amendment_proposed", "", fmt.Sprintf("coordinator proposed revising agent %q: %s", agentName, firstLine(rationale, 120)))
+	return nil
+}
+
+// Bounds for proposed behavior rules: each is one norm the user must read to
+// approve, and the approved set is injected into every future run's prompt.
+// The per-call cap leaves room for a consolidation pass over a full set.
+const (
+	maxLessonRuleLen = 400
+	maxRulesPerCall  = 8
+)
+
+// ProposeLessons records the coordinator's proposed rule changes — new rules,
+// supersessions, retirements — as PENDING records only. Nothing is injected
+// or removed until the user approves each one: agents surface lessons, the
+// user decides what becomes standing instruction (the amendment asymmetry,
+// applied to feedback). Replacement targets are validated and snapshotted by
+// the store at save time, so a bad reference is refused here, loudly, while
+// the coordinator can still fix it.
+func (rs *RunSession) ProposeLessons(rules []proposedRuleIn) (int, error) {
+	if rs.cfg.SaveLesson == nil {
+		return 0, fmt.Errorf("lesson proposals are not wired for this run")
+	}
+	var clean []*model.Lesson
+	for _, r := range rules {
+		text := strings.TrimSpace(r.Text)
+		if text == "" && len(r.Replaces) == 0 {
+			continue
+		}
+		if len(text) > maxLessonRuleLen {
+			return 0, fmt.Errorf("a rule exceeds %d characters — a behavior norm is one directive, not a recap", maxLessonRuleLen)
+		}
+		clean = append(clean, &model.Lesson{
+			WorkflowID: rs.run.WorkflowID, RunID: rs.run.ID, Text: text, Replaces: r.Replaces,
+		})
+	}
+	if len(clean) == 0 {
+		return 0, nil
+	}
+	if len(clean) > maxRulesPerCall {
+		return 0, fmt.Errorf("%d rules in one call — distill to at most %d; only what will change future behavior", len(clean), maxRulesPerCall)
+	}
+	for _, l := range clean {
+		if err := rs.cfg.SaveLesson(l); err != nil {
+			return 0, err
+		}
+	}
+	first := clean[0].Text
+	if first == "" {
+		first = "retire " + strings.Join(clean[0].Replaces, ", ")
+	}
+	rs.event("lessons_proposed", "", fmt.Sprintf("coordinator proposed %d rule change(s) for user confirmation: %s",
+		len(clean), firstLine(first, 120)))
+	return len(clean), nil
 }
 
 // ---- worker tools ----
@@ -477,7 +648,12 @@ type reportResultIn struct {
 	Observations string   `json:"observations,omitempty" jsonschema:"anything the contract did not cover that the coordinator should know: a spec that seems wrong, a coupling you noticed, a default you had to invent. Speaking up here is part of the job"`
 }
 
-func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskID string) {
+// addWorkerTools registers the worker toolset. taskOf resolves the acting
+// task at call time: fixed for a per-task worker session, ledger-bound for a
+// resident (pair) session that serves many tasks. resident additionally
+// grants record_project_fact — the implementer is the role that actually
+// sees the code, so it is the first to learn durable project facts.
+func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskOf func() string, resident bool) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "write_artifact",
 		Description: "Write a deliverable file into the run's exchange directory. Substantial text output — a " +
@@ -485,6 +661,10 @@ func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskID string) {
 			"tools), NEVER pasted into messages or the result summary. Works even if you have no file tools. " +
 			"Overwrites unless append=true; large documents go in chunks.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in writeArtifactIn) (*mcp.CallToolResult, any, error) {
+		taskID := taskOf()
+		if taskID == "" {
+			return toolErr("no task is currently bound to this session"), nil, nil
+		}
 		if err := rs.WriteArtifact(taskID, in.Path, in.Content, in.Append); err != nil {
 			return toolErr("%v", err), nil, nil
 		}
@@ -498,6 +678,10 @@ func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskID string) {
 		Description: "Report progress mid-task so the coordinator can see where you are. Does not end your task " +
 			"and does not require a reply.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in reportProgressIn) (*mcp.CallToolResult, any, error) {
+		taskID := taskOf()
+		if taskID == "" {
+			return toolErr("no task is currently bound to this session"), nil, nil
+		}
 		if err := rs.Progress(taskID, in.Text); err != nil {
 			return toolErr("%v", err), nil, nil
 		}
@@ -510,6 +694,10 @@ func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskID string) {
 			"when the task is done (or definitively stuck), then end your turn — the engine settles your task " +
 			"from this report and runs the acceptance checks itself. Calling again replaces the earlier report.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in reportResultIn) (*mcp.CallToolResult, any, error) {
+		taskID := taskOf()
+		if taskID == "" {
+			return toolErr("no task is currently bound to this session"), nil, nil
+		}
 		status := strings.ToLower(strings.TrimSpace(in.Status))
 		if status != "ok" && status != "error" {
 			return toolErr("status must be \"ok\" or \"error\", got %q", in.Status), nil, nil
@@ -536,12 +724,30 @@ func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskID string) {
 		Description: "Ask the coordinator a question when the task is genuinely ambiguous and guessing would waste " +
 			"the work. Blocks until it answers. Use this instead of inventing an assumption.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in askCoordinatorIn) (*mcp.CallToolResult, askCoordinatorOut, error) {
+		taskID := taskOf()
+		if taskID == "" {
+			return toolErr("no task is currently bound to this session"), askCoordinatorOut{}, nil
+		}
 		answer, err := rs.Ask(ctx, taskID, in.Question)
 		if err != nil {
 			return toolErr("%v", err), askCoordinatorOut{}, nil
 		}
 		return nil, askCoordinatorOut{Answer: answer}, nil
 	})
+
+	if resident {
+		mcp.AddTool(srv, &mcp.Tool{
+			Name: "record_project_fact",
+			Description: "Append one durable fact to PROJECT.md in the exchange directory — the cross-run memory " +
+				"of the PROJECT: domain constraints, conventions, corrections. You are the role that actually reads " +
+				"the code; when you learn something every future task must honor, record it.",
+		}, func(ctx context.Context, _ *mcp.CallToolRequest, in recordProjectFactIn) (*mcp.CallToolResult, any, error) {
+			if err := rs.RecordProjectFact(in.Text); err != nil {
+				return toolErr("%v", err), nil, nil
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Project fact recorded in PROJECT.md."}}}, nil, nil
+		})
+	}
 
 	if !rs.Budget().AllowPeerHandoff {
 		return
@@ -552,6 +758,10 @@ func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskID string) {
 		Description: "Hand a sub-task to another agent directly. Use only for work that is genuinely outside your " +
 			"own remit; the coordinator is notified and sees the result.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in handoffIn) (*mcp.CallToolResult, *delegateOut, error) {
+		taskID := taskOf()
+		if taskID == "" {
+			return toolErr("no task is currently bound to this session"), nil, nil
+		}
 		self, ok := rs.View(taskID)
 		if !ok {
 			return toolErr("your task is no longer active"), nil, nil
@@ -574,6 +784,10 @@ func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskID string) {
 		Description: "Send a question to a task in your own lineage (your parent, your child, or a sibling). " +
 			"The exchange is recorded on both tasks.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in askAgentIn) (*mcp.CallToolResult, any, error) {
+		taskID := taskOf()
+		if taskID == "" {
+			return toolErr("no task is currently bound to this session"), nil, nil
+		}
 		if in.TaskID == taskID {
 			return toolErr("that is your own task"), nil, nil
 		}

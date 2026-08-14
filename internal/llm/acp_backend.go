@@ -31,6 +31,11 @@ import (
 type ACP struct {
 	Command string   // path to an ACP agent binary (e.g. claude-code-acp)
 	Args    []string // extra args for the agent process
+	// ProtectDir is loom's own data directory. Sessions get path-scoped deny
+	// rules shielding its control surfaces (agent definitions and homes'
+	// AGENTS.md/skills, workflow files, run ledgers) from their file tools —
+	// see pathDenyFor. Empty disables the path rules (tests, ad-hoc use).
+	ProtectDir string
 }
 
 func (a *ACP) Name() string { return "acp" }
@@ -67,7 +72,6 @@ func allowedFn(tools string) func(title, kind string) bool {
 		}
 	}
 }
-
 
 // ---- tool jail ----
 //
@@ -119,24 +123,66 @@ func denyListFor(tools string) []string {
 	return deny
 }
 
+// writeCapableTools are the file-writing tools that path-scoped deny rules
+// must cover. Bash is deliberately absent: permission rules cannot see into a
+// shell command line, so for a Bash-granted agent the path rules stop the
+// structured tools' casual overreach while the shell remains a trust boundary
+// — the same trust level as using Claude Code directly.
+var writeCapableTools = []string{"Write", "Edit", "MultiEdit", "NotebookEdit"}
+
+// pathDenyFor computes path-scoped deny rules shielding loom's own state from
+// a session's file tools. The boundary is drawn per-path, not per-tree: agent
+// homes live under the data dir and legitimately serve as scratch space, so
+// only the control surfaces are denied — the files that would let a session
+// rewrite an agent's identity (agent.md, AGENTS.md, private skills), a
+// workflow's configuration, a run's ledger, or its own jail. `//` prefixes an
+// absolute filesystem path in Claude Code's rule syntax.
+func pathDenyFor(protectDir string) []string {
+	pats := []string{"**/.claude/settings.local.json"}
+	if protectDir != "" {
+		if abs, err := filepath.Abs(protectDir); err == nil {
+			protectDir = abs
+		}
+		root := "//" + strings.TrimPrefix(protectDir, "/")
+		pats = append(pats,
+			root+"/workflows/**",
+			root+"/agents/*/agent.md",
+			root+"/agents/*/home/.claude/**",
+			root+"/runs/*/run.json",
+			// AGENTS.md / CLAUDE.md anywhere under the data dir are loaded as
+			// instructions by some future session — planting one is injection.
+			root+"/**/AGENTS.md",
+			root+"/**/CLAUDE.md",
+		)
+	}
+	rules := make([]string, 0, len(writeCapableTools)*len(pats))
+	for _, tool := range writeCapableTools {
+		for _, p := range pats {
+			rules = append(rules, tool+"("+p+")")
+		}
+	}
+	return rules
+}
+
 // writeToolJail materializes the deny rules into the session cwd's
 // .claude/settings.local.json. The file is loom-managed and rewritten on
 // every session open, so an agent's jail always reflects its current
-// allowlist.
-func writeToolJail(workDir, tools string) error {
+// allowlist. Tool-level rules encode the agent's allowlist; path-level rules
+// shield loom's own state even from granted tools.
+func writeToolJail(workDir, tools, protectDir string) error {
 	dir := filepath.Join(workDir, ".claude")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
+	deny := append(denyListFor(tools), pathDenyFor(protectDir)...)
 	data, err := json.MarshalIndent(map[string]any{
-		"permissions": map[string]any{"deny": denyListFor(tools)},
+		"permissions": map[string]any{"deny": deny},
 	}, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "settings.local.json"), data, 0o644)
 }
-
 
 // acpClient implements acp.Client for one session: it streams session updates
 // into the collectors, answers permission requests by policy, and hosts the
@@ -529,7 +575,7 @@ var _ ImageSession = (*acpSession)(nil)
 
 func (a *ACP) Open(ctx context.Context, req SessionRequest) (Session, error) {
 	// Fail closed: without the jail on disk, the allowlist is advisory.
-	if err := writeToolJail(req.WorkDir, req.Tools); err != nil {
+	if err := writeToolJail(req.WorkDir, req.Tools, a.ProtectDir); err != nil {
 		return nil, fmt.Errorf("write tool jail: %w", err)
 	}
 	cmd := exec.Command(a.Command, a.Args...)
