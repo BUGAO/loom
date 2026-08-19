@@ -18,7 +18,7 @@ import (
 func TestDynamicResumeFromInterrupted(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
 
-	run, err := st.NewRun(wf, "build the thing", "mock")
+	run, err := st.NewRun(wf, "build the thing", "mock", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestDynamicResumeFromInterrupted(t *testing.T) {
 // envelope never had the power to pass it.
 func TestDynamicAcceptanceRejectsFalseClaim(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
-	run, err := eng.StartRun(wf, "build the thing, simulate-reject", true)
+	run, err := eng.StartRun(wf, "build the thing, simulate-reject", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestDynamicAcceptanceRejectsFalseClaim(t *testing.T) {
 // round leaves a reply the user can read.
 func TestChatCarriesGoalAndReplies(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
-	run, err := eng.StartRun(wf, "build the thing", true)
+	run, err := eng.StartRun(wf, "build the thing", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestChatCarriesGoalAndReplies(t *testing.T) {
 // ledger, same notes, same conversation — instead of starting a new run.
 func TestReopenFinishedSessionContinues(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
-	run, err := eng.StartRun(wf, "build the thing", true)
+	run, err := eng.StartRun(wf, "build the thing", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestReopenFinishedSessionContinues(t *testing.T) {
 
 func TestReopenRefusedWhileActive(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
-	run, err := eng.StartRun(wf, "build the thing", true)
+	run, err := eng.StartRun(wf, "build the thing", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,25 +200,28 @@ func TestReopenRefusedWhileActive(t *testing.T) {
 	waitTerminal(t, st, run.ID)
 }
 
-// The workflow-output convention end to end: the coordinator names the
-// folder, artifacts land inside it, and deleting the session leaves the
-// deliverables alone.
-func TestOutputDirConvention(t *testing.T) {
+// The workspace convention end to end: a run started without a workspace
+// works in the default root, artifacts land right there, and deleting the
+// session leaves the deliverables alone.
+func TestDefaultWorkspaceConvention(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
-	run, err := eng.StartRun(wf, "build the thing", true)
+	run, err := eng.StartRun(wf, "build the thing", "", true)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if run.Workspace != eng.OutputRoot() {
+		t.Fatalf("a run without a chosen workspace must use the default root, got %q (want %q)", run.Workspace, eng.OutputRoot())
+	}
+	if run.OutputDir != "" || run.OutputName != "" {
+		t.Fatalf("new runs must not carry the legacy output folder fields: %q %q", run.OutputDir, run.OutputName)
 	}
 	final := waitTerminal(t, st, run.ID)
 	if final.Status != model.RunSucceeded {
 		t.Fatalf("setup run failed: %s (%s)", final.Status, final.Error)
 	}
-	if final.OutputName != "mock-run" && !strings.HasPrefix(final.OutputName, "mock-run-") {
-		t.Fatalf("coordinator-chosen output name missing: %q", final.OutputName)
-	}
-	artifact := filepath.Join(final.OutputDir, "mock-a.txt")
+	artifact := filepath.Join(final.Workspace, "mock-a.txt")
 	if _, err := os.Stat(artifact); err != nil {
-		t.Fatalf("deliverable should be in the named output folder: %v", err)
+		t.Fatalf("deliverable should be in the workspace: %v", err)
 	}
 
 	// Deleting the session removes the run record but never the deliverables.
@@ -230,9 +233,71 @@ func TestOutputDirConvention(t *testing.T) {
 	}
 }
 
+// A run started WITH a workspace works there — no separate output folder, no
+// legacy fields — and its workers' artifacts land in that very directory.
+func TestChosenWorkspaceIsTheOnlyDirectory(t *testing.T) {
+	eng, st, wf := dynSetup(t, noApproval())
+	ws := t.TempDir()
+	run, err := eng.StartRun(wf, "build the thing", ws, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Workspace != ws {
+		t.Fatalf("workspace should be the chosen dir, got %q", run.Workspace)
+	}
+	final := waitTerminal(t, st, run.ID)
+	if final.Status != model.RunSucceeded {
+		t.Fatalf("run failed: %s (%s)", final.Status, final.Error)
+	}
+	if final.OutputDir != "" {
+		t.Fatalf("no output folder may be named beside the workspace: %q", final.OutputDir)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "mock-a.txt")); err != nil {
+		t.Fatalf("deliverable should be in the chosen workspace: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(eng.OutputRoot(), "mock-a.txt")); err == nil {
+		t.Fatal("nothing may land in the default root when a workspace was chosen")
+	}
+	// The coordinator's cwd is a private folder, never the workspace and never
+	// something called "workspace".
+	if cwd := st.CoordinatorDir(run.ID); cwd == ws || filepath.Base(cwd) == "workspace" {
+		t.Fatalf("coordinator cwd must not be (or look like) the workspace: %s", cwd)
+	}
+}
+
+// A legacy run — Workspace pointing at a "project" while the work was
+// delivered into OutputDir — resumes in OutputDir: that is where the work is.
+func TestLegacyRunResolvesToOutputDir(t *testing.T) {
+	eng, st, wf := dynSetup(t, noApproval())
+	run, err := eng.StartRun(wf, "build the thing", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := waitTerminal(t, st, run.ID)
+	if final.Status != model.RunSucceeded {
+		t.Fatalf("setup run failed: %s (%s)", final.Status, final.Error)
+	}
+	// Forge the pre-unification shape on disk.
+	legacyOut := t.TempDir()
+	os.Rename(filepath.Join(final.Workspace, "mock-a.txt"), filepath.Join(legacyOut, "mock-a.txt"))
+	final.Workspace = t.TempDir() // the old "project" pointer, empty
+	final.OutputDir = legacyOut
+	final.OutputName = filepath.Base(legacyOut)
+	if err := st.SaveRun(final); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.ReopenRun(run.ID, "continue"); err != nil {
+		t.Fatal(err)
+	}
+	second := waitTerminal(t, st, run.ID)
+	if second.Workspace != legacyOut {
+		t.Fatalf("legacy run should resume in its output dir %s, got %s", legacyOut, second.Workspace)
+	}
+}
+
 func TestResumeRefusedForNonInterrupted(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
-	run, err := eng.StartRun(wf, "build the thing", true)
+	run, err := eng.StartRun(wf, "build the thing", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +338,7 @@ func TestIndependentNodePromptOmitsUpstreamSummaries(t *testing.T) {
 	}
 
 	independent := &model.Agent{Name: "critic", Independent: true, Tools: "Read"}
-	prompt := eng.buildNodePrompt(run, run.Plan.Nodes[1], independent, nodeByID)
+	prompt := eng.buildNodePrompt(run, run.Plan.Nodes[1], independent, nodeByID, t.TempDir())
 	if strings.Contains(prompt, "AUTHOR-SELF-REPORT") {
 		t.Fatal("independent verifier's prompt leaked the author's self-summary")
 	}
@@ -282,7 +347,7 @@ func TestIndependentNodePromptOmitsUpstreamSummaries(t *testing.T) {
 	}
 
 	regular := &model.Agent{Name: "critic", Tools: "Read"}
-	prompt = eng.buildNodePrompt(run, run.Plan.Nodes[1], regular, nodeByID)
+	prompt = eng.buildNodePrompt(run, run.Plan.Nodes[1], regular, nodeByID, t.TempDir())
 	if !strings.Contains(prompt, "AUTHOR-SELF-REPORT") {
 		t.Fatal("a regular agent should still receive upstream summaries")
 	}
@@ -292,7 +357,7 @@ func TestIndependentNodePromptOmitsUpstreamSummaries(t *testing.T) {
 // rounds are audit trail, not scratch.
 func TestReopenAppendsCoordinatorTranscript(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
-	run, err := eng.StartRun(wf, "build the thing", true)
+	run, err := eng.StartRun(wf, "build the thing", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +394,7 @@ func TestReopenAppendsCoordinatorTranscript(t *testing.T) {
 func TestGoalImagesPersistAndDegrade(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
 	png := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3}
-	run, err := eng.StartRun(wf, "look at the pasted screenshot", true,
+	run, err := eng.StartRun(wf, "look at the pasted screenshot", "", true,
 		llm.Image{MimeType: "image/png", Data: png})
 	if err != nil {
 		t.Fatal(err)
@@ -352,7 +417,7 @@ func TestGoalImagesPersistAndDegrade(t *testing.T) {
 
 func TestGoalImagesRejectUnsupportedType(t *testing.T) {
 	eng, _, wf := dynSetup(t, noApproval())
-	_, err := eng.StartRun(wf, "goal", true, llm.Image{MimeType: "image/tiff", Data: []byte{1}})
+	_, err := eng.StartRun(wf, "goal", "", true, llm.Image{MimeType: "image/tiff", Data: []byte{1}})
 	if err == nil || !strings.Contains(err.Error(), "unsupported image type") {
 		t.Fatalf("expected unsupported-type refusal, got %v", err)
 	}

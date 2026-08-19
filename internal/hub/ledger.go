@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -38,13 +37,20 @@ type RunConfig struct {
 	Run      *model.Run
 	Workflow *model.Workflow
 	Pool     []*model.Agent
-	// Workspace is the internal fallback exchange directory; once the run's
-	// output folder is named (by the coordinator or the auto-freeze), the
-	// output folder IS the exchange directory.
+	// Workspace is THE directory of this run: the project the workers read
+	// and modify, and where every deliverable lands. The user chose it in
+	// the UI (or got the default output root); the engine resolves it before
+	// opening the run and nothing renames it afterwards.
 	Workspace string
-	// OutputRoot is where named output folders live (~/workflow-output).
-	OutputRoot string
-	Exec       Executor
+	Exec      Executor
+	// ProtectDir is loom's data directory: the hook gate refuses writes to
+	// its control surfaces from every session. Empty disables that rule.
+	ProtectDir string
+	// PilotTools is the allowlist the main agent's session was opened with
+	// ("" = no file tools — the pre-pilot coordinator). The gate enforces it
+	// per identity, so a session sharing its cwd with others cannot borrow
+	// a wider jail.
+	PilotTools string
 
 	// OnChange persists and publishes a run snapshot. It is called with the
 	// session lock held, so it must not call back into the RunSession.
@@ -60,6 +66,9 @@ type RunConfig struct {
 	// postmortem — as a PENDING record only; the user approves or rejects it,
 	// and only approved lessons are injected into future runs.
 	SaveLesson func(*model.Lesson) error
+	// Templates lists the static workflows the main agent may run as a single
+	// task (run_template). nil = none offered.
+	Templates func() []*model.Workflow
 }
 
 // ErrApprovalPending is returned when work is requested before a human has
@@ -102,6 +111,7 @@ type Verdict struct {
 	Status    string // succeeded | failed
 	Summary   string
 	Artifacts []string
+	Evidence  []EvidenceResult // finish-time report on the declared proofs
 }
 
 // RunSession is the ledger and policy engine for one dynamic run.
@@ -136,16 +146,16 @@ type RunSession struct {
 	// coordinator liveness / stall detection
 	lastTransition time.Time
 	pendingNotice  string
+	// lastDraftPublish throttles the streamed reply draft's republishing.
+	lastDraftPublish time.Time
 
-	// outputFrozen pins the exchange directory once the first task has been
-	// dispatched: prompts and contracts reference the path from then on.
-	outputFrozen bool
-	// outputBaseName is the topic name the coordinator last passed to
-	// SetOutputName, BEFORE collision suffixing. Repeating the same name
-	// (name_output, then propose_plan carrying output_name again) must be a
-	// no-op — re-claiming used to collide with the run's own first claim and
-	// silently move the run to "<topic>-2", orphaning the first directory.
-	outputBaseName string
+	// assessment / triage state (see triage.go)
+	assessPending        bool
+	assessReason         string
+	writesAtAssess       int // len(run.Writes) when the last assessment was filed
+	testFailsSinceAssess int
+	reassessNoticed      bool
+	listenerFails        int
 
 	// inspections counts the coordinator's audited reads of run deliverables.
 	// finish_run(succeeded) is refused while it is zero and artifacts exist:
@@ -158,9 +168,10 @@ type RunSession struct {
 	// carries the drained messages.
 	pendingChat []model.ChatMessage
 
-	// pairTaskID is the task the resident implementer session is currently
-	// bound to ("" between tasks); see SetPairTask.
-	pairTaskID string
+	// pairTasks maps each resident partner (agent name) to the task its
+	// session is currently bound to ("" / absent between tasks); see
+	// SetPairTask.
+	pairTasks map[string]string
 
 	// seq increments on every ledger transition; the round driver compares it
 	// across rounds to detect a coordinator that acts without effect.
@@ -211,117 +222,9 @@ func (rs *RunSession) newTaskCtrl() *taskCtrl {
 // Run returns the live run object. Callers must not mutate it.
 func (rs *RunSession) Run() *model.Run { return rs.run }
 
-// Workspace is the run's shared exchange directory: the named output folder
-// once one exists, the internal fallback until then.
-func (rs *RunSession) Workspace() string {
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	if rs.run.OutputDir != "" {
-		return rs.run.OutputDir
-	}
-	return rs.workspace
-}
-
-// outputNameRe is the shape of a deliverable folder name: short, kebab, no
-// path tricks.
-var outputNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
-
-// SetOutputName names the run's deliverable folder under the output root.
-// Refused once frozen (first task dispatched): workers already received the
-// old path in their prompts, and a contract's artifact paths must not move
-// under a running task.
-func (rs *RunSession) SetOutputName(name string) error {
-	name = strings.TrimSpace(name)
-	if !outputNameRe.MatchString(name) {
-		return fmt.Errorf("output name %q is invalid: use a short kebab-case topic name, e.g. \"trading-health-check\"", name)
-	}
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	if rs.outputFrozen {
-		return fmt.Errorf("the output folder is already %s and tasks have been dispatched against it; it cannot be renamed", rs.run.OutputDir)
-	}
-	if rs.run.OutputDir != "" && rs.outputBaseName == name {
-		return nil // same topic, same folder — nothing to do
-	}
-	if rs.cfg.OutputRoot == "" {
-		return fmt.Errorf("no output root is configured for this run")
-	}
-	dir, finalName, err := claimOutputDir(rs.cfg.OutputRoot, name)
-	if err != nil {
-		return err
-	}
-	rs.releaseOutputDirLocked(dir)
-	rs.outputBaseName = name
-	rs.run.OutputName = finalName
-	rs.run.OutputDir = dir
-	rs.appendEventLocked("info", "", "output folder named: "+dir)
-	rs.notifyLocked()
-	return nil
-}
-
-// releaseOutputDirLocked drops the run's previous pre-freeze output claim when
-// it is being replaced by newDir. Only an EMPTY directory is removed —
-// os.Remove refuses non-empty ones, which is exactly the safety wanted: a
-// rename never deletes work. Must hold rs.mu.
-func (rs *RunSession) releaseOutputDirLocked(newDir string) {
-	if old := rs.run.OutputDir; old != "" && old != newDir {
-		if err := os.Remove(old); err == nil {
-			rs.appendEventLocked("info", "", "released empty output folder: "+old)
-		}
-	}
-}
-
-// claimOutputDir creates root/name, suffixing -2, -3… when the name is taken.
-// The claim is os.Mkdir itself — atomic at the filesystem, so two sessions (or
-// two loom processes) racing for the same topic cannot both win: the loser
-// sees EEXIST and moves to the next suffix.
-func claimOutputDir(root, name string) (dir, finalName string, err error) {
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return "", "", err
-	}
-	for i := 0; i < 50; i++ {
-		candidate := name
-		if i > 0 {
-			candidate = fmt.Sprintf("%s-%d", name, i+1)
-		}
-		dir := filepath.Join(root, candidate)
-		switch err := os.Mkdir(dir, 0o755); {
-		case err == nil:
-			return dir, candidate, nil
-		case errors.Is(err, os.ErrExist):
-			continue // taken; try the next suffix
-		default:
-			return "", "", err
-		}
-	}
-	return "", "", fmt.Errorf("could not find a free output folder name for %q", name)
-}
-
-// freezeOutputLocked pins the exchange directory before the first dispatch,
-// auto-naming when the coordinator never did. Must hold rs.mu.
-func (rs *RunSession) freezeOutputLocked() {
-	if rs.outputFrozen {
-		return
-	}
-	if rs.run.OutputDir == "" && rs.cfg.OutputRoot != "" {
-		auto := fmt.Sprintf("%s-%s", time.Now().Format("0102"), shortRunID(rs.run.ID))
-		if dir, finalName, err := claimOutputDir(rs.cfg.OutputRoot, auto); err == nil {
-			rs.run.OutputName = finalName
-			rs.run.OutputDir = dir
-			rs.appendEventLocked("info", "", "output folder auto-named: "+dir)
-		} else {
-			rs.appendEventLocked("error", "", "output folder could not be created ("+err.Error()+"); using the internal exchange directory")
-		}
-	}
-	rs.outputFrozen = true
-}
-
-func shortRunID(id string) string {
-	if len(id) > 8 {
-		return id[len(id)-8:]
-	}
-	return id
-}
+// Workspace is THE directory of this run — project and deliverables alike.
+// Fixed at open; the same value every prompt and contract of the run names.
+func (rs *RunSession) Workspace() string { return rs.workspace }
 
 // Budget is the effective budget for this run.
 func (rs *RunSession) Budget() model.BudgetConfig { return rs.budget }
@@ -493,6 +396,10 @@ type DelegateRequest struct {
 	Title       string
 	Instruction string
 	Constraints string // cross-domain constraints the worker cannot infer; required for internal callers
+	// Scope is the workspace paths this task owns while in flight (files or
+	// directory prefixes, relative to the workspace). Optional; the hook gate
+	// enforces it both ways. "." means the whole workspace.
+	Scope       []string
 	ContextHint string
 	CreatedBy   string // "coordinator" | "external" | parent task id
 	Depth       int
@@ -574,6 +481,14 @@ func (rs *RunSession) Delegate(req DelegateRequest) (*model.Task, error) {
 	}
 	internal := req.CreatedBy != CreatedByExternal
 	if internal {
+		if err := rs.assessGateLocked(); err != nil {
+			rs.mu.Unlock()
+			return nil, err
+		}
+		if err := rs.evidenceGateLocked(); err != nil {
+			rs.mu.Unlock()
+			return nil, err
+		}
 		if strings.TrimSpace(req.Constraints) == "" {
 			rs.mu.Unlock()
 			return nil, fmt.Errorf("constraints is required: state the cross-domain constraints this worker cannot infer " +
@@ -647,6 +562,7 @@ func (rs *RunSession) Delegate(req DelegateRequest) (*model.Task, error) {
 		Title:       strings.TrimSpace(req.Title),
 		Instruction: req.Instruction,
 		Constraints: strings.TrimSpace(req.Constraints),
+		Scope:       NormalizeScope(req.Scope, rs.workspace),
 		CreatedBy:   req.CreatedBy,
 		RetryOf:     retryOf,
 		Depth:       req.Depth,
@@ -680,6 +596,97 @@ func (rs *RunSession) Delegate(req DelegateRequest) (*model.Task, error) {
 	return t, nil
 }
 
+// TemplateRequest asks for a static workflow template to be run as ONE task
+// of this dynamic run: the engine plans and executes the template's DAG in
+// the same workspace, and the task settles with the template run's outcome.
+type TemplateRequest struct {
+	TemplateID string
+	Title      string
+	Goal       string
+}
+
+// DelegateTemplate creates a template task. It passes the same gates as a
+// delegate (assessment, evidence, approval, task budget) — a template is a
+// bigger hammer, not a side door.
+func (rs *RunSession) DelegateTemplate(req TemplateRequest) (*model.Task, error) {
+	var tpl *model.Workflow
+	if rs.cfg.Templates != nil {
+		for _, w := range rs.cfg.Templates() {
+			if w.ID == req.TemplateID {
+				tpl = w
+			}
+		}
+	}
+	if tpl == nil {
+		return nil, fmt.Errorf("unknown template %q; call list_templates for what is available", req.TemplateID)
+	}
+	if strings.TrimSpace(req.Goal) == "" {
+		return nil, fmt.Errorf("goal is required: the self-contained goal the template's planner will decompose")
+	}
+	rs.mu.Lock()
+	if rs.closed {
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("this run has ended; no further tasks can be created")
+	}
+	if rs.approvalNeeded && !rs.approvalDone {
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("%w: this run is awaiting human approval of its initial plan, so no task can be created yet", ErrApprovalPending)
+	}
+	if n := len(rs.run.Tasks); n >= rs.budget.MaxTasks {
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("task budget exhausted: %d of %d tasks already created", n, rs.budget.MaxTasks)
+	}
+	if err := rs.assessGateLocked(); err != nil {
+		rs.mu.Unlock()
+		return nil, err
+	}
+	if err := rs.evidenceGateLocked(); err != nil {
+		rs.mu.Unlock()
+		return nil, err
+	}
+	now := time.Now()
+	t := &model.Task{
+		ID:          store.NewTaskID(),
+		Agent:       model.TemplateAgentPrefix + tpl.ID,
+		Title:       strings.TrimSpace(req.Title),
+		Instruction: req.Goal,
+		CreatedBy:   RoleCoordinator,
+		Depth:       1,
+		Status:      model.TaskSubmitted,
+		CreatedAt:   now,
+	}
+	if t.Title == "" {
+		t.Title = tpl.Name + ": " + firstLine(req.Goal, 50)
+	}
+	t.Messages = append(t.Messages, model.TaskMessage{Ts: now, From: RoleCoordinator, Role: model.MsgInstruction, Text: req.Goal})
+	rs.run.Tasks[t.ID] = t
+	rs.run.TaskOrder = append(rs.run.TaskOrder, t.ID)
+	rs.ctrl[t.ID] = rs.newTaskCtrl()
+	rs.notifyLocked()
+	rs.mu.Unlock()
+	rs.event("task_created", t.ID, fmt.Sprintf("coordinator → template %s (%s): %s", tpl.ID, tpl.Name, t.Title))
+	rs.schedule()
+	return t, nil
+}
+
+// SetSubRun links a template task to the static run driving it.
+func (rs *RunSession) SetSubRun(taskID, runID string) {
+	rs.mu.Lock()
+	if t := rs.run.Tasks[taskID]; t != nil {
+		t.SubRunID = runID
+	}
+	rs.persistLocked()
+	rs.mu.Unlock()
+}
+
+// Templates is the list offered to the main agent.
+func (rs *RunSession) Templates() []*model.Workflow {
+	if rs.cfg.Templates == nil {
+		return nil
+	}
+	return rs.cfg.Templates()
+}
+
 // schedule dispatches as many queued tasks as the parallelism budget allows.
 //
 // A slot is held from dispatch until the task is terminal — including while it
@@ -692,7 +699,6 @@ func (rs *RunSession) schedule() {
 		rs.mu.Unlock()
 		return
 	}
-	rs.freezeOutputLocked() // the first dispatch pins the exchange directory
 	occupied := 0
 	var queue []string
 	for _, id := range rs.run.TaskOrder {
@@ -824,6 +830,13 @@ func (rs *RunSession) CompleteTaskWith(taskID, summary string, artifacts []strin
 	}
 	if acceptance != nil {
 		t.AcceptanceResults = acceptance
+		for _, r := range acceptance {
+			if !r.Passed && r.Check.Kind == model.CheckCommand {
+				rs.testFailsSinceAssess++
+				break
+			}
+		}
+		rs.noteReassessLocked()
 	}
 	to := model.TaskCompleted
 	if taskErr != nil {
@@ -1217,17 +1230,6 @@ func describeChecks(checks []model.AcceptanceCheck) string {
 	return b.String()
 }
 
-// OutputInfo reports the current exchange directory and whether it carries a
-// coordinator-chosen name — the locked read the round prompt builds from.
-func (rs *RunSession) OutputInfo() (dir string, named bool) {
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	if rs.run.OutputDir != "" {
-		return rs.run.OutputDir, true
-	}
-	return rs.workspace, false
-}
-
 // Notes returns a copy of the coordinator's persisted notes.
 func (rs *RunSession) Notes() []string {
 	rs.mu.Lock()
@@ -1589,7 +1591,7 @@ const maxArtifactWriteBytes = 512 * 1024
 
 // WriteArtifact is the hub's delivery channel for worker output: any worker —
 // including a pure-reasoning agent with no file tools at all — can persist a
-// document into the exchange directory through it. It exists so that "large
+// document into the workspace through it. It exists so that "large
 // text goes into md files, never into messages" is an enforceable rule rather
 // than advice a no-tool agent cannot follow.
 func (rs *RunSession) WriteArtifact(taskID, path, content string, appendTo bool) error {
@@ -1662,7 +1664,7 @@ func appendUnique(list []string, s string) []string {
 // ---- coordinator round support ----
 
 // Inspect is the coordinator's audited read of a run deliverable: a file under
-// the exchange directory, returned truncated, counted, and logged. It is the
+// the workspace, returned truncated, counted, and logged. It is the
 // only read access the coordinator has — its session gets no file tools — so
 // every look at the work leaves a ledger trace.
 const maxInspectBytes = 16 * 1024
@@ -1673,7 +1675,7 @@ func (rs *RunSession) Inspect(path string) (string, error) {
 	}
 	data, err := os.ReadFile(filepath.Join(rs.Workspace(), path))
 	if err != nil {
-		return "", fmt.Errorf("cannot read %q: %v. Inspect paths are relative to the exchange directory; "+
+		return "", fmt.Errorf("cannot read %q: %v. Inspect paths are relative to the workspace; "+
 			"check the artifact list of the task that claimed to produce it", path, err)
 	}
 	truncated := false
@@ -1720,27 +1722,34 @@ func (rs *RunSession) AddNote(text string) {
 
 // ---- pair (resident implementer) task binding ----
 
-// SetPairTask binds the resident implementer session to the task it is
-// currently working; "" unbinds. The engine sets it around each pair task's
-// turns, and every pair-credential tool call resolves through it.
-func (rs *RunSession) SetPairTask(taskID string) {
+// SetPairTask binds a resident partner's session to the task it is currently
+// working; "" unbinds. The engine sets it around each pair task's turns, and
+// every pair-credential tool call resolves through it.
+func (rs *RunSession) SetPairTask(agent, taskID string) {
 	rs.mu.Lock()
-	rs.pairTaskID = taskID
+	if rs.pairTasks == nil {
+		rs.pairTasks = map[string]string{}
+	}
+	if taskID == "" {
+		delete(rs.pairTasks, agent)
+	} else {
+		rs.pairTasks[agent] = taskID
+	}
 	rs.mu.Unlock()
 }
 
-// PairTask returns the task currently bound to the resident implementer
-// session, or "".
-func (rs *RunSession) PairTask() string {
+// PairTask returns the task currently bound to a resident partner's session,
+// or "".
+func (rs *RunSession) PairTask(agent string) string {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	return rs.pairTaskID
+	return rs.pairTasks[agent]
 }
 
 // ---- project memory ----
 
 // projectMemoryFile is the durable, cross-run memory of the PROJECT, living in
-// the exchange directory where the user can read and edit it. run-scoped
+// the workspace where the user can read and edit it. run-scoped
 // strategy goes in notes; what the NEXT run must not relearn goes here.
 const projectMemoryFile = "PROJECT.md"
 
@@ -1754,7 +1763,7 @@ const (
 	projectMemoryTail = 1600
 )
 
-// RecordProjectFact appends one durable fact to the exchange directory's
+// RecordProjectFact appends one durable fact to the workspace's
 // PROJECT.md, creating it with a header on first use. Audited like any other
 // coordinator action.
 func (rs *RunSession) RecordProjectFact(text string) error {
@@ -1784,7 +1793,7 @@ func (rs *RunSession) RecordProjectFact(text string) error {
 	return nil
 }
 
-// ProjectMemory returns the (capped) content of the exchange directory's
+// ProjectMemory returns the (capped) content of the workspace's
 // PROJECT.md, or "" when none exists.
 func (rs *RunSession) ProjectMemory() string {
 	return ReadProjectMemory(rs.Workspace())
@@ -1798,7 +1807,7 @@ func ReadProjectMemory(dir string) string {
 		return ""
 	}
 	return clipHeadTail(strings.TrimSpace(string(data)), projectMemoryCap-projectMemoryTail, projectMemoryTail,
-		"…[middle truncated — read the full PROJECT.md in the exchange directory]")
+		"…[middle truncated — read the full PROJECT.md in the workspace]")
 }
 
 // clipHeadTail bounds s to roughly headCap+tailCap bytes by eliding the
@@ -1942,46 +1951,6 @@ func (rs *RunSession) AskUser(text string) error {
 	return nil
 }
 
-// SetOutputDir points the run's deliverable folder at a user-chosen absolute
-// path instead of the default output root — the user said where the work
-// should land, and that wish is honored verbatim (no -2 suffixing: an existing
-// directory is used as-is). Same freeze rules as SetOutputName.
-func (rs *RunSession) SetOutputDir(dir string) error {
-	dir = strings.TrimSpace(dir)
-	if dir == "~" || strings.HasPrefix(dir, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("cannot resolve ~: %v", err)
-		}
-		dir = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(dir, "~"), "/"))
-	}
-	if !filepath.IsAbs(dir) {
-		return fmt.Errorf("output dir must be an absolute path (or start with ~/); got %q", dir)
-	}
-	dir = filepath.Clean(dir)
-	if home, err := os.UserHomeDir(); dir == "/" || (err == nil && dir == home) {
-		return fmt.Errorf("output dir %q is too broad; use a dedicated subdirectory", dir)
-	}
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	if rs.outputFrozen {
-		return fmt.Errorf("the output folder is already %s and tasks have been dispatched against it; it cannot be moved", rs.run.OutputDir)
-	}
-	if rs.run.OutputDir == dir {
-		return nil // already there
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("cannot create %s: %v", dir, err)
-	}
-	rs.releaseOutputDirLocked(dir)
-	rs.outputBaseName = ""
-	rs.run.OutputName = filepath.Base(dir)
-	rs.run.OutputDir = dir
-	rs.appendEventLocked("info", "", "output folder set by user request: "+dir)
-	rs.notifyLocked()
-	return nil
-}
-
 // ChatHistory returns the user↔coordinator conversation so far, excluding the
 // given messages (the ones a round prompt is about to deliver as new — they
 // must not appear twice). Matching is by timestamp+sender+text; worker
@@ -2021,15 +1990,60 @@ func (rs *RunSession) TakeUserChat() []model.ChatMessage {
 // still trip the no-progress guard.
 func (rs *RunSession) CoordinatorReply(text string) {
 	text = strings.TrimSpace(text)
-	if text == "" {
-		return
-	}
 	rs.mu.Lock()
-	rs.run.Chat = append(rs.run.Chat, model.ChatMessage{Ts: time.Now(), From: "coordinator", Text: text})
+	defer rs.mu.Unlock()
+	// The round is over: its streamed draft and trace are committed or dropped.
+	if c := rs.run.Coordinator; c != nil {
+		c.Draft = ""
+		c.Trace = nil
+	}
+	if text != "" {
+		rs.run.Chat = append(rs.run.Chat, model.ChatMessage{Ts: time.Now(), From: "coordinator", Text: text})
+	}
 	if rs.cfg.OnChange != nil {
 		rs.cfg.OnChange(rs.run)
 	}
-	rs.mu.Unlock()
+}
+
+// CoordinatorDraft streams the round's reply text as it is produced: the
+// whole text so far, republished at most every draftPublishEvery so a fast
+// model does not turn the event stream into a firehose.
+func (rs *RunSession) CoordinatorDraft(text string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	c := rs.run.Coordinator
+	if c == nil {
+		return
+	}
+	c.Draft = text
+	if now := time.Now(); now.Sub(rs.lastDraftPublish) >= draftPublishEvery || text == "" {
+		rs.lastDraftPublish = now
+		if rs.cfg.OnChange != nil {
+			rs.cfg.OnChange(rs.run)
+		}
+	}
+}
+
+const draftPublishEvery = 250 * time.Millisecond
+const maxTrace = 40
+
+// CoordinatorTrace appends one tool activity line to the round's live trace
+// (and keeps Activity, the one-line card, current).
+func (rs *RunSession) CoordinatorTrace(line string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	c := rs.run.Coordinator
+	if c == nil {
+		return
+	}
+	c.Activity = line
+	c.Trace = append(c.Trace, line)
+	if len(c.Trace) > maxTrace {
+		c.Trace = append([]string(nil), c.Trace[len(c.Trace)-maxTrace:]...)
+	}
+	if rs.cfg.OnChange != nil {
+		rs.cfg.OnChange(rs.run)
+	}
 }
 
 // InjectNotice queues a one-shot system notice for the coordinator and wakes
@@ -2096,6 +2110,20 @@ func (rs *RunSession) Finish(v *Verdict) error {
 		rs.mu.Unlock()
 		return fmt.Errorf("finish_run was already called for this run")
 	}
+	// The definition of done decides "succeeded", not the summary: every
+	// declared proof must be reported met, with how it was verified. Anything
+	// less is a failed run that says what is missing — which is still a
+	// perfectly good outcome, just an honest one.
+	if err := rs.settleEvidenceLocked(v); err != nil {
+		rs.mu.Unlock()
+		return err
+	}
+	if v.Status == model.RunSucceeded {
+		if err := rs.reviewGateLocked(); err != nil {
+			rs.mu.Unlock()
+			return err
+		}
+	}
 	// Success may not be declared sight-unseen: if any completed task produced
 	// artifacts, at least one must have been read via inspect. This is the
 	// mechanical floor under "the coordinator verifies before signing off" —
@@ -2105,7 +2133,7 @@ func (rs *RunSession) Finish(v *Verdict) error {
 			if t.Status == model.TaskCompleted && len(t.Artifacts) > 0 {
 				rs.mu.Unlock()
 				return fmt.Errorf("cannot declare success without having read any deliverable: use the inspect tool " +
-					"on at least one artifact in the exchange directory first, then call finish_run again")
+					"on at least one artifact in the workspace first, then call finish_run again")
 			}
 		}
 	}
@@ -2118,6 +2146,257 @@ func (rs *RunSession) Finish(v *Verdict) error {
 	rs.mu.Unlock()
 	rs.event("run_status", "", "coordinator verdict: "+v.Status+" — "+firstLine(v.Summary, 160))
 	return nil
+}
+
+// ---- definition of done ----
+
+// EvidenceItem is one declared proof, as the coordinator's tools pass it.
+type EvidenceItem struct {
+	Claim         string
+	NeedsFromUser string
+}
+
+// EvidenceResult is the coordinator's finish-time report on one declared
+// proof, matched to the declaration by claim text.
+type EvidenceResult struct {
+	Claim string
+	Met   bool
+	How   string
+}
+
+const maxEvidenceItems = 12
+
+// DeclareEvidence sets (or replaces) the run's definition of done. Allowed
+// any time before the verdict — a goal that changes mid-run changes its
+// proofs — but the FIRST delegation waits for it (see evidenceGateLocked).
+func (rs *RunSession) DeclareEvidence(items []EvidenceItem) error {
+	var clean []model.GoalEvidence
+	for _, it := range items {
+		claim := strings.TrimSpace(it.Claim)
+		if claim == "" {
+			continue
+		}
+		clean = append(clean, model.GoalEvidence{Claim: claim, NeedsFromUser: strings.TrimSpace(it.NeedsFromUser)})
+	}
+	if len(clean) == 0 {
+		return fmt.Errorf("declare at least one observable proof of the goal — what would an outsider check to see it is met " +
+			"(a file that exists with X, a command that exits 0, an email that arrives, a page that renders)? " +
+			"Not \"the tasks completed\": that is activity, not outcome")
+	}
+	if len(clean) > maxEvidenceItems {
+		return fmt.Errorf("at most %d proofs: state the few that decide the goal, not a task list", maxEvidenceItems)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.verdict != nil {
+		return fmt.Errorf("the run already has a verdict")
+	}
+	// Re-declaration keeps settled state for claims that survive verbatim.
+	prev := map[string]model.GoalEvidence{}
+	for _, e := range rs.run.Evidence {
+		prev[strings.ToLower(e.Claim)] = e
+	}
+	for i := range clean {
+		if old, ok := prev[strings.ToLower(clean[i].Claim)]; ok {
+			clean[i].Met, clean[i].How = old.Met, old.How
+		}
+	}
+	rs.run.Evidence = clean
+	rs.appendEventLocked("info", "", fmt.Sprintf("definition of done declared: %d proof(s)", len(clean)))
+	rs.notifyLocked()
+	return nil
+}
+
+// Evidence returns a copy of the declared proofs.
+func (rs *RunSession) Evidence() []model.GoalEvidence {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return append([]model.GoalEvidence(nil), rs.run.Evidence...)
+}
+
+// evidenceGateLocked is the precondition for the coordinator's first (and
+// every) delegation: the definition of done exists, and any proof that needs
+// something from the user has been preceded by an ask_user — you cannot
+// build toward "an email arrives" while never asking for a way to send one.
+// Must hold rs.mu.
+func (rs *RunSession) evidenceGateLocked() error {
+	if len(rs.run.Evidence) == 0 {
+		return fmt.Errorf("declare the definition of done first: call declare_evidence with the observable proofs that " +
+			"would show the goal is met (or pass evidence in propose_plan). No task can be created before that — " +
+			"planning without a finish line is how runs end \"succeeded\" with the goal unmet")
+	}
+	if rs.userAskedLocked() {
+		return nil
+	}
+	for _, e := range rs.run.Evidence {
+		if e.NeedsFromUser != "" {
+			return fmt.Errorf("proof %q depends on something only the user can supply (%s), and you have not asked "+
+				"them yet: call ask_user for it now (batch it with any other question) and end your turn — build "+
+				"only once you know whether it can be had", e.Claim, e.NeedsFromUser)
+		}
+	}
+	return nil
+}
+
+// userAskedLocked reports whether this run has ever asked the user a question
+// (any activation — the audit log persists). Must hold rs.mu.
+func (rs *RunSession) userAskedLocked() bool {
+	for _, ev := range rs.run.Events {
+		if ev.Type == "user_question" {
+			return true
+		}
+	}
+	return false
+}
+
+// settleEvidenceLocked records the finish-time results against the declared
+// proofs and decides whether "succeeded" is available. Must hold rs.mu.
+func (rs *RunSession) settleEvidenceLocked(v *Verdict) error {
+	if len(rs.run.Evidence) == 0 {
+		if v.Status == model.RunSucceeded {
+			return fmt.Errorf("cannot declare success: no definition of done was ever declared for this run. " +
+				"Call declare_evidence with the observable proofs of the goal, report each one in finish_run's " +
+				"evidence, and finish again")
+		}
+		return nil // failing without a definition of done is allowed: it is honest
+	}
+	byClaim := map[string]EvidenceResult{}
+	for _, r := range v.Evidence {
+		byClaim[strings.ToLower(strings.TrimSpace(r.Claim))] = r
+	}
+	var unmet, unreported []string
+	for i := range rs.run.Evidence {
+		e := &rs.run.Evidence[i]
+		r, ok := byClaim[strings.ToLower(e.Claim)]
+		if !ok {
+			unreported = append(unreported, e.Claim)
+			continue
+		}
+		e.Met = r.Met
+		e.How = strings.TrimSpace(r.How)
+		if !r.Met {
+			unmet = append(unmet, e.Claim)
+		} else if e.How == "" && v.Status == model.RunSucceeded {
+			return fmt.Errorf("proof %q is reported met but with no verification: say HOW you know (which task's "+
+				"acceptance command, which inspected file, which observed effect)", e.Claim)
+		}
+	}
+	if v.Status != model.RunSucceeded {
+		return nil
+	}
+	if len(unreported) > 0 {
+		return fmt.Errorf("finish_run(succeeded) must report every declared proof; missing: %q. Report each with met "+
+			"and how — or, if one is not met, finish as failed and say what is missing", unreported)
+	}
+	if len(unmet) > 0 {
+		return fmt.Errorf("cannot declare success while these proofs are not met: %q. Either make them true (delegate the "+
+			"work, ask the user for what is missing) or finish as failed with an honest account of the gap", unmet)
+	}
+	return nil
+}
+
+// reviewGateLocked refuses "succeeded" while the newest implementation work
+// stands unreviewed — when the pool has an independent agent to review it.
+// Implementation work is a completed task run by an agent that can change
+// code (Edit or Bash); a review is a completed task run by an independent
+// agent AFTER that. Documentation-only writers (Write alone) do not count as
+// implementation. Must hold rs.mu.
+func (rs *RunSession) reviewGateLocked() error {
+	var reviewers []string
+	for name, a := range rs.pool {
+		if a.Independent {
+			reviewers = append(reviewers, name)
+		}
+	}
+	if len(reviewers) == 0 {
+		return nil // nobody could review; the prompt already says so
+	}
+	sort.Strings(reviewers)
+	var lastImpl *model.Task
+	var lastReview time.Time
+	for _, t := range rs.run.Tasks {
+		if t.Status != model.TaskCompleted {
+			continue
+		}
+		a := rs.pool[t.Agent]
+		if a == nil {
+			continue
+		}
+		switch {
+		case a.Independent:
+			if t.EndedAt.After(lastReview) {
+				lastReview = t.EndedAt
+			}
+		case agentChangesCode(a):
+			if lastImpl == nil || t.EndedAt.After(lastImpl.EndedAt) {
+				lastImpl = t
+			}
+		}
+	}
+	// The main agent's own hands count too: a pilot that edits code after the
+	// last review has unreviewed work exactly like a worker would.
+	var lastOwn *model.WriteRecord
+	ownCount := 0
+	for i := range rs.run.Writes {
+		w := &rs.run.Writes[i]
+		if w.By != RoleCoordinator || !writeChangesCode(w) {
+			continue
+		}
+		if w.Ts.After(lastReview) {
+			ownCount++
+		}
+		if lastOwn == nil || w.Ts.After(lastOwn.Ts) {
+			lastOwn = w
+		}
+	}
+	if lastOwn != nil && lastOwn.Ts.After(lastReview) && (lastImpl == nil || lastOwn.Ts.After(lastImpl.EndedAt)) {
+		what := lastOwn.Path
+		if what == "" {
+			what = "shell: " + lastOwn.Command
+		}
+		return fmt.Errorf("your own code changes have not been independently reviewed (%d since the last review; latest: %s). "+
+			"Delegate a review to %s covering what you changed (paths in the instruction; acceptance: a findings file), act on "+
+			"blocking findings, then finish_run again — the review must come AFTER the last code change",
+			ownCount, what, strings.Join(reviewers, " or "))
+	}
+	if lastImpl == nil || !lastReview.Before(lastImpl.EndedAt) {
+		return nil
+	}
+	return fmt.Errorf("the latest implementation work (%s %q, by %s) has not been independently reviewed. Delegate a "+
+		"review to %s covering the changed artifacts (paths in the instruction; acceptance: a findings file), act on "+
+		"blocking findings, then finish_run again — the review must come AFTER the last code change",
+		lastImpl.ID, lastImpl.Title, lastImpl.Agent, strings.Join(reviewers, " or "))
+}
+
+// writeChangesCode reports whether an attributed write is implementation
+// work: a shell write, or a structured write to anything but a document
+// (markdown/text, or under docs/). Documents never need code review.
+func writeChangesCode(w *model.WriteRecord) bool {
+	if w.Tool == "Bash" {
+		return true
+	}
+	p := strings.ToLower(filepath.ToSlash(w.Path))
+	if strings.HasPrefix(p, "docs/") || strings.Contains(p, "/docs/") {
+		return false
+	}
+	switch filepath.Ext(p) {
+	case ".md", ".markdown", ".txt", ".rst", ".adoc":
+		return false
+	}
+	return true
+}
+
+// agentChangesCode reports whether an agent's tool allowlist lets it modify
+// code in place — the mark of implementation work, as opposed to writing
+// documents (Write) or reading (Read/Grep/Glob).
+func agentChangesCode(a *model.Agent) bool {
+	for _, t := range strings.Split(a.Tools, ",") {
+		switch strings.TrimSpace(t) {
+		case "Edit", "MultiEdit", "Bash":
+			return true
+		}
+	}
+	return false
 }
 
 // CoordinatorActivity records what the coordinator is doing, for its card.

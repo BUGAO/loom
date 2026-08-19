@@ -24,6 +24,9 @@ const (
 	// each; real backends treat them like any other session.
 	KindCoordinator = "coordinator"
 	KindWorker      = "worker"
+	// KindListen is the listener's one-shot classification of a user
+	// message (task / continuation / question / meta). No tools, tiny model.
+	KindListen = "listen"
 )
 
 type Request struct {
@@ -32,7 +35,7 @@ type Request struct {
 	Prompt       string
 	Model        string
 	WorkDir      string       // session cwd (the agent's own home workspace)
-	AddDirs      []string     // extra dirs the agent may access (e.g. run exchange dir)
+	AddDirs      []string     // extra dirs the agent may access (e.g. the run workspace)
 	Tools        string       // comma-separated allowed tools, "" = no tools
 	MaxTurns     int          // 0 = backend default
 	Pool         []string     // agent names available (used by mock planner)
@@ -76,6 +79,21 @@ type SessionRequest struct {
 	MaxTurns     int
 	MCPServers   []MCPServer
 	OnActivity   func(string)
+	// OnText, when set, receives the turn's reply text as it streams — the
+	// whole text so far on every chunk — so a UI can show the agent talking
+	// instead of waiting for the turn to end.
+	OnText func(string)
+	// Gate, when set, routes every tool call of the session through loom's
+	// hook gate (PreToolUse/PostToolUse hooks calling back with this
+	// credential). Sessions without it get the static jail only.
+	Gate *GateHook
+}
+
+// GateHook is a session's hook-gate credential: where to post tool calls and
+// the token that identifies the session there.
+type GateHook struct {
+	URL   string
+	Token string
 }
 
 // Session is one live agent conversation. Prompt may be called repeatedly;

@@ -17,6 +17,8 @@ import (
 	"time"
 
 	acp "github.com/coder/acp-go-sdk"
+
+	"loom/internal/model"
 )
 
 // ACP executes agents over the Agent Client Protocol via coder/acp-go-sdk:
@@ -82,40 +84,28 @@ func allowedFn(tools string) func(title, kind string) bool {
 // closes that hole with the runtime's own permissions.deny rules, written to
 // the session cwd before spawn — enforced by Claude Code core, immune to
 // prompting.
-
-// capabilityGrants maps loom allowlist tokens onto the Claude Code tools they
-// legitimize.
-var capabilityGrants = map[string][]string{
-	"read":      {"Read", "NotebookRead"},
-	"grep":      {"Grep"},
-	"glob":      {"Glob"},
-	"write":     {"Write", "NotebookEdit"},
-	"edit":      {"Edit", "MultiEdit", "NotebookEdit"},
-	"bash":      {"Bash", "BashOutput", "KillShell"},
-	"webfetch":  {"WebFetch"},
-	"websearch": {"WebSearch"},
-}
-
-// capabilityTools is every capability-granting Claude Code tool the jail
-// manages. Task is here unconditionally: subagents spawned outside the ledger
-// are never a granted capability, whatever the allowlist says. Skills and
-// TodoWrite are deliberately absent — they act within the session and their
-// tool calls hit these same rules.
-var capabilityTools = []string{
-	"Task", "Bash", "BashOutput", "KillShell", "Read", "NotebookRead", "Write",
-	"Edit", "MultiEdit", "NotebookEdit", "Grep", "Glob", "WebFetch", "WebSearch",
-}
+//
+// Two layers, two homes:
+//   - an AGENT HOME (under loom's data dir) is loom's own: the jail file
+//     there is rewritten wholesale on every open with the full deny list for
+//     that agent's allowlist;
+//   - a USER WORKSPACE (anywhere else) is not loom's: the jail MERGES into
+//     whatever settings.local.json the user has, adds only loom's path rules
+//     and hook entries, and removes them again when the last loom session in
+//     that cwd closes. Tool-level restriction there is the hook gate's job,
+//     which judges per identity — so two sessions with different allowlists
+//     can share the workspace without inheriting each other's jail.
+//
+// The hook entries are static (the loom binary + "gate"); the per-session
+// credential travels in the spawned process environment (LOOM_GATE_*), which
+// hook commands inherit. That is what keeps concurrent sessions in one cwd
+// from clobbering each other's identity.
 
 // denyListFor computes the deny rules implied by an agent's tool allowlist.
 func denyListFor(tools string) []string {
-	keep := map[string]bool{}
-	for _, t := range strings.Split(tools, ",") {
-		for _, name := range capabilityGrants[strings.ToLower(strings.TrimSpace(t))] {
-			keep[name] = true
-		}
-	}
+	keep := model.GrantedTools(tools)
 	var deny []string
-	for _, name := range capabilityTools {
+	for _, name := range model.CapabilityTools {
 		if !keep[name] {
 			deny = append(deny, name)
 		}
@@ -123,20 +113,16 @@ func denyListFor(tools string) []string {
 	return deny
 }
 
-// writeCapableTools are the file-writing tools that path-scoped deny rules
-// must cover. Bash is deliberately absent: permission rules cannot see into a
-// shell command line, so for a Bash-granted agent the path rules stop the
-// structured tools' casual overreach while the shell remains a trust boundary
-// — the same trust level as using Claude Code directly.
-var writeCapableTools = []string{"Write", "Edit", "MultiEdit", "NotebookEdit"}
-
 // pathDenyFor computes path-scoped deny rules shielding loom's own state from
 // a session's file tools. The boundary is drawn per-path, not per-tree: agent
 // homes live under the data dir and legitimately serve as scratch space, so
 // only the control surfaces are denied — the files that would let a session
 // rewrite an agent's identity (agent.md, AGENTS.md, private skills), a
 // workflow's configuration, a run's ledger, or its own jail. `//` prefixes an
-// absolute filesystem path in Claude Code's rule syntax.
+// absolute filesystem path in Claude Code's rule syntax. Bash is deliberately
+// absent: permission rules cannot see into a shell command line, so for a
+// Bash-granted agent the path rules stop the structured tools' casual
+// overreach while the shell remains a trust boundary.
 func pathDenyFor(protectDir string) []string {
 	pats := []string{"**/.claude/settings.local.json"}
 	if protectDir != "" {
@@ -155,8 +141,8 @@ func pathDenyFor(protectDir string) []string {
 			root+"/**/CLAUDE.md",
 		)
 	}
-	rules := make([]string, 0, len(writeCapableTools)*len(pats))
-	for _, tool := range writeCapableTools {
+	rules := make([]string, 0, len(model.WriteTools)*len(pats))
+	for _, tool := range model.WriteTools {
 		for _, p := range pats {
 			rules = append(rules, tool+"("+p+")")
 		}
@@ -164,24 +150,246 @@ func pathDenyFor(protectDir string) []string {
 	return rules
 }
 
-// writeToolJail materializes the deny rules into the session cwd's
-// .claude/settings.local.json. The file is loom-managed and rewritten on
-// every session open, so an agent's jail always reflects its current
-// allowlist. Tool-level rules encode the agent's allowlist; path-level rules
-// shield loom's own state even from granted tools.
-func writeToolJail(workDir, tools, protectDir string) error {
-	dir := filepath.Join(workDir, ".claude")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+// gateExe overrides the binary the hook runs (tests build a real loom binary;
+// the test process itself is not one).
+var gateExe string
+
+// gateHookCommand is the hook command line: this very binary, subcommand
+// gate. Single-quoted so a path with spaces survives the shell.
+func gateHookCommand() string {
+	exe := gateExe
+	if exe == "" {
+		var err error
+		if exe, err = os.Executable(); err != nil {
+			exe = "loom"
+		}
 	}
-	deny := append(denyListFor(tools), pathDenyFor(protectDir)...)
-	data, err := json.MarshalIndent(map[string]any{
-		"permissions": map[string]any{"deny": deny},
-	}, "", "  ")
+	return "'" + strings.ReplaceAll(exe, "'", `'\''`) + "' gate"
+}
+
+// isGateHookEntry recognizes a hook entry loom wrote (any loom binary).
+func isGateHookEntry(entry any) bool {
+	m, ok := entry.(map[string]any)
+	if !ok {
+		return false
+	}
+	hooks, _ := m["hooks"].([]any)
+	for _, h := range hooks {
+		hm, _ := h.(map[string]any)
+		cmd, _ := hm["command"].(string)
+		if strings.HasSuffix(cmd, "' gate") || strings.HasSuffix(cmd, "loom gate") {
+			return true
+		}
+	}
+	return false
+}
+
+func gateHookEntries() map[string][]any {
+	cmd := gateHookCommand()
+	entry := func(matcher string) any {
+		return map[string]any{
+			"matcher": matcher,
+			"hooks":   []any{map[string]any{"type": "command", "command": cmd, "timeout": 15}},
+		}
+	}
+	return map[string][]any{
+		"PreToolUse":  {entry("^(" + strings.Join(model.CapabilityTools, "|") + ")$")},
+		"PostToolUse": {entry("^(" + strings.Join(append(append([]string{}, model.WriteTools...), "Bash"), "|") + ")$")},
+	}
+}
+
+// jailRef tracks how many live loom sessions share one cwd's jail and what
+// loom created there, so the last one out can clean up a user workspace.
+type jailRef struct {
+	n           int
+	createdDir  bool
+	createdFile bool
+	added       []string // deny entries loom put into a user workspace's file
+}
+
+var (
+	jailMu   sync.Mutex
+	jailRefs = map[string]*jailRef{}
+)
+
+func jailPath(workDir string) string {
+	return filepath.Join(workDir, ".claude", "settings.local.json")
+}
+
+// underDir reports whether p is inside dir (both cleaned; symlink-agnostic).
+func underDir(p, dir string) bool {
+	if dir == "" {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(p))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+}
+
+// writeToolJail materializes the jail into the session cwd's
+// .claude/settings.local.json and registers the session against it. hooked
+// says whether the session carries a gate credential: only then are hook
+// entries written, and only then may a user workspace skip the tool-level
+// deny list (the gate enforces it per identity). Without a gate every cwd
+// gets the full list — the pre-gate behavior, never weaker.
+func writeToolJail(workDir, tools, protectDir string, hooked bool) error {
+	jailMu.Lock()
+	defer jailMu.Unlock()
+	home := underDir(workDir, protectDir)
+	dir := filepath.Dir(jailPath(workDir))
+	ref := jailRefs[workDir]
+	if ref == nil {
+		ref = &jailRef{}
+		jailRefs[workDir] = ref
+	}
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		ref.createdDir = true
+	}
+	settings := map[string]any{}
+	raw, err := os.ReadFile(jailPath(workDir))
+	switch {
+	case os.IsNotExist(err):
+		ref.createdFile = true
+	case err != nil:
+		return err
+	case home:
+		// loom's own file: rewritten wholesale.
+	default:
+		if err := json.Unmarshal(raw, &settings); err != nil {
+			return fmt.Errorf("%s is not valid JSON; refusing to merge loom's jail into it: %w", jailPath(workDir), err)
+		}
+	}
+	var deny []string
+	if home || !hooked {
+		deny = append(deny, denyListFor(tools)...)
+	}
+	deny = append(deny, pathDenyFor(protectDir)...)
+	// Sessions sharing a workspace may differ in allowlist: the union of what
+	// loom has put there is what gets replaced, so a stricter earlier entry
+	// never survives to jail a later, wider session — and vice versa the
+	// gate, not this file, is what keeps the narrower one narrow.
+	mergeJail(settings, ref.added, deny, hooked)
+	ref.added = deny
+	data, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "settings.local.json"), data, 0o644)
+	if err := os.WriteFile(jailPath(workDir), data, 0o644); err != nil {
+		return err
+	}
+	ref.n++
+	return nil
+}
+
+// mergeJail edits a settings object in place: the deny entries loom added
+// earlier (remove) go, the current ones (add) come, gate hook entries are
+// replaced by the current set (none when !hooked). User entries — including
+// a user's own bare "WebFetch" deny — are left alone, which is why removal
+// is by exact bookkeeping, not by pattern.
+func mergeJail(settings map[string]any, remove, add []string, hooked bool) {
+	perms, _ := settings["permissions"].(map[string]any)
+	if perms == nil {
+		perms = map[string]any{}
+	}
+	drop := map[string]bool{}
+	for _, d := range remove {
+		drop[d] = true
+	}
+	var kept []any
+	if old, _ := perms["deny"].([]any); old != nil {
+		for _, d := range old {
+			if ds, ok := d.(string); ok && drop[ds] {
+				continue
+			}
+			kept = append(kept, d)
+		}
+	}
+	for _, d := range add {
+		kept = append(kept, d)
+	}
+	if len(kept) > 0 {
+		perms["deny"] = kept
+		settings["permissions"] = perms
+	} else {
+		delete(perms, "deny")
+		if len(perms) == 0 {
+			delete(settings, "permissions")
+		} else {
+			settings["permissions"] = perms
+		}
+	}
+
+	hooks, _ := settings["hooks"].(map[string]any)
+	if hooks == nil {
+		hooks = map[string]any{}
+	}
+	ours := map[string][]any{}
+	if hooked {
+		ours = gateHookEntries()
+	}
+	for _, ev := range []string{"PreToolUse", "PostToolUse"} {
+		var keptH []any
+		if old, _ := hooks[ev].([]any); old != nil {
+			for _, e := range old {
+				if !isGateHookEntry(e) {
+					keptH = append(keptH, e)
+				}
+			}
+		}
+		keptH = append(keptH, ours[ev]...)
+		if len(keptH) > 0 {
+			hooks[ev] = keptH
+		} else {
+			delete(hooks, ev)
+		}
+	}
+	if len(hooks) > 0 {
+		settings["hooks"] = hooks
+	} else {
+		delete(settings, "hooks")
+	}
+}
+
+// releaseToolJail is the session-close counterpart: the last loom session in
+// a USER workspace removes loom's entries (and the file / .claude dir if loom
+// created them). Agent homes keep their jail — loom owns them.
+func releaseToolJail(workDir, protectDir string) {
+	jailMu.Lock()
+	defer jailMu.Unlock()
+	ref := jailRefs[workDir]
+	if ref == nil {
+		return
+	}
+	ref.n--
+	if ref.n > 0 {
+		return
+	}
+	delete(jailRefs, workDir)
+	if underDir(workDir, protectDir) {
+		return
+	}
+	path := jailPath(workDir)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	settings := map[string]any{}
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		return
+	}
+	mergeJail(settings, ref.added, nil, false)
+	if len(settings) == 0 && ref.createdFile {
+		os.Remove(path)
+		if ref.createdDir {
+			os.Remove(filepath.Dir(path)) // only succeeds if empty
+		}
+		return
+	}
+	if data, err := json.MarshalIndent(settings, "", "  "); err == nil {
+		os.WriteFile(path, data, 0o644)
+	}
 }
 
 // acpClient implements acp.Client for one session: it streams session updates
@@ -561,6 +769,8 @@ type acpSession struct {
 	stderr  *bytes.Buffer
 	closeMu sync.Mutex
 	closed  bool
+	// protectDir is the backend's data dir, needed to release the jail.
+	protectDir string
 
 	usageMu   sync.Mutex
 	lastUsage modelUsage // per-model totals as of the previous turn
@@ -575,12 +785,17 @@ var _ ImageSession = (*acpSession)(nil)
 
 func (a *ACP) Open(ctx context.Context, req SessionRequest) (Session, error) {
 	// Fail closed: without the jail on disk, the allowlist is advisory.
-	if err := writeToolJail(req.WorkDir, req.Tools, a.ProtectDir); err != nil {
+	if err := writeToolJail(req.WorkDir, req.Tools, a.ProtectDir, req.Gate != nil); err != nil {
 		return nil, fmt.Errorf("write tool jail: %w", err)
 	}
 	cmd := exec.Command(a.Command, a.Args...)
 	cmd.Dir = req.WorkDir
 	cmd.Env = scrubEnv(req.Model)
+	if req.Gate != nil {
+		// The gate credential rides in the process environment: hook commands
+		// inherit it, and nothing per-session lands on disk in the cwd.
+		cmd.Env = append(cmd.Env, "LOOM_GATE_URL="+req.Gate.URL, "LOOM_GATE_TOKEN="+req.Gate.Token)
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -595,7 +810,7 @@ func (a *ACP) Open(ctx context.Context, req SessionRequest) (Session, error) {
 		return nil, fmt.Errorf("spawn %s: %w", a.Command, err)
 	}
 
-	s := &acpSession{cmd: cmd, stdin: stdin, stderr: stderr, req: req, client: &acpClient{allow: allowedFn(req.Tools)}}
+	s := &acpSession{cmd: cmd, stdin: stdin, stderr: stderr, req: req, protectDir: a.ProtectDir, client: &acpClient{allow: allowedFn(req.Tools)}}
 	s.conn = acp.NewClientSideConnection(s.client, stdin, stdout)
 	s.conn.SetLogger(slog.New(slog.DiscardHandler)) // teardown noise isn't loom's log
 
@@ -695,11 +910,19 @@ func (s *acpSession) PromptImages(ctx context.Context, text string, images []Ima
 func (s *acpSession) promptBlocks(ctx context.Context, blocks []acp.ContentBlock) (*Result, error) {
 	var msgText, transcript strings.Builder
 	lastThought := false
+	afterTool := false // a text block resuming after a tool call starts a new paragraph
 	s.client.setCollectors(
 		func(t string) {
+			if afterTool && msgText.Len() > 0 && !strings.HasSuffix(msgText.String(), "\n") && !strings.HasPrefix(t, "\n") {
+				msgText.WriteString("\n\n")
+			}
+			afterTool = false
 			msgText.WriteString(t)
 			transcript.WriteString(t)
 			lastThought = false
+			if s.req.OnText != nil {
+				s.req.OnText(msgText.String())
+			}
 		},
 		func(t string) {
 			if !lastThought {
@@ -711,6 +934,7 @@ func (s *acpSession) promptBlocks(ctx context.Context, blocks []acp.ContentBlock
 		func(title, kind string) {
 			fmt.Fprintf(&transcript, "\n[tool:%s] %s\n", kind, title)
 			lastThought = false
+			afterTool = true
 			if s.req.OnActivity != nil && title != "" {
 				s.req.OnActivity(title)
 			}
@@ -807,6 +1031,7 @@ func (s *acpSession) Close() error {
 		s.cmd.Process.Kill()
 	}
 	s.cmd.Wait()
+	releaseToolJail(s.req.WorkDir, s.protectDir)
 	return nil
 }
 

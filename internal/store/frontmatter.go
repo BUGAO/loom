@@ -62,7 +62,7 @@ func agentsMD(a *model.Agent) string {
   may not.`)
 	}
 	b.WriteString(`
-- Each task names the run's shared exchange directory (an absolute path).
+- Each task names the run's workspace (an absolute path): the project directory and the deliverable folder in one.
   Upstream artifacts are there; every deliverable MUST be written there too.
 - Each task lists the exact tools granted to you. Calls to any other tool
   (including shell/terminal, if not granted) are rejected — never let a
@@ -71,7 +71,7 @@ func agentsMD(a *model.Agent) string {
 - Your private skills live under .claude/skills/ in this directory.
 - End every task reply with the result envelope:
   ` + "```json" + `
-  {"status": "ok", "summary": "...", "artifacts": ["paths relative to the exchange dir"]}
+  {"status": "ok", "summary": "...", "artifacts": ["paths relative to the workspace"]}
   ` + "```" + `
 `)
 	return b.String()
@@ -79,7 +79,7 @@ func agentsMD(a *model.Agent) string {
 
 // agentCanWriteFiles reports whether the agent can write files in its own home
 // with its own tools — the precondition for maintaining MEMORY.md (the hub's
-// write_artifact only reaches the exchange directory, never the home).
+// write_artifact only reaches the workspace, never the home).
 func agentCanWriteFiles(a *model.Agent) bool {
 	for _, t := range strings.Split(a.Tools, ",") {
 		switch strings.TrimSpace(t) {

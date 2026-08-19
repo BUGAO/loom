@@ -53,11 +53,54 @@ func ValidateChecks(checks []model.AcceptanceCheck) error {
 			if strings.TrimSpace(c.Command) == "" {
 				return fmt.Errorf("acceptance[%d]: command check needs a command", i)
 			}
+			if m := dryRunRe.FindString(c.Command); m != "" {
+				return fmt.Errorf("acceptance[%d]: %q exercises a dry-run/mock path (%s). Acceptance runs the REAL path — "+
+					"a dry run proves rendering, not delivery. Put the real command here; if the real path needs "+
+					"something only the user has (credentials, an account), ask_user for it BEFORE delegating; if it "+
+					"cannot be had, the goal stays unmet — an honest \"unverified\" beats a green dry run", i, c.Command, m)
+			}
 		default:
 			return fmt.Errorf("acceptance[%d]: unknown kind %q; use artifact_exists, artifact_contains or command", i, c.Kind)
 		}
 	}
+	// A build/lint check without a test check is the contract that shipped
+	// 11k lines with zero tests: "compiles" was the whole bar. Compiling is
+	// not working; the contract must run the tests too — which is also what
+	// obliges the worker to write them.
+	if bi := indexOfCommand(checks, buildCmdRe); bi >= 0 && indexOfCommand(checks, testCmdRe) < 0 {
+		return fmt.Errorf("acceptance[%d]: %q is a build/lint check but this contract has no TEST command. A build "+
+			"proves \"compiles\", not \"works\": add the project's test command (go test ./..., npm test, pytest, "+
+			"cargo test, make test …). For a task that also writes the code, that means the worker writes the tests "+
+			"— say so in the instruction. A documentation-only task should not carry a build check at all",
+			bi, checks[bi].Command)
+	}
 	return nil
+}
+
+// buildCmdRe recognizes build / typecheck / lint / format checks — the
+// "compiles and is tidy" family. testCmdRe recognizes the commands that
+// actually execute tests. dryRunRe recognizes flags that swap the real path
+// for a simulation.
+var (
+	buildCmdRe = regexp.MustCompile(`(^|[\s;&|(])(go\s+(build|vet|install)\b|gofmt\b|golangci-lint\b|staticcheck\b|` +
+		`(npm|pnpm|yarn|bun)\s+(run\s+)?(build|lint|typecheck|type-check)\b|tsc\b|vite\s+build\b|eslint\b|` +
+		`cargo\s+(build|check|clippy)\b|make\s+(build|all|lint)\b|mvn\s+(compile|package)\b|gradle\s+(build|assemble)\b|` +
+		`dotnet\s+build\b|(python3?|py)\s+-m\s+(py_compile|compileall)\b|ruff\b|mypy\b|pyright\b)`)
+	testCmdRe = regexp.MustCompile(`(^|[\s;&|(])(go\s+test\b|(npm|pnpm|yarn|bun)\s+(run\s+)?test\b|vitest\b|jest\b|mocha\b|` +
+		`pytest\b|(python3?|py)\s+-m\s+(pytest|unittest)\b|cargo\s+test\b|make\s+(test|check)\b|mvn\s+(test|verify)\b|` +
+		`gradle\s+test\b|dotnet\s+test\b|ctest\b|rspec\b|phpunit\b|swift\s+test\b|mix\s+test\b|dart\s+test\b|` +
+		`flutter\s+test\b|deno\s+test\b|bats\b)`)
+	dryRunRe = regexp.MustCompile(`--dry[-_]?run\b|\bdry_run\b|--no-?op\b|--simulate\b|--pretend\b|--fake\b|--mock\b|` +
+		`--no-send\b|--skip-send\b|--what-if\b`)
+)
+
+func indexOfCommand(checks []model.AcceptanceCheck, re *regexp.Regexp) int {
+	for i, c := range checks {
+		if c.Kind == model.CheckCommand && re.MatchString(c.Command) {
+			return i
+		}
+	}
+	return -1
 }
 
 // NOTE: there used to be a ChecksFeasibleFor guard here refusing artifact
@@ -68,15 +111,15 @@ func ValidateChecks(checks []model.AcceptanceCheck) error {
 func checkPathOK(p string) error {
 	p = strings.TrimSpace(p)
 	if p == "" {
-		return fmt.Errorf("artifact check needs a path relative to the exchange directory")
+		return fmt.Errorf("artifact check needs a path relative to the workspace")
 	}
 	if filepath.IsAbs(p) || strings.Contains(p, "..") {
-		return fmt.Errorf("artifact path must be relative to the exchange directory, without '..'")
+		return fmt.Errorf("artifact path must be relative to the workspace, without '..'")
 	}
 	return nil
 }
 
-// RunChecks executes an acceptance contract against the run's exchange
+// RunChecks executes an acceptance contract against the run's workspace
 // directory and reports each check's outcome.
 func RunChecks(ctx context.Context, workspace string, checks []model.AcceptanceCheck) (results []model.CheckResult, allPassed bool) {
 	allPassed = true
@@ -96,7 +139,7 @@ func runCheck(ctx context.Context, workspace string, c model.AcceptanceCheck) mo
 	case model.CheckArtifactExists:
 		full := filepath.Join(workspace, c.Path)
 		if st, err := os.Stat(full); err != nil {
-			res.Detail = fmt.Sprintf("artifact %q does not exist in the exchange directory", c.Path)
+			res.Detail = fmt.Sprintf("artifact %q does not exist in the workspace", c.Path)
 		} else if st.IsDir() {
 			res.Passed = true
 			res.Detail = "directory exists"

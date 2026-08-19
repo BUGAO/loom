@@ -50,6 +50,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/agents/{name}/skills/{skill}", s.deleteSkill)
 
 	mux.HandleFunc("GET /api/workflows", s.listWorkflows)
+	mux.HandleFunc("GET /api/main", s.getMainWorkflow)
 	mux.HandleFunc("POST /api/workflows", s.saveWorkflow)
 	mux.HandleFunc("POST /api/workflows/prompt-preview", s.promptPreview)
 	mux.HandleFunc("GET /api/workflows/{id}", s.getWorkflow)
@@ -57,6 +58,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/workflows/{id}/runs", s.startRun)
 	mux.HandleFunc("POST /api/workflows/{id}/chat", s.chatWorkflow)
 	mux.HandleFunc("POST /api/runs/{id}/chat", s.chatRun)
+
+	mux.HandleFunc("GET /api/workspaces", s.listWorkspaces)
+	mux.HandleFunc("DELETE /api/workspaces", s.deleteWorkspace)
+	mux.HandleFunc("POST /api/workspaces/browse", s.browseWorkspace)
+	mux.HandleFunc("POST /api/workspaces/mkdir", s.mkdirWorkspace)
+	mux.HandleFunc("POST /api/workspaces/rename", s.renameWorkspace)
 
 	mux.HandleFunc("GET /api/costs/summary", s.costSummary)
 
@@ -70,6 +77,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/runs/{id}/resume", s.resumeRun)
 	mux.HandleFunc("POST /api/runs/{id}/feedback", s.setRunFeedback)
 	mux.HandleFunc("POST /api/runs/{id}/tasks/{task}/message", s.sendTaskMessage)
+	mux.HandleFunc("POST /api/runs/{id}/level", s.setRunLevel)
 
 	mux.HandleFunc("GET /api/amendments", s.listAmendments)
 	mux.HandleFunc("POST /api/amendments/{id}/approve", s.approveAmendment)
@@ -92,6 +100,7 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("/mcp/", s.hub)
 		mux.Handle("/a2a/", s.hub)
 		mux.Handle("/a2a/agents", s.hub)
+		mux.Handle("/gate", s.hub) // the hook gate: sessions' tool calls ask here
 	}
 
 	sub, _ := fs.Sub(webFS, "web")
@@ -236,6 +245,41 @@ func (s *Server) listWorkflows(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, wfs)
 }
 
+// getMainWorkflow returns THE main-agent configuration: the dynamic workflow
+// every session runs under. There is exactly one in the pilot UI — the
+// seeded wf-dynamic, else the first dynamic workflow, else a fresh default
+// created on the spot so the session page always has something to talk to.
+func (s *Server) getMainWorkflow(w http.ResponseWriter, r *http.Request) {
+	wfs, err := s.store.ListWorkflows()
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	var main *model.Workflow
+	for _, wf := range wfs {
+		if wf.EffectiveMode() != model.ModeDynamic {
+			continue
+		}
+		if wf.ID == "wf-dynamic" {
+			main = wf
+			break
+		}
+		if main == nil {
+			main = wf
+		}
+	}
+	if main == nil {
+		b := model.DefaultBudget()
+		main = &model.Workflow{ID: "wf-dynamic", Name: "main agent", Description: "会话的主 agent 配置", Mode: model.ModeDynamic,
+			Coordinator: &model.CoordinatorConfig{}, Budget: &b}
+		if err := s.store.SaveWorkflow(main); err != nil {
+			writeErr(w, 500, err)
+			return
+		}
+	}
+	writeJSON(w, 200, main)
+}
+
 func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
 	wf, err := s.store.LoadWorkflow(r.PathValue("id"))
 	if err != nil {
@@ -275,7 +319,7 @@ func (s *Server) promptPreview(w http.ResponseWriter, r *http.Request) {
 	}
 	var prompt string
 	if wf.EffectiveMode() == model.ModeDynamic {
-		prompt = hub.CoordinatorPrompt(&model.Run{}, wf, wf.EffectiveBudget(), s.engine.OutputRoot(), "", pool, s.engine.LessonsFor(wf.ID))
+		prompt = hub.CoordinatorPrompt(&model.Run{}, wf, wf.EffectiveBudget(), "", pool, s.engine.LessonsFor(wf.ID))
 	} else {
 		prompt = planner.BuildPrompt("<用户发起运行时输入的目标>", pool, wf.Planner, "", wf.AllowAgentCreation, engine.LessonTexts(s.engine.LessonsFor(wf.ID)))
 	}
@@ -329,6 +373,85 @@ func (s *Server) costSummary(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ---- workspaces ----
+// The directory a run works in and delivers to. The picker offers the recent
+// ones, a folder browser (with new-folder + rename), and the default root.
+
+func (s *Server) listWorkspaces(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListRecentWorkspaces()
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	if list == nil {
+		list = []string{}
+	}
+	home, _ := os.UserHomeDir()
+	writeJSON(w, 200, map[string]any{"workspaces": list, "home": home, "default": s.engine.OutputRoot()})
+}
+
+// mkdirWorkspace creates a new folder for the picker (inside the home
+// directory only) and returns its path.
+func (s *Server) mkdirWorkspace(w http.ResponseWriter, r *http.Request) {
+	body, ok := readBody[struct {
+		Parent string `json:"parent"`
+		Name   string `json:"name"`
+	}](w, r)
+	if !ok {
+		return
+	}
+	path, err := s.store.MkdirWorkspace(body.Parent, body.Name)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"path": path})
+}
+
+// renameWorkspace renames an EMPTY folder (the kind the picker creates) and
+// returns its new path; the MRU history follows.
+func (s *Server) renameWorkspace(w http.ResponseWriter, r *http.Request) {
+	body, ok := readBody[struct {
+		Path string `json:"path"`
+		Name string `json:"name"`
+	}](w, r)
+	if !ok {
+		return
+	}
+	path, err := s.store.RenameWorkspaceDir(body.Path, body.Name)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"path": path})
+}
+
+func (s *Server) deleteWorkspace(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.DeleteWorkspace(r.URL.Query().Get("path")); err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) browseWorkspace(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	// readBody is not used here: an empty body is legal (it means "list the
+	// browse root") and readBody answers 400 to one.
+	var body struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err == nil && body.Path != "" {
+		path = body.Path
+	}
+	listing, err := s.store.BrowseDirs(path)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, listing)
+}
+
 // ---- runs ----
 
 func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
@@ -343,6 +466,9 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 		// Backend is the pre-v2.1 spelling; "mock" meant what dry_run means
 		// now. Accepted so existing scripts keep working.
 		Backend string `json:"backend"`
+		// Workspace is the directory this run works in and delivers to.
+		// Empty = the default root.
+		Workspace string `json:"workspace"`
 	}](w, r)
 	if !ok {
 		return
@@ -352,10 +478,18 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dryRun := body.DryRun || body.Backend == "mock"
-	run, err := s.engine.StartRun(wf, body.Goal, dryRun)
+	ws, err := store.NormalizeWorkspace(body.Workspace)
 	if err != nil {
 		writeErr(w, 400, err)
 		return
+	}
+	run, err := s.engine.StartRun(wf, body.Goal, ws, dryRun)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if ws != "" {
+		s.store.SaveRecentWorkspace(ws) // best effort: history must not fail a started run
 	}
 	writeJSON(w, 200, run)
 }
@@ -416,6 +550,9 @@ func (s *Server) chatWorkflow(w http.ResponseWriter, r *http.Request) {
 		DryRun     bool        `json:"dry_run"`
 		RunID      string      `json:"run_id"`      // the session to continue; empty = active or latest
 		NewSession bool        `json:"new_session"` // force a fresh session
+		// Workspace applies only when this message STARTS a run; continuing a
+		// session keeps the workspace the run was created with.
+		Workspace string `json:"workspace"`
 	}](w, r)
 	if !ok {
 		return
@@ -429,11 +566,19 @@ func (s *Server) chatWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
+	ws, err := store.NormalizeWorkspace(body.Workspace)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
 	if wf.EffectiveMode() != model.ModeDynamic || body.NewSession {
-		run, err := s.engine.StartRun(wf, body.Text, body.DryRun, images...)
+		run, err := s.engine.StartRun(wf, body.Text, ws, body.DryRun, images...)
 		if err != nil {
 			writeErr(w, 400, err)
 			return
+		}
+		if ws != "" {
+			s.store.SaveRecentWorkspace(ws)
 		}
 		writeJSON(w, 200, run)
 		return
@@ -457,17 +602,24 @@ func (s *Server) chatWorkflow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if target == "" {
-		run, err := s.engine.StartRun(wf, body.Text, body.DryRun, images...)
+		run, err := s.engine.StartRun(wf, body.Text, ws, body.DryRun, images...)
 		if err != nil {
 			writeErr(w, 400, err)
 			return
+		}
+		if ws != "" {
+			s.store.SaveRecentWorkspace(ws)
 		}
 		writeJSON(w, 200, run)
 		return
 	}
 
 	// Continue the session: live runs get the message directly; finished ones
-	// are reopened by it.
+	// are reopened by it. A workspace in the request is IGNORED here — a run's
+	// workspace freezes at birth, and rejecting a stale selector value would
+	// only punish the common "the chip still shows the old project" case. The
+	// response is the loaded run, so the client can sync its chip back to the
+	// authoritative run.workspace.
 	if err := s.engine.ChatToRun(target, body.Text, images...); err != nil {
 		if _, rerr := s.engine.ReopenRun(target, body.Text, images...); rerr != nil {
 			writeErr(w, 400, fmt.Errorf("cannot continue session %s: %v", target, rerr))
@@ -798,6 +950,23 @@ func (s *Server) sendTaskMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
+// setRunLevel is the user's override of a run's collaboration level.
+func (s *Server) setRunLevel(w http.ResponseWriter, r *http.Request) {
+	body, ok := readBody[struct {
+		Level  string `json:"level"`
+		Reason string `json:"reason"`
+	}](w, r)
+	if !ok {
+		return
+	}
+	run, err := s.engine.SetLevel(r.PathValue("id"), body.Level, body.Reason)
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, run)
+}
+
 func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	if err := s.engine.Cancel(r.PathValue("id")); err != nil {
 		writeErr(w, 400, err)
@@ -862,6 +1031,11 @@ func (s *Server) streamRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if snapshot, err := json.Marshal(run); err == nil {
 		send(snapshot)
+	}
+	// A terminal run will never publish again — close instead of parking a
+	// goroutine on a channel nobody writes to.
+	if run.Terminal() {
+		return
 	}
 	for {
 		select {

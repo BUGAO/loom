@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -38,6 +41,7 @@ type identity struct {
 	runID  string
 	role   string
 	taskID string // worker only
+	agent  string // pair only: which resident partner this session is
 }
 
 // Hub owns every dynamic run's control plane and the two protocol surfaces
@@ -110,10 +114,7 @@ func (h *Hub) OpenRun(ctx context.Context, cfg RunConfig) *RunSession {
 	if rs.run.Tasks == nil {
 		rs.run.Tasks = map[string]*model.Task{}
 	}
-	// Resume: tasks carried over from a previous process need control blocks,
-	// and a session that already dispatched work keeps its exchange directory
-	// — named or not — rather than moving deliverables mid-conversation.
-	rs.outputFrozen = cfg.Run.OutputDir != "" || len(cfg.Run.Tasks) > 0
+	// Resume: tasks carried over from a previous process need control blocks.
 	for id, t := range rs.run.Tasks {
 		if !model.TaskTerminal(t.Status) {
 			rs.ctrl[id] = rs.newTaskCtrl()
@@ -207,11 +208,12 @@ func (h *Hub) IssueWorkerToken(runID, taskID string) string {
 	return h.issue(identity{runID: runID, role: RoleWorker, taskID: taskID})
 }
 
-// IssuePairToken mints the credential for a run's resident implementer
-// session. It outlives any one task; the task it acts for at each call is
-// whatever the engine has currently bound via RunSession.SetPairTask.
-func (h *Hub) IssuePairToken(runID string) string {
-	return h.issue(identity{runID: runID, role: RolePair})
+// IssuePairToken mints the credential for one of a run's resident partner
+// sessions (agent names it). It outlives any one task; the task it acts for
+// at each call is whatever the engine has currently bound for that agent via
+// RunSession.SetPairTask.
+func (h *Hub) IssuePairToken(runID, agent string) string {
+	return h.issue(identity{runID: runID, role: RolePair, agent: agent})
 }
 
 func (h *Hub) issue(id identity) string {
@@ -298,8 +300,37 @@ func (h *Hub) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", h.MCPHandler())
 	mux.Handle("/mcp/", h.MCPHandler())
+	mux.HandleFunc("POST /gate", h.serveGate)
 	h.mountA2A(mux)
 	return mux
+}
+
+// GateEndpoint is where a session's hook posts its tool calls.
+func (h *Hub) GateEndpoint() string { return h.baseURL + "/gate" }
+
+// serveGate is the hook gate's HTTP face: bearer token, hook JSON in, hook
+// JSON out. An unknown token (the run is over) answers allow — the hook is
+// fail-open by design, and an ended run has nothing left to protect.
+func (h *Hub) serveGate(w http.ResponseWriter, r *http.Request) {
+	tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if tok == "" {
+		tok = r.Header.Get(TokenHeader)
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	out, err := h.Gate(tok, body)
+	switch {
+	case errors.Is(err, ErrUnknownCredential):
+		out = map[string]any{}
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
 }
 
 // toolErr renders an error as a tool result the model can act on, rather than

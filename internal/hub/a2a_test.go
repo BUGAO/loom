@@ -42,6 +42,7 @@ func a2aSetup(t *testing.T) (*Hub, *RunSession, *httptest.Server, *fakeExec) {
 		OnChange:  func(*model.Run) {},
 	})
 	t.Cleanup(rs.Close)
+	declareTestEvidence(t, rs)
 	return h, rs, srv, exec
 }
 

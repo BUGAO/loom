@@ -61,9 +61,33 @@ func (m *Mock) Complete(ctx context.Context, req Request) (*Result, error) {
 	switch req.Kind {
 	case KindPlan:
 		return m.plan(req)
+	case KindListen:
+		return m.listen(req)
 	default:
 		return m.node(ctx, req)
 	}
+}
+
+// listen is the mock listener: a few verbs mark a new task, a question mark
+// a question, "simulate-listener-fail" a failure; everything else continues.
+func (m *Mock) listen(req Request) (*Result, error) {
+	text := strings.ToLower(req.Prompt)
+	if i := strings.Index(text, "### message\n"); i >= 0 {
+		text = text[i+len("### message\n"):]
+		if j := strings.Index(text, "\n### end"); j >= 0 {
+			text = text[:j]
+		}
+	}
+	switch {
+	case strings.Contains(text, "simulate-listener-fail"):
+		return nil, fmt.Errorf("mock: simulated listener failure")
+	case strings.Contains(text, "new task:") || strings.Contains(text, "做一个") || strings.Contains(text, "实现一个") ||
+		strings.Contains(text, "build a") || strings.Contains(text, "create a") || strings.Contains(text, "implement a"):
+		return &Result{Text: "task"}, nil
+	case strings.HasSuffix(strings.TrimSpace(text), "?") || strings.HasSuffix(strings.TrimSpace(text), "?"):
+		return &Result{Text: "question"}, nil
+	}
+	return &Result{Text: "continuation"}, nil
 }
 
 func (m *Mock) plan(req Request) (*Result, error) {
@@ -214,6 +238,23 @@ func (s *mockSession) coordinate(ctx context.Context, goal string, call callFn, 
 	}
 	agent := s.pickAgent(ctx)
 
+	// The assessment comes first: the engine sets the level from it and
+	// refuses delegate and workspace writes until it is filed. Idempotent.
+	if _, err := call("assess_task", map[string]any{
+		"summary": "(mock) " + firstLineOf(goal), "steps": 2, "parallel_branches": 2,
+		"roles": []string{"implementer"}, "changes_code": false, "est_files": 2,
+	}); err != nil {
+		return "", err
+	}
+
+	// The definition of done comes before any plan: what would prove the
+	// goal? Idempotent across rounds/reopens (a re-declaration replaces).
+	if _, err := call("declare_evidence", map[string]any{
+		"evidence": []map[string]any{{"claim": mockProof}},
+	}); err != nil {
+		return "", err
+	}
+
 	// The approval gate is asynchronous: propose ends the round; the human's
 	// decision wakes the next one. Each round re-reads the gate state, exactly
 	// as a real coordinator is instructed to.
@@ -263,10 +304,30 @@ func (s *mockSession) coordinate(ctx context.Context, goal string, call callFn, 
 		return s.finish(call, "succeeded", "(mock) converged after the task budget refused further delegation")
 	}
 
-	// Name the deliverable folder by topic before delegating, like a
-	// disciplined coordinator; on a reopened session the name is frozen and
-	// the refusal is expected.
-	call("name_output", map[string]any{"name": "mock-run"})
+	// A template task: the first static template the hub offers runs as one
+	// task of this run, and its outcome settles like any other task's.
+	if marker("simulate-template") {
+		out, err := call("list_templates", nil)
+		if err != nil {
+			return "", err
+		}
+		var tpls struct {
+			Templates []struct {
+				ID string `json:"id"`
+			} `json:"templates"`
+		}
+		json.Unmarshal([]byte(out), &tpls)
+		if len(tpls.Templates) == 0 {
+			return s.finish(call, "failed", "(mock) no template offered")
+		}
+		res, err := call("run_template", map[string]any{"template_id": tpls.Templates[0].ID, "goal": "(mock) template goal: " + goal})
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(log, "[template] %s\n", res)
+		call("await", map[string]any{"mode": "all", "timeout_sec": 60})
+		return s.finish(call, "succeeded", "(mock) template task settled")
+	}
 
 	instrA := "MOCK_QUICK MOCK_WRITE mock-a.txt part A of the goal"
 	if marker("simulate-fail") {
@@ -359,8 +420,14 @@ func mockWriteTarget(instr string) string {
 	return ""
 }
 
+// mockProof is the mock coordinator's one declared proof of the goal.
+const mockProof = "(mock) the delegated deliverables exist in the workspace and were inspected"
+
 func (s *mockSession) finish(call callFn, status, summary string) (string, error) {
-	if _, err := call("finish_run", map[string]any{"status": status, "summary": summary}); err != nil {
+	// A succeeded verdict must settle every declared proof; a failed one
+	// reports honestly that the proof is not met.
+	ev := []map[string]any{{"claim": mockProof, "met": status == "succeeded", "how": "(mock) inspect of mock-a.txt"}}
+	if _, err := call("finish_run", map[string]any{"status": status, "summary": summary, "evidence": ev}); err != nil {
 		return "", err
 	}
 	return "Coordination complete: " + summary, nil
@@ -421,7 +488,7 @@ func (s *mockSession) work(ctx context.Context, prompt string, call callFn) (str
 	}
 
 	// A MOCK_WRITE instruction is honored for real: the artifact lands in the
-	// exchange directory, so the engine's acceptance checks (and the
+	// run workspace, so the engine's acceptance checks (and the
 	// coordinator's inspect) run against something that actually exists.
 	// MOCK_SKIP simulates a lying worker: it claims the artifact without
 	// writing it, and must be caught by the engine's acceptance run.
@@ -448,8 +515,8 @@ func (s *mockSession) work(ctx context.Context, prompt string, call callFn) (str
 	return "Mock worker transcript.", nil
 }
 
-// exchangeDirOf extracts the run's exchange directory from a worker prompt.
-var exchangeDirRe = regexp.MustCompile(`exchange directory is: (\S+)`)
+// exchangeDirOf extracts the run's workspace from a worker prompt.
+var exchangeDirRe = regexp.MustCompile(`run's workspace is: (\S+)`)
 
 func exchangeDirOf(prompt string) string {
 	if m := exchangeDirRe.FindStringSubmatch(prompt); m != nil {
@@ -550,6 +617,16 @@ func clip(s string, n int) string {
 	}
 	if len(s) > n {
 		return s[:n] + "…"
+	}
+	return s
+}
+
+func firstLineOf(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 80 {
+		s = s[:80] + "…"
 	}
 	return s
 }

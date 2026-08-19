@@ -12,7 +12,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -280,13 +282,17 @@ func (s *Store) DeleteWorkflow(id string) error {
 
 // ---- runs ----
 
-func (s *Store) NewRun(wf *model.Workflow, goal, backend string) (*model.Run, error) {
+// NewRun creates a run. workspace is the user-chosen PROJECT directory this
+// run operates on (already normalized by NormalizeWorkspace); "" means no
+// project was selected, which is legal.
+func (s *Store) NewRun(wf *model.Workflow, goal, backend, workspace string) (*model.Run, error) {
 	r := &model.Run{
 		ID:           newID("run"),
 		WorkflowID:   wf.ID,
 		WorkflowName: wf.Name,
 		Goal:         goal,
 		Backend:      backend,
+		Workspace:    workspace,
 		Mode:         wf.EffectiveMode(),
 		Status:       model.RunPlanning,
 		Nodes:        map[string]*model.NodeState{},
@@ -297,9 +303,6 @@ func (s *Store) NewRun(wf *model.Workflow, goal, backend string) (*model.Run, er
 		// A dynamic run has nothing to plan: the coordinator starts immediately.
 		r.Status = model.RunRunning
 	}
-	if err := os.MkdirAll(s.RunWorkspace(r.ID), 0o755); err != nil {
-		return nil, err
-	}
 	if err := os.MkdirAll(filepath.Join(s.runDir(r.ID), "nodes"), 0o755); err != nil {
 		return nil, err
 	}
@@ -308,10 +311,23 @@ func (s *Store) NewRun(wf *model.Workflow, goal, backend string) (*model.Run, er
 
 func (s *Store) runDir(id string) string { return filepath.Join(s.dir, "runs", id) }
 
-// RunWorkspace is the run's shared exchange directory (absolute): upstream
-// artifacts land here and every node's deliverables must be written here.
+// RunWorkspace is the LEGACY internal exchange directory of a run (absolute).
+// Runs made before the workspace unification delivered here when they were
+// never named; it is kept only so those runs still resolve. New runs never
+// get one: their workspace is the user's directory (or the default root).
 func (s *Store) RunWorkspace(id string) string {
 	p := filepath.Join(s.runDir(id), "workspace")
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
+}
+
+// CoordinatorDir is the coordinator session's working directory: a private
+// folder beside the run's records, holding nothing the run cares about. It is
+// deliberately not the workspace and not named like one.
+func (s *Store) CoordinatorDir(id string) string {
+	p := filepath.Join(s.runDir(id), "coordinator")
 	if abs, err := filepath.Abs(p); err == nil {
 		return abs
 	}
@@ -404,6 +420,415 @@ func (s *Store) ListRuns() ([]*model.Run, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out, nil
+}
+
+// ---- workspaces ----
+// The project directories a run can be scoped to, remembered as an MRU list in
+// <data>/workspaces.json so the user picks instead of retyping a path. This is
+// a convenience over typing the path into the prompt; nothing in the engine
+// requires it, and the file not existing is simply an empty history.
+
+// workspaceEntry is one remembered project directory. Stored in
+// <data>/workspaces.json, newest first.
+type workspaceEntry struct {
+	Path     string    `json:"path"`
+	LastUsed time.Time `json:"last_used"`
+	Uses     int       `json:"uses"`
+}
+
+type workspaceFile struct {
+	Version    int              `json:"version"`
+	Workspaces []workspaceEntry `json:"workspaces"`
+}
+
+// maxRecentWorkspaces bounds the MRU list. 20 is enough to cover a person's
+// active projects and short enough that the dropdown never needs scrolling
+// tricks.
+const maxRecentWorkspaces = 20
+
+func (s *Store) workspacesPath() string { return filepath.Join(s.dir, "workspaces.json") }
+
+// NormalizeWorkspace turns a user-typed project path into the canonical form
+// stored and compared everywhere: ~ expanded, absolute, cleaned, and verified
+// to be an existing directory. The guards mirror hub.SetOutputDir: "/" and the
+// bare home directory are refused as too broad — a run scoped at $HOME is never
+// what anyone meant. There is deliberately NO "must be inside home" rule here;
+// projects legitimately live on external volumes, /opt or /srv. That
+// restriction belongs only to BrowseDirs, the one place that hands filesystem
+// structure back over HTTP.
+func NormalizeWorkspace(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", nil // empty is legal: "no workspace selected"
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot resolve ~: %v", err)
+		}
+		path = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(path, "~"), "/"))
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("workspace must be an absolute path (or start with ~/); got %q", path)
+	}
+	path = filepath.Clean(path)
+	if home, err := os.UserHomeDir(); path == "/" || (err == nil && path == home) {
+		return "", fmt.Errorf("workspace %q is too broad; pick a project directory", path)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("workspace %q does not exist", path)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("workspace %q is not a directory", path)
+	}
+	return path, nil
+}
+
+// ListRecentWorkspaces returns remembered project directories, most recently
+// used first. A missing file is an empty history, not an error. Entries whose
+// directory has since disappeared are filtered out of the RESULT but left in
+// the file (a temporarily unmounted volume must not silently lose history).
+func (s *Store) ListRecentWorkspaces() ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	wf, err := s.loadWorkspacesLocked()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(wf.Workspaces))
+	for _, e := range wf.Workspaces {
+		if fi, err := os.Stat(e.Path); err == nil && fi.IsDir() {
+			out = append(out, e.Path)
+		}
+	}
+	return out, nil
+}
+
+// loadWorkspacesLocked reads the MRU file. Must hold s.mu.
+func (s *Store) loadWorkspacesLocked() (*workspaceFile, error) {
+	var wf workspaceFile
+	if err := readJSON(s.workspacesPath(), &wf); err != nil {
+		if os.IsNotExist(err) {
+			return &workspaceFile{Version: 1}, nil
+		}
+		return nil, err
+	}
+	if wf.Version == 0 {
+		wf.Version = 1
+	}
+	return &wf, nil
+}
+
+// SaveRecentWorkspace records one use of a project directory, moving it to the
+// head of the MRU list. Callers pass the already-normalized path; it is
+// normalized again here so no caller can poison the file with "~/x" or a
+// trailing slash. A path that fails validation is dropped silently: remembering
+// history must never fail a run that already started.
+func (s *Store) SaveRecentWorkspace(path string) error {
+	norm, err := NormalizeWorkspace(path)
+	if err != nil || norm == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	wf, err := s.loadWorkspacesLocked()
+	if err != nil {
+		return err
+	}
+	uses := 1
+	kept := make([]workspaceEntry, 0, len(wf.Workspaces)+1)
+	for _, e := range wf.Workspaces {
+		if e.Path == norm {
+			uses = e.Uses + 1
+			continue // the old entry is replaced by the new head
+		}
+		kept = append(kept, e)
+	}
+	wf.Workspaces = append([]workspaceEntry{{Path: norm, LastUsed: time.Now(), Uses: uses}}, kept...)
+	if len(wf.Workspaces) > maxRecentWorkspaces {
+		wf.Workspaces = wf.Workspaces[:maxRecentWorkspaces]
+	}
+	return writeJSONAtomic(s.workspacesPath(), wf)
+}
+
+// DeleteWorkspace forgets one remembered directory. Removing a path that is not
+// in the list is a no-op, not an error — the UI's ✕ must be idempotent. A
+// directory that has since been deleted fails normalization, so the raw string
+// is used as the fallback key: history must stay removable either way.
+func (s *Store) DeleteWorkspace(path string) error {
+	norm := strings.TrimSpace(path)
+	if n, err := NormalizeWorkspace(norm); err == nil && n != "" {
+		norm = n
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	wf, err := s.loadWorkspacesLocked()
+	if err != nil {
+		return err
+	}
+	kept := wf.Workspaces[:0]
+	for _, e := range wf.Workspaces {
+		if e.Path != norm {
+			kept = append(kept, e)
+		}
+	}
+	wf.Workspaces = kept
+	return writeJSONAtomic(s.workspacesPath(), wf)
+}
+
+// DirEntry is one subdirectory in a browse listing. Empty marks a directory
+// with no entries at all — the only kind the picker lets the user rename,
+// because it is the kind the picker itself creates.
+type DirEntry struct {
+	Name  string `json:"name"`
+	Path  string `json:"path"`
+	Empty bool   `json:"empty,omitempty"`
+}
+
+// DirListing is the folder picker's view of one directory.
+type DirListing struct {
+	Path   string     `json:"path"`             // the directory listed (absolute, cleaned)
+	Parent string     `json:"parent,omitempty"` // "" when Path is the browse root
+	Home   string     `json:"home"`             // the browse root, for the UI's "go home"
+	Dirs   []DirEntry `json:"dirs"`
+	Trunc  bool       `json:"truncated,omitempty"`
+}
+
+// maxBrowseEntries bounds one listing; a directory with 100k children must not
+// become a 10 MB JSON response.
+const maxBrowseEntries = 500
+
+// BrowseDirs lists the SUBDIRECTORIES of one directory for the folder picker.
+//
+// Security posture — this is the only endpoint that reveals filesystem
+// structure, so it is deliberately the most restricted surface in loom:
+//   - the browse root is the user's home directory; "" means "list the root";
+//   - the requested path is ~-expanded, cleaned and made absolute, then
+//     resolved with filepath.EvalSymlinks, and the RESOLVED path must still be
+//     inside the resolved home — this is what stops `~/link-to-/etc` and any
+//     `..` escape (Clean already collapses `..`, EvalSymlinks closes the
+//     symlink hole Clean cannot see);
+//   - symlinked children are SKIPPED entirely rather than followed: a listing
+//     never leaves the tree it started in;
+//   - files are never listed, only directories — this endpoint cannot be used
+//     to enumerate documents;
+//   - dot-directories are hidden (.git, .venv noise);
+//   - the listing is capped at maxBrowseEntries.
+func (s *Store) BrowseDirs(path string) (*DirListing, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve the home directory: %v", err)
+	}
+	rootReal, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		rootReal = home
+	}
+
+	path = strings.TrimSpace(path)
+	if path == "" || path == "~" {
+		path = home
+	} else if strings.HasPrefix(path, "~/") {
+		path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
+	}
+	if !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("browse path must be absolute")
+	}
+	path = filepath.Clean(path)
+
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, fmt.Errorf("directory not found")
+	}
+	if !withinRoot(rootReal, real) {
+		return nil, fmt.Errorf("browsing outside the home directory is not allowed")
+	}
+	fi, err := os.Stat(real)
+	if err != nil || !fi.IsDir() {
+		return nil, fmt.Errorf("not a directory")
+	}
+
+	entries, err := os.ReadDir(real)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read directory")
+	}
+	out := &DirListing{Path: path, Home: home}
+	if real != rootReal {
+		out.Parent = filepath.Dir(path)
+	}
+	for _, e := range entries {
+		if len(out.Dirs) >= maxBrowseEntries {
+			out.Trunc = true
+			break
+		}
+		if !e.IsDir() {
+			continue // files are never listed
+		}
+		if e.Type()&os.ModeSymlink != 0 {
+			continue // never follow a symlink out of the tree
+		}
+		if strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		child := filepath.Join(path, e.Name())
+		out.Dirs = append(out.Dirs, DirEntry{Name: e.Name(), Path: child, Empty: dirIsEmpty(filepath.Join(real, e.Name()))})
+	}
+	sort.Slice(out.Dirs, func(i, j int) bool { return out.Dirs[i].Name < out.Dirs[j].Name })
+	return out, nil
+}
+
+// dirIsEmpty reports whether dir has no entries at all (dotfiles included —
+// a folder holding a .git is not empty). Unreadable counts as not empty: the
+// picker must never offer to rename what it cannot see into.
+func dirIsEmpty(dir string) bool {
+	f, err := os.Open(dir)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	_, err = f.Readdirnames(1)
+	return err == io.EOF
+}
+
+// pickerPath resolves a picker-supplied path under the same confinement as
+// BrowseDirs: ~-expanded, absolute, cleaned, symlink-resolved, and inside the
+// home directory. It returns the cleaned path (what the UI shows) and the
+// resolved one (what the filesystem is asked about).
+func pickerPath(path string) (clean, real string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", fmt.Errorf("cannot resolve the home directory: %v", err)
+	}
+	rootReal, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		rootReal = home
+	}
+	path = strings.TrimSpace(path)
+	if path == "" || path == "~" {
+		path = home
+	} else if strings.HasPrefix(path, "~/") {
+		path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
+	}
+	if !filepath.IsAbs(path) {
+		return "", "", fmt.Errorf("path must be absolute")
+	}
+	path = filepath.Clean(path)
+	real, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", "", fmt.Errorf("directory not found")
+	}
+	if !withinRoot(rootReal, real) {
+		return "", "", fmt.Errorf("only directories inside the home directory can be managed here")
+	}
+	return path, real, nil
+}
+
+// folderNameRe is what the picker accepts as a new folder name: one path
+// component, no dot-prefix, no separators, no shell-hostile characters.
+var folderNameRe = regexp.MustCompile(`^[A-Za-z0-9\p{Han}][A-Za-z0-9\p{Han}._ -]{0,63}$`)
+
+func checkFolderName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("folder name is required")
+	}
+	if !folderNameRe.MatchString(name) || name == "." || name == ".." || strings.HasSuffix(name, ".") {
+		return fmt.Errorf("folder name %q is not allowed: use letters, digits, '-', '_', '.' or spaces, without a leading dot", name)
+	}
+	return nil
+}
+
+// MkdirWorkspace creates parent/name for the picker and returns the new
+// directory's cleaned absolute path. Confined to the home directory like
+// BrowseDirs; an existing name is an error, never silently reused.
+func (s *Store) MkdirWorkspace(parent, name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if err := checkFolderName(name); err != nil {
+		return "", err
+	}
+	clean, real, err := pickerPath(parent)
+	if err != nil {
+		return "", err
+	}
+	if fi, err := os.Stat(real); err != nil || !fi.IsDir() {
+		return "", fmt.Errorf("parent is not a directory")
+	}
+	if err := os.Mkdir(filepath.Join(real, name), 0o755); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return "", fmt.Errorf("%q already exists here", name)
+		}
+		return "", fmt.Errorf("cannot create folder: %v", err)
+	}
+	return filepath.Join(clean, name), nil
+}
+
+// RenameWorkspaceDir renames the directory at path to name (same parent) and
+// returns the new path. Only an EMPTY directory may be renamed — the picker
+// creates empty folders, and that is the only kind of folder it should be
+// able to move; a populated project or a run's live workspace is out of
+// bounds. The MRU history follows the rename.
+func (s *Store) RenameWorkspaceDir(path, name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if err := checkFolderName(name); err != nil {
+		return "", err
+	}
+	clean, real, err := pickerPath(path)
+	if err != nil {
+		return "", err
+	}
+	home, _ := os.UserHomeDir()
+	if clean == home || clean == "/" {
+		return "", fmt.Errorf("that directory cannot be renamed")
+	}
+	if fi, err := os.Stat(real); err != nil || !fi.IsDir() {
+		return "", fmt.Errorf("not a directory")
+	}
+	if !dirIsEmpty(real) {
+		return "", fmt.Errorf("only an empty folder can be renamed here — this one already has content")
+	}
+	if filepath.Base(clean) == name {
+		return clean, nil
+	}
+	target := filepath.Join(filepath.Dir(real), name)
+	if _, err := os.Lstat(target); err == nil {
+		return "", fmt.Errorf("%q already exists here", name)
+	}
+	if err := os.Rename(real, target); err != nil {
+		return "", fmt.Errorf("cannot rename: %v", err)
+	}
+	newPath := filepath.Join(filepath.Dir(clean), name)
+	s.replaceRecentWorkspace(clean, newPath)
+	return newPath, nil
+}
+
+// replaceRecentWorkspace rewrites one MRU entry's path in place (best effort:
+// history must never fail a rename that already happened on disk).
+func (s *Store) replaceRecentWorkspace(oldPath, newPath string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	wf, err := s.loadWorkspacesLocked()
+	if err != nil {
+		return
+	}
+	changed := false
+	for i := range wf.Workspaces {
+		if wf.Workspaces[i].Path == oldPath {
+			wf.Workspaces[i].Path = newPath
+			changed = true
+		}
+	}
+	if changed {
+		writeJSONAtomic(s.workspacesPath(), wf)
+	}
+}
+
+// withinRoot reports whether p is root or lives under it. The separator guard
+// is what makes "/home/bobby" fail against root "/home/bob".
+func withinRoot(root, p string) bool {
+	if p == root {
+		return true
+	}
+	return strings.HasPrefix(p, root+string(filepath.Separator))
 }
 
 // ---- amendments ----

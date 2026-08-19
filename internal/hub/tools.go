@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -27,9 +28,10 @@ func (h *Hub) buildServer(rs *RunSession, id identity) *mcp.Server {
 	case RoleCoordinator:
 		h.addCoordinatorTools(srv, rs)
 	case RolePair:
-		// The resident implementer's task binding moves between calls; every
+		// A resident partner's task binding moves between calls; every
 		// handler resolves it fresh from the ledger.
-		h.addWorkerTools(srv, rs, rs.PairTask, true)
+		agent := id.agent
+		h.addWorkerTools(srv, rs, func() string { return rs.PairTask(agent) }, true)
 	default:
 		taskID := id.taskID
 		h.addWorkerTools(srv, rs, func() string { return taskID }, false)
@@ -70,9 +72,9 @@ type listAgentsOut struct {
 
 type acceptanceCheckIn struct {
 	Kind       string `json:"kind" jsonschema:"artifact_exists | artifact_contains | command"`
-	Path       string `json:"path,omitempty" jsonschema:"artifact checks: path relative to the exchange directory"`
+	Path       string `json:"path,omitempty" jsonschema:"artifact checks: path relative to the run workspace"`
 	Pattern    string `json:"pattern,omitempty" jsonschema:"artifact_contains: regexp the file content must match"`
-	Command    string `json:"command,omitempty" jsonschema:"command check: shell command run in the exchange directory; exit 0 = pass"`
+	Command    string `json:"command,omitempty" jsonschema:"command check: shell command run in the run workspace; exit 0 = pass"`
 	TimeoutSec int    `json:"timeout_sec,omitempty"`
 }
 
@@ -87,12 +89,13 @@ func toChecks(in []acceptanceCheckIn) []model.AcceptanceCheck {
 }
 
 type delegateIn struct {
-	Agent       string `json:"agent" jsonschema:"name of an agent from list_agents"`
-	Model       string `json:"model,omitempty" jsonschema:"model tier for THIS task, chosen by difficulty: haiku (mechanical, low-ambiguity), sonnet (standard work), opus (hard reasoning — the ceiling for workers). Empty = the agent's default model"`
-	Title       string `json:"title,omitempty" jsonschema:"short label for the task tree"`
-	Instruction string `json:"instruction" jsonschema:"self-contained task; the worker cannot see your context"`
-	Constraints string `json:"constraints" jsonschema:"cross-domain constraints the worker cannot infer: interfaces, formats, style, boundaries with other tasks. 'none' if genuinely none"`
-	ContextHint string `json:"context_hint,omitempty" jsonschema:"background the worker needs, e.g. which upstream artifacts to read. Never for independent verifiers"`
+	Agent       string   `json:"agent" jsonschema:"name of an agent from list_agents"`
+	Model       string   `json:"model,omitempty" jsonschema:"model tier for THIS task, chosen by difficulty: haiku (mechanical, low-ambiguity), sonnet (standard work), opus (hard reasoning — the ceiling for workers). Empty = the agent's default model"`
+	Title       string   `json:"title,omitempty" jsonschema:"short label for the task tree"`
+	Instruction string   `json:"instruction" jsonschema:"self-contained task; the worker cannot see your context"`
+	Constraints string   `json:"constraints" jsonschema:"cross-domain constraints the worker cannot infer: interfaces, formats, style, boundaries with other tasks. 'none' if genuinely none"`
+	ContextHint string   `json:"context_hint,omitempty" jsonschema:"background the worker needs, e.g. which upstream artifacts to read. Never for independent verifiers"`
+	Scope       []string `json:"scope,omitempty" jsonschema:"workspace paths (relative; files or directory prefixes) this task OWNS while it runs: the worker may only write inside them and nobody else may write there meanwhile — enforced by the engine. Give one whenever tasks run in parallel on the same project"`
 
 	Acceptance []acceptanceCheckIn `json:"acceptance" jsonschema:"machine-checkable passing criteria, fixed now, executed by the engine when the worker finishes. The worker's own report never decides"`
 	RetryOf    string              `json:"retry_of,omitempty" jsonschema:"id of a failed task this delegation reworks; only allowed when it failed as 'blocked'"`
@@ -138,13 +141,56 @@ type proposePlanIn struct {
 		Title string `json:"title"`
 		Why   string `json:"why,omitempty"`
 	} `json:"tasks"`
-	Agents     []createAgentIn `json:"agents,omitempty" jsonschema:"new agents you intend to create, if any"`
-	OutputName string          `json:"output_name,omitempty" jsonschema:"short kebab-case topic name for the deliverable folder under the output root, e.g. trading-health-check"`
+	Agents   []createAgentIn `json:"agents,omitempty" jsonschema:"new agents you intend to create, if any"`
+	Evidence []evidenceIn    `json:"evidence,omitempty" jsonschema:"the definition of done: observable proofs that the goal is met (same as declare_evidence; required before any delegate)"`
 }
 
-type nameOutputIn struct {
-	Name string `json:"name,omitempty" jsonschema:"short kebab-case topic name for the deliverable folder under the default output root, e.g. trading-health-check"`
-	Dir  string `json:"dir,omitempty" jsonschema:"absolute path (or ~/...) the USER asked the deliverables to land in; overrides the default root. Only when the user explicitly named a location"`
+type evidenceIn struct {
+	Claim         string `json:"claim" jsonschema:"one observable proof an outsider could check, e.g. 'a digest email from the app arrives in the user's inbox' or 'go test ./... passes in the workspace'"`
+	NeedsFromUser string `json:"needs_from_user,omitempty" jsonschema:"what only the user can supply for this proof to be checkable (credentials, an account, a device); empty if nothing"`
+}
+
+type assessIn struct {
+	Summary          string   `json:"summary" jsonschema:"one line: what the task is"`
+	Steps            int      `json:"steps" jsonschema:"distinct steps you expect (honest estimate, ≥1)"`
+	Modules          []string `json:"modules,omitempty" jsonschema:"modules / areas of the project touched"`
+	ParallelBranches int      `json:"parallel_branches" jsonschema:"how many of those steps are INDEPENDENT of each other and could run in parallel (0 or 1 = none)"`
+	Roles            []string `json:"roles,omitempty" jsonschema:"kinds of work needed: implementer, reviewer, researcher, writer, …"`
+	ChangesCode      bool     `json:"changes_code" jsonschema:"does it modify source code (not just docs)?"`
+	EstFiles         int      `json:"est_files" jsonschema:"estimated number of files created or modified"`
+}
+
+type listTemplatesIn struct{}
+
+type templateCard struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type listTemplatesOut struct {
+	Templates []templateCard `json:"templates"`
+}
+
+type runTemplateIn struct {
+	TemplateID string `json:"template_id" jsonschema:"id from list_templates"`
+	Title      string `json:"title,omitempty" jsonschema:"short label for the task tree"`
+	Goal       string `json:"goal" jsonschema:"self-contained goal for the template's planner; name the concrete paths in this workspace"`
+}
+
+type requestLevelIn struct {
+	Level string `json:"level" jsonschema:"pair or orchestrate (higher than the current level)"`
+	Why   string `json:"why" jsonschema:"what you found that needs the extra structure"`
+}
+
+type declareEvidenceIn struct {
+	Evidence []evidenceIn `json:"evidence" jsonschema:"the complete list (replaces any earlier declaration)"`
+}
+
+type evidenceResultIn struct {
+	Claim string `json:"claim" jsonschema:"the declared proof, verbatim"`
+	Met   bool   `json:"met"`
+	How   string `json:"how,omitempty" jsonschema:"how you verified it: task id + acceptance command, inspected file, observed effect. Required when met"`
 }
 
 type askUserIn struct {
@@ -152,13 +198,14 @@ type askUserIn struct {
 }
 
 type finishRunIn struct {
-	Status    string   `json:"status" jsonschema:"succeeded or failed"`
-	Summary   string   `json:"summary" jsonschema:"what was achieved, or what is missing and why"`
-	Artifacts []string `json:"artifacts,omitempty" jsonschema:"paths relative to the exchange directory"`
+	Status    string             `json:"status" jsonschema:"succeeded or failed"`
+	Summary   string             `json:"summary" jsonschema:"what was achieved, or what is missing and why"`
+	Artifacts []string           `json:"artifacts,omitempty" jsonschema:"paths relative to the run workspace"`
+	Evidence  []evidenceResultIn `json:"evidence,omitempty" jsonschema:"one entry per declared proof: met + how. succeeded requires every proof met"`
 }
 
 type inspectIn struct {
-	Path string `json:"path" jsonschema:"file path relative to the exchange directory"`
+	Path string `json:"path" jsonschema:"file path relative to the run workspace"`
 }
 
 type amendAcceptanceIn struct {
@@ -229,8 +276,8 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 				Tools: a.Tools, MaxTurns: a.MaxTurns, SystemPrompt: a.SystemPrompt,
 			})
 		}
-		if in.OutputName != "" {
-			if err := rs.SetOutputName(in.OutputName); err != nil {
+		if len(in.Evidence) > 0 {
+			if err := rs.DeclareEvidence(evidenceItems(in.Evidence)); err != nil {
 				return toolErr("%v", err), nil, nil
 			}
 		}
@@ -241,9 +288,95 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
+		Name: "declare_evidence",
+		Description: "Declare the run's DEFINITION OF DONE: the observable proofs that would show the goal is met. " +
+			"Required before the first delegate (propose_plan may carry it instead). Each proof is something an outsider " +
+			"could check — an email that arrives, a command that exits 0, a page that renders — never \"tasks completed\". " +
+			"Name what only the user can supply (needs_from_user); such proofs force an ask_user before you build. " +
+			"finish_run(succeeded) is refused until every proof is reported met with how you verified it. Calling it " +
+			"again replaces the list (a goal that changes changes its proofs).",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in declareEvidenceIn) (*mcp.CallToolResult, any, error) {
+		activity("declare_evidence")
+		if err := rs.DeclareEvidence(evidenceItems(in.Evidence)); err != nil {
+			return toolErr("%v", err), nil, nil
+		}
+		return okf(rs, "Definition of done recorded (%d proofs). It appears in your round prompt; finish_run must settle every item.", len(in.Evidence)), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "assess_task",
+		Description: "File your structured ASSESSMENT of the task in front of you — required before you change anything " +
+			"(workspace writes and delegate are refused while an assessment is pending: at the start of a run, when " +
+			"the user brings a new task, and when the engine sees the work outgrowing the last assessment). Give " +
+			"honest estimates: distinct steps, modules touched, independent parallel branches, roles needed " +
+			"(implementer/reviewer/researcher/…), whether it changes code, estimated files. The ENGINE turns this into " +
+			"the run's level (solo/pair/orchestrate) with fixed thresholds — you do not choose the level. Re-file " +
+			"whenever the task materially changes.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in assessIn) (*mcp.CallToolResult, any, error) {
+		activity("assess_task")
+		a, err := rs.Assess(model.TaskAssessment{Summary: in.Summary, Steps: in.Steps, Modules: in.Modules,
+			ParallelBranches: in.ParallelBranches, Roles: in.Roles, ChangesCode: in.ChangesCode, EstFiles: in.EstFiles})
+		if err != nil {
+			return toolErr("%v", err), nil, nil
+		}
+		applied := "applied"
+		if !a.Applied {
+			applied = "NOT applied (the level is pinned by the workflow or set by the user)"
+		}
+		return okf(rs, "Assessment recorded. Triage → %s (%s): %s. Current level: %s — %s",
+			a.Level, applied, strings.Join(a.Reasons, "; "), rs.Level(), levelLine(rs.Level())), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "list_templates",
+		Description: "List the static workflow TEMPLATES you can run as one task (run_template): each is a planner that " +
+			"turns a goal into a fixed DAG of agent tasks executed deterministically in this workspace. Use one when the " +
+			"work matches a template's shape (repeatable, well-understood pipelines) instead of hand-delegating it.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ listTemplatesIn) (*mcp.CallToolResult, any, error) {
+		activity("list_templates")
+		var out listTemplatesOut
+		for _, w := range rs.Templates() {
+			out.Templates = append(out.Templates, templateCard{ID: w.ID, Name: w.Name, Description: w.Description})
+		}
+		data, _ := json.Marshal(out)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: rs.withNotice(string(data))}}}, out, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "run_template",
+		Description: "Run a static workflow template as ONE task of this run: the template's planner decomposes your goal " +
+			"into a DAG, the engine executes it in this workspace, and the task settles with the template run's outcome " +
+			"(await it like any task; inspect its deliverables). Same gates as delegate (assessment, evidence, budget). " +
+			"The goal must be self-contained — the template cannot see this conversation.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in runTemplateIn) (*mcp.CallToolResult, any, error) {
+		activity("run_template → " + in.TemplateID)
+		t, err := rs.DelegateTemplate(TemplateRequest{TemplateID: in.TemplateID, Title: in.Title, Goal: in.Goal})
+		if err != nil {
+			if errors.Is(err, ErrApprovalPending) {
+				return toolErr("%v. Call propose_plan first and wait for it to return.", err), nil, nil
+			}
+			return toolErr("%v", err), nil, nil
+		}
+		return okf(rs, "template task %s created (%s); await it to collect the outcome", t.ID, t.Title), delegateOut{TaskID: t.ID, Status: t.Status}, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "request_level",
+		Description: "Ask the engine to RAISE the run's level (solo → pair → orchestrate) when the work turns out to need " +
+			"more structure than triage gave it. You can only ask for a higher level; lowering is the user's decision " +
+			"(ask_user). Refused when the user set the level on this run.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in requestLevelIn) (*mcp.CallToolResult, any, error) {
+		activity("request_level → " + in.Level)
+		if err := rs.RequestLevel(in.Level, in.Why); err != nil {
+			return toolErr("%v", err), nil, nil
+		}
+		return okf(rs, "Level is now %s — %s", rs.Level(), levelLine(rs.Level())), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ask_user",
-		Description: "Ask the user clarifying questions BEFORE committing to a plan — scope, priorities, and always " +
-			"the deliverable location. Batch every open question into ONE call, then END YOUR TURN; the user's " +
+		Description: "Ask the user clarifying questions BEFORE committing to a plan — scope, priorities, open " +
+			"design choices. Batch every open question into ONE call, then END YOUR TURN; the user's " +
 			"answer arrives as a message in your next round. Never ask what you can decide yourself, and never " +
 			"ask twice what was already answered.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in askUserIn) (*mcp.CallToolResult, any, error) {
@@ -252,30 +385,6 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 			return toolErr("%v", err), nil, nil
 		}
 		return okf(rs, "Question delivered to the user. End your turn now — their answer will wake your next round."), nil, nil
-	})
-
-	mcp.AddTool(srv, &mcp.Tool{
-		Name: "name_output",
-		Description: "Set this run's deliverable folder. Default: a short kebab-case topic name under the output " +
-			"root. When the USER named a location, pass it as dir (absolute or ~/ path) and it is honored verbatim. " +
-			"Do this BEFORE delegating — the folder freezes at the first dispatch, and an unnamed run gets an " +
-			"automatic name.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in nameOutputIn) (*mcp.CallToolResult, any, error) {
-		switch {
-		case in.Dir != "":
-			activity("name_output → " + in.Dir)
-			if err := rs.SetOutputDir(in.Dir); err != nil {
-				return toolErr("%v", err), nil, nil
-			}
-		case in.Name != "":
-			activity("name_output " + in.Name)
-			if err := rs.SetOutputName(in.Name); err != nil {
-				return toolErr("%v", err), nil, nil
-			}
-		default:
-			return toolErr("pass name (topic under the default root) or dir (user-chosen absolute path)"), nil, nil
-		}
-		return okf(rs, "Deliverable folder: %s — every artifact of this run lands there.", rs.Workspace()), nil, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -288,7 +397,7 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 		activity("delegate → " + in.Agent)
 		t, err := rs.Delegate(DelegateRequest{
 			Agent: in.Agent, Model: in.Model, Title: in.Title, Instruction: in.Instruction,
-			Constraints: in.Constraints, ContextHint: in.ContextHint,
+			Constraints: in.Constraints, ContextHint: in.ContextHint, Scope: in.Scope,
 			Acceptance: toChecks(in.Acceptance), RetryOf: in.RetryOf,
 			CreatedBy: RoleCoordinator, Depth: 1,
 		})
@@ -377,7 +486,7 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "inspect",
-		Description: "Read a deliverable from the exchange directory (audited, truncated at 16KB). This is your " +
+		Description: "Read a deliverable from the run workspace (audited, truncated at 16KB). This is your " +
 			"ONLY read access to the work: use it to verify what workers actually produced. Declaring success " +
 			"requires having inspected at least one deliverable.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in inspectIn) (*mcp.CallToolResult, any, error) {
@@ -403,7 +512,7 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "record_project_fact",
-		Description: "Append one durable fact to PROJECT.md in the exchange directory — the cross-run memory of " +
+		Description: "Append one durable fact to PROJECT.md in the run workspace — the cross-run memory of " +
 			"the PROJECT itself: domain constraints, conventions, and user corrections (e.g. \"data X changes " +
 			"quarterly, never poll it\", \"the user wants options staged for review before integration\"). When " +
 			"the user corrects a wrong assumption, record the correction IMMEDIATELY. Workers see PROJECT.md in " +
@@ -469,19 +578,34 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "finish_run",
 		Description: "Declare the run finished. Call this exactly once, when the goal is met or when you have " +
-			"concluded it cannot be. Success requires having inspected at least one deliverable. After calling " +
-			"it, end your turn.",
+			"concluded it cannot be. \"succeeded\" requires: every declared proof reported met (evidence, with how), " +
+			"at least one deliverable inspected, and — when the pool has an independent agent — an independent review " +
+			"completed after the last code change. Otherwise finish as failed and say exactly what is missing. After " +
+			"calling it, end your turn.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in finishRunIn) (*mcp.CallToolResult, any, error) {
 		activity("finish_run")
 		status := model.RunSucceeded
 		if strings.EqualFold(in.Status, "failed") {
 			status = model.RunFailed
 		}
-		if err := rs.Finish(&Verdict{Status: status, Summary: in.Summary, Artifacts: in.Artifacts}); err != nil {
+		var results []EvidenceResult
+		for _, r := range in.Evidence {
+			results = append(results, EvidenceResult{Claim: r.Claim, Met: r.Met, How: r.How})
+		}
+		if err := rs.Finish(&Verdict{Status: status, Summary: in.Summary, Artifacts: in.Artifacts, Evidence: results}); err != nil {
 			return toolErr("%v", err), nil, nil
 		}
 		return okf(rs, "Run recorded as %s. Stop working and end your turn now.", status), nil, nil
 	})
+}
+
+// evidenceItems converts tool input into ledger items.
+func evidenceItems(in []evidenceIn) []EvidenceItem {
+	out := make([]EvidenceItem, 0, len(in))
+	for _, e := range in {
+		out = append(out, EvidenceItem{Claim: e.Claim, NeedsFromUser: e.NeedsFromUser})
+	}
+	return out
 }
 
 // CreateAgent validates a coordinator-proposed agent against the same
@@ -613,7 +737,7 @@ type reportProgressIn struct {
 }
 
 type writeArtifactIn struct {
-	Path    string `json:"path" jsonschema:"file path relative to the exchange directory, e.g. research-findings.md"`
+	Path    string `json:"path" jsonschema:"file path relative to the run workspace, e.g. research-findings.md"`
 	Content string `json:"content" jsonschema:"the file content (UTF-8); for a large document, write it in chunks with append=true"`
 	Append  bool   `json:"append,omitempty" jsonschema:"append to the file instead of overwriting it"`
 }
@@ -644,7 +768,7 @@ type reportResultIn struct {
 	Status       string   `json:"status" jsonschema:"ok | error"`
 	FailureKind  string   `json:"failure_kind,omitempty" jsonschema:"required when status=error: spec-unclear | blocked | missing-dependency | conflict"`
 	Summary      string   `json:"summary" jsonschema:"SHORT: what you did and which files you delivered, or what stopped you — the substance lives in the artifacts, not here"`
-	Artifacts    []string `json:"artifacts,omitempty" jsonschema:"paths relative to the exchange directory"`
+	Artifacts    []string `json:"artifacts,omitempty" jsonschema:"paths relative to the run workspace"`
 	Observations string   `json:"observations,omitempty" jsonschema:"anything the contract did not cover that the coordinator should know: a spec that seems wrong, a coupling you noticed, a default you had to invent. Speaking up here is part of the job"`
 }
 
@@ -656,7 +780,7 @@ type reportResultIn struct {
 func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskOf func() string, resident bool) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "write_artifact",
-		Description: "Write a deliverable file into the run's exchange directory. Substantial text output — a " +
+		Description: "Write a deliverable file into the run workspace. Substantial text output — a " +
 			"report, analysis, spec, review — is delivered as a Markdown file this way (or with your own file " +
 			"tools), NEVER pasted into messages or the result summary. Works even if you have no file tools. " +
 			"Overwrites unless append=true; large documents go in chunks.",
@@ -669,7 +793,7 @@ func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskOf func() stri
 			return toolErr("%v", err), nil, nil
 		}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(
-			"Wrote %s (%d bytes) into the exchange directory. List it in your report_result artifacts.",
+			"Wrote %s (%d bytes) into the run workspace. List it in your report_result artifacts.",
 			in.Path, len(in.Content))}}}, nil, nil
 	})
 
@@ -738,7 +862,7 @@ func (h *Hub) addWorkerTools(srv *mcp.Server, rs *RunSession, taskOf func() stri
 	if resident {
 		mcp.AddTool(srv, &mcp.Tool{
 			Name: "record_project_fact",
-			Description: "Append one durable fact to PROJECT.md in the exchange directory — the cross-run memory " +
+			Description: "Append one durable fact to PROJECT.md in the run workspace — the cross-run memory " +
 				"of the PROJECT: domain constraints, conventions, corrections. You are the role that actually reads " +
 				"the code; when you learn something every future task must honor, record it.",
 		}, func(ctx context.Context, _ *mcp.CallToolRequest, in recordProjectFactIn) (*mcp.CallToolResult, any, error) {

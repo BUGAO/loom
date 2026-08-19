@@ -50,6 +50,7 @@ func testSession(t *testing.T, budget model.BudgetConfig) (*RunSession, *fakeExe
 		OnChange:  func(*model.Run) {},
 	})
 	t.Cleanup(rs.Close)
+	declareTestEvidence(t, rs)
 	return rs, exec
 }
 
@@ -57,6 +58,20 @@ func openBudget() model.BudgetConfig {
 	b := model.DefaultBudget()
 	b.ApprovalPolicy = model.ApprovalNone
 	return b
+}
+
+// testEvidenceMet is the finish-time report that settles the test proof.
+func testEvidenceMet() []EvidenceResult {
+	return []EvidenceResult{{Claim: "test proof: the deliverables exist", Met: true, How: "test"}}
+}
+
+// declareTestEvidence gives a session the definition of done every real run
+// declares before delegating — the delegate gate insists on it.
+func declareTestEvidence(t *testing.T, rs *RunSession) {
+	t.Helper()
+	if err := rs.DeclareEvidence([]EvidenceItem{{Claim: "test proof: the deliverables exist"}}); err != nil {
+		t.Fatalf("declare evidence: %v", err)
+	}
 }
 
 // okChecks is a minimal valid acceptance contract for policy tests that are
@@ -175,90 +190,6 @@ func TestAskUserFlow(t *testing.T) {
 	}
 	if msgs := rs.TakeUserChat(); len(msgs) != 1 {
 		t.Fatalf("answer should be queued for the next round, got %v", msgs)
-	}
-}
-
-// The poe2-build-advisor bug: name_output("topic") followed by propose_plan
-// carrying output_name "topic" again claimed a SECOND directory ("topic-2") —
-// colliding with the run's own first claim — and orphaned the first.
-func TestOutputNameRepeatAndRename(t *testing.T) {
-	rs, _ := testSession(t, openBudget())
-	root := t.TempDir()
-	rs.cfg.OutputRoot = root
-
-	if err := rs.SetOutputName("topic"); err != nil {
-		t.Fatal(err)
-	}
-	first := rs.Workspace()
-	if filepath.Base(first) != "topic" {
-		t.Fatalf("first claim should be the plain name, got %s", first)
-	}
-
-	// Repeating the same topic must be a no-op, not a fresh claim.
-	if err := rs.SetOutputName("topic"); err != nil {
-		t.Fatal(err)
-	}
-	if rs.Workspace() != first {
-		t.Fatalf("repeat naming moved the folder: %s → %s", first, rs.Workspace())
-	}
-	if entries, _ := os.ReadDir(root); len(entries) != 1 {
-		t.Fatalf("repeat naming should not claim extra directories, root has %d", len(entries))
-	}
-
-	// A genuine rename claims the new name and releases the old empty claim.
-	if err := rs.SetOutputName("better-topic"); err != nil {
-		t.Fatal(err)
-	}
-	if filepath.Base(rs.Workspace()) != "better-topic" {
-		t.Fatalf("rename should take effect, got %s", rs.Workspace())
-	}
-	if _, err := os.Stat(first); !os.IsNotExist(err) {
-		t.Fatalf("old empty claim should be released, stat err: %v", err)
-	}
-
-	// A rename never deletes work: a non-empty old folder stays.
-	if err := os.WriteFile(filepath.Join(rs.Workspace(), "x.md"), []byte("hi"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	kept := rs.Workspace()
-	if err := rs.SetOutputName("third"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(kept, "x.md")); err != nil {
-		t.Fatalf("non-empty old folder must be kept: %v", err)
-	}
-}
-
-func TestSetOutputDir(t *testing.T) {
-	rs, _ := testSession(t, openBudget())
-
-	if err := rs.SetOutputDir("relative/path"); err == nil {
-		t.Fatal("relative path must be refused")
-	}
-	if err := rs.SetOutputDir("/"); err == nil {
-		t.Fatal("filesystem root must be refused")
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		if err := rs.SetOutputDir(home); err == nil {
-			t.Fatal("home itself must be refused")
-		}
-	}
-
-	dir := filepath.Join(t.TempDir(), "my-deliverables")
-	if err := rs.SetOutputDir(dir); err != nil {
-		t.Fatal(err)
-	}
-	if rs.Workspace() != dir {
-		t.Fatalf("workspace should be the user's dir, got %s", rs.Workspace())
-	}
-	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-		t.Fatalf("user dir should exist: %v", err)
-	}
-
-	// The first dispatch freezes the folder; moving it afterwards is refused.
-	mustDelegate(t, rs, "alpha")
-	if err := rs.SetOutputDir(filepath.Join(t.TempDir(), "elsewhere")); err == nil {
-		t.Fatal("moving the output dir after dispatch must be refused")
 	}
 }
 
@@ -709,7 +640,7 @@ func TestApprovalRejectionAllowsRepropose(t *testing.T) {
 
 func TestFinishIsOnce(t *testing.T) {
 	rs, _ := testSession(t, openBudget())
-	if err := rs.Finish(&Verdict{Status: model.RunSucceeded, Summary: "ok"}); err != nil {
+	if err := rs.Finish(&Verdict{Status: model.RunSucceeded, Summary: "ok", Evidence: testEvidenceMet()}); err != nil {
 		t.Fatal(err)
 	}
 	if err := rs.Finish(&Verdict{Status: model.RunFailed, Summary: "no"}); err == nil {

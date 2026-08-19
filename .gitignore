@@ -1,3 +1,4 @@
 data/
 /loom
 .acp/node_modules/
+.claude/

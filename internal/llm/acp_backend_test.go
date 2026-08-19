@@ -141,7 +141,7 @@ func TestDenyListFor(t *testing.T) {
 
 func TestOpenWritesToolJail(t *testing.T) {
 	dir := t.TempDir()
-	if err := writeToolJail(dir, "Read", ""); err != nil {
+	if err := writeToolJail(dir, "Read", "", false); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(dir + "/.claude/settings.local.json")

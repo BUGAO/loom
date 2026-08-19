@@ -85,6 +85,7 @@ func TestIndependentAgentRejectsContextHint(t *testing.T) {
 		OnChange:  func(*model.Run) {},
 	})
 	t.Cleanup(rs.Close)
+	declareTestEvidence(t, rs)
 
 	_, err := rs.Delegate(DelegateRequest{
 		Agent: "reviewer", Instruction: "review the code", Constraints: "none", Acceptance: okChecks(),
@@ -387,7 +388,7 @@ func TestFinishSuccessRequiresInspection(t *testing.T) {
 	rs.TaskStarted(task.ID)
 	rs.CompleteTaskWith(task.ID, "done", []string{"report.md"}, nil, "", nil)
 
-	err := rs.Finish(&Verdict{Status: model.RunSucceeded, Summary: "all good"})
+	err := rs.Finish(&Verdict{Status: model.RunSucceeded, Summary: "all good", Evidence: testEvidenceMet()})
 	if err == nil || !strings.Contains(err.Error(), "inspect") {
 		t.Fatalf("success without any inspection must be refused, got: %v", err)
 	}
@@ -399,7 +400,7 @@ func TestFinishSuccessRequiresInspection(t *testing.T) {
 	if !strings.Contains(content, "the deliverable") {
 		t.Fatalf("inspect returned wrong content: %q", content)
 	}
-	if err := rs.Finish(&Verdict{Status: model.RunSucceeded, Summary: "all good"}); err != nil {
+	if err := rs.Finish(&Verdict{Status: model.RunSucceeded, Summary: "all good", Evidence: testEvidenceMet()}); err != nil {
 		t.Fatalf("success after inspection should be accepted: %v", err)
 	}
 }
@@ -525,70 +526,30 @@ func TestAwaitRoundParksUntilNotice(t *testing.T) {
 	}
 }
 
-// ---- deliverable folder naming (workflow-output) ----
+// ---- workspace (one directory per run) ----
 
-func outputSession(t *testing.T, root string) (*RunSession, *fakeExec) {
-	t.Helper()
-	h := New("http://test", func() ([]*model.Agent, error) { return nil, nil })
-	exec := newFakeExec()
-	budget := openBudget()
-	run := &model.Run{ID: "run_out_" + fmt.Sprint(delegateN.Add(1)), Mode: model.ModeDynamic, Tasks: map[string]*model.Task{}}
-	rs := h.OpenRun(context.Background(), RunConfig{
-		Run:      run,
-		Workflow: &model.Workflow{Mode: model.ModeDynamic, Budget: &budget},
-		Pool: []*model.Agent{
-			{Name: "alpha", Description: "a"},
-		},
-		Workspace:  t.TempDir(),
-		OutputRoot: root,
-		Exec:       exec,
-		OnChange:   func(*model.Run) {},
-	})
-	t.Cleanup(rs.Close)
-	return rs, exec
-}
-
-func TestOutputNameValidatedAndClaimed(t *testing.T) {
-	root := t.TempDir()
-	rs, _ := outputSession(t, root)
-
-	for _, bad := range []string{"", "UPPER", "has space", "../escape", "-lead", strings.Repeat("x", 60)} {
-		if err := rs.SetOutputName(bad); err == nil {
-			t.Errorf("name %q should be refused", bad)
-		}
-	}
-	if err := rs.SetOutputName("trading-health-check"); err != nil {
-		t.Fatal(err)
-	}
-	want := filepath.Join(root, "trading-health-check")
-	if rs.Workspace() != want {
-		t.Fatalf("workspace should be the named folder, got %s", rs.Workspace())
-	}
-	if _, err := os.Stat(want); err != nil {
-		t.Fatal("the folder must exist on naming")
-	}
-
-	// A second run with the same topic gets a suffixed folder, not a collision.
-	rs2, _ := outputSession(t, root)
-	if err := rs2.SetOutputName("trading-health-check"); err != nil {
-		t.Fatal(err)
-	}
-	if got := rs2.Workspace(); got != filepath.Join(root, "trading-health-check-2") {
-		t.Fatalf("colliding name should be suffixed, got %s", got)
-	}
-}
-
-func TestOutputFreezesOnFirstDispatch(t *testing.T) {
-	root := t.TempDir()
-	rs, _ := outputSession(t, root)
-	mustDelegate(t, rs, "alpha") // dispatch → auto-name + freeze
-
+// The workspace is fixed at open and is what every prompt names: the run's
+// deliverables and its project are the same folder, and nothing renames it.
+func TestWorkspaceIsFixedAtOpen(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
 	ws := rs.Workspace()
-	if filepath.Dir(ws) != root {
-		t.Fatalf("auto-named workspace should live under the output root, got %s", ws)
+	if ws == "" {
+		t.Fatal("a session must have a workspace")
 	}
-	if err := rs.SetOutputName("late-name"); err == nil {
-		t.Fatal("renaming after the first dispatch must be refused")
+	mustDelegate(t, rs, "alpha")
+	if rs.Workspace() != ws {
+		t.Fatalf("dispatch must not move the workspace: %s → %s", ws, rs.Workspace())
+	}
+	run := rs.Run()
+	if run.OutputDir != "" || run.OutputName != "" {
+		t.Fatalf("the hub must not name output folders any more: %q %q", run.OutputDir, run.OutputName)
+	}
+	p := RoundPrompt(run, rs, 1, nil, nil)
+	if !strings.Contains(p, "## Workspace\n"+ws) {
+		t.Fatalf("round prompt should name the workspace:\n%s", p)
+	}
+	if strings.Contains(p, "name_output") || strings.Contains(p, "xchange director") {
+		t.Fatalf("round prompt still speaks of output naming / exchange directories:\n%s", p)
 	}
 }
 
@@ -612,35 +573,6 @@ func TestRoundPromptDoesNotGrowWithRounds(t *testing.T) {
 	}
 }
 
-// A legacy session (tasks exist, no named folder) keeps its internal exchange
-// directory: deliverables must not move mid-conversation.
-func TestLegacyRunKeepsInternalWorkspace(t *testing.T) {
-	root := t.TempDir()
-	h := New("http://test", func() ([]*model.Agent, error) { return nil, nil })
-	internalWS := t.TempDir()
-	run := &model.Run{ID: "run_legacy", Mode: model.ModeDynamic, Tasks: map[string]*model.Task{
-		"task_old": {ID: "task_old", Agent: "alpha", Status: model.TaskCompleted},
-	}, TaskOrder: []string{"task_old"}}
-	budget := openBudget()
-	rs := h.OpenRun(context.Background(), RunConfig{
-		Run:        run,
-		Workflow:   &model.Workflow{Mode: model.ModeDynamic, Budget: &budget},
-		Pool:       []*model.Agent{{Name: "alpha", Description: "a"}},
-		Workspace:  internalWS,
-		OutputRoot: root,
-		Exec:       newFakeExec(),
-		OnChange:   func(*model.Run) {},
-	})
-	t.Cleanup(rs.Close)
-
-	if rs.Workspace() != internalWS {
-		t.Fatalf("legacy run should keep the internal workspace, got %s", rs.Workspace())
-	}
-	if err := rs.SetOutputName("late"); err == nil {
-		t.Fatal("naming a legacy run with dispatched tasks must be refused")
-	}
-}
-
 // Image attachments are files on disk; the round prompt carries their names so
 // the coordinator can connect the inline images to the words around them.
 func TestRoundPromptNamesAttachedImages(t *testing.T) {
@@ -654,5 +586,208 @@ func TestRoundPromptNamesAttachedImages(t *testing.T) {
 		if !strings.Contains(p, want) {
 			t.Fatalf("round prompt should mention %q:\n%s", want, p)
 		}
+	}
+}
+
+// ---- contract gates: build needs test, no dry-run acceptance ----
+
+// The newspush run shipped 11k lines with zero tests because every contract's
+// bar was "go build". A build/lint check now requires a test command beside
+// it; a dry-run/mock flag in an acceptance command is refused outright.
+func TestValidateChecksBuildNeedsTestAndNoDryRun(t *testing.T) {
+	cmd := func(c string) model.AcceptanceCheck {
+		return model.AcceptanceCheck{Kind: model.CheckCommand, Command: c}
+	}
+	exists := model.AcceptanceCheck{Kind: model.CheckArtifactExists, Path: "README.md"}
+
+	// build without test → refused, naming the offending check.
+	err := ValidateChecks([]model.AcceptanceCheck{exists, cmd("cd /p && go build ./... && go vet ./...")})
+	if err == nil || !strings.Contains(err.Error(), "no TEST command") {
+		t.Fatalf("build-only contract should be refused, got %v", err)
+	}
+	// build + test → fine.
+	if err := ValidateChecks([]model.AcceptanceCheck{cmd("go build ./..."), cmd("go test ./...")}); err != nil {
+		t.Fatalf("build+test contract should pass: %v", err)
+	}
+	// Other ecosystems.
+	if err := ValidateChecks([]model.AcceptanceCheck{cmd("cd web && npm run build")}); err == nil {
+		t.Fatal("npm build without test should be refused")
+	}
+	if err := ValidateChecks([]model.AcceptanceCheck{cmd("cd web && npm run build"), cmd("cd web && npm test -- --run")}); err != nil {
+		t.Fatalf("npm build+test should pass: %v", err)
+	}
+	if err := ValidateChecks([]model.AcceptanceCheck{cmd("cargo build"), cmd("cargo test")}); err != nil {
+		t.Fatalf("cargo build+test should pass: %v", err)
+	}
+	// No build check at all (docs task) → no test demanded.
+	if err := ValidateChecks([]model.AcceptanceCheck{exists}); err != nil {
+		t.Fatalf("artifact-only contract should pass: %v", err)
+	}
+	// A test-only contract is fine too.
+	if err := ValidateChecks([]model.AcceptanceCheck{cmd("pytest -q")}); err != nil {
+		t.Fatalf("test-only contract should pass: %v", err)
+	}
+	// "test" as a shell builtin is not a test runner.
+	if err := ValidateChecks([]model.AcceptanceCheck{cmd("test -f install.sh")}); err != nil {
+		t.Fatalf("shell test builtin must not trip the build rule: %v", err)
+	}
+
+	// dry-run / mock flags → refused whatever else is there.
+	for _, c := range []string{"./newspush send --dry-run", "./app deploy --dry_run", "./x --mock", "tool --no-send"} {
+		if err := ValidateChecks([]model.AcceptanceCheck{cmd(c), cmd("go test ./...")}); err == nil || !strings.Contains(err.Error(), "dry-run/mock") {
+			t.Errorf("%q should be refused as a dry-run acceptance, got %v", c, err)
+		}
+	}
+	// A dry-run flag inside a task INSTRUCTION is not this rule's business;
+	// only contracts are checked. Ensure a plain command still passes.
+	if err := ValidateChecks([]model.AcceptanceCheck{cmd("./newspush send"), cmd("go test ./...")}); err != nil {
+		t.Fatalf("real send should pass: %v", err)
+	}
+}
+
+// ---- definition of done (evidence) ----
+
+// No proofs, no tasks; a proof that needs the user forces an ask_user first;
+// re-declaration replaces; the round prompt shows the list.
+func TestEvidenceGatesDelegate(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	rs.mu.Lock()
+	rs.run.Evidence = nil // undo the helper's declaration: this test is about the gate
+	rs.mu.Unlock()
+
+	_, err := rs.Delegate(DelegateRequest{Agent: "alpha", Instruction: "x", Constraints: "none",
+		Acceptance: okChecks(), CreatedBy: RoleCoordinator, Depth: 1})
+	if err == nil || !strings.Contains(err.Error(), "declare_evidence") {
+		t.Fatalf("delegate without a definition of done must be refused, got %v", err)
+	}
+	// External (A2A) callers are not the coordinator; they are not gated.
+	if _, err := rs.Delegate(DelegateRequest{Agent: "alpha", Instruction: "x", CreatedBy: CreatedByExternal, Depth: 1}); err != nil {
+		t.Fatalf("external delegate should not be gated on evidence: %v", err)
+	}
+
+	if err := rs.DeclareEvidence(nil); err == nil {
+		t.Fatal("empty declaration must be refused")
+	}
+	if err := rs.DeclareEvidence([]EvidenceItem{{Claim: "a digest email arrives in the inbox", NeedsFromUser: "SMTP credentials"}}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = rs.Delegate(DelegateRequest{Agent: "alpha", Instruction: "x", Constraints: "none",
+		Acceptance: okChecks(), CreatedBy: RoleCoordinator, Depth: 1})
+	if err == nil || !strings.Contains(err.Error(), "ask_user") {
+		t.Fatalf("a proof needing the user must force an ask_user before building, got %v", err)
+	}
+	if err := rs.AskUser("Which credentials can I use to send mail?"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rs.Delegate(DelegateRequest{Agent: "alpha", Instruction: "x", Constraints: "none",
+		Acceptance: okChecks(), CreatedBy: RoleCoordinator, Depth: 1}); err != nil {
+		t.Fatalf("after asking, delegate should pass: %v", err)
+	}
+	p := RoundPrompt(rs.Run(), rs, 2, nil, nil)
+	if !strings.Contains(p, "## Definition of done (declared proofs)") || !strings.Contains(p, "digest email arrives") ||
+		!strings.Contains(p, "needs from user: SMTP credentials") {
+		t.Fatalf("round prompt should list the proofs:\n%s", p)
+	}
+}
+
+// succeeded needs every proof reported met with how; anything else is a
+// failed run — which is always allowed.
+func TestFinishSettlesEvidence(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	if err := rs.DeclareEvidence([]EvidenceItem{{Claim: "email arrives"}, {Claim: "go test passes"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Unreported proof.
+	err := rs.Finish(&Verdict{Status: model.RunSucceeded, Summary: "done",
+		Evidence: []EvidenceResult{{Claim: "go test passes", Met: true, How: "task_1 acceptance"}}})
+	if err == nil || !strings.Contains(err.Error(), "email arrives") {
+		t.Fatalf("succeeded with an unreported proof must be refused, got %v", err)
+	}
+	// Unmet proof.
+	err = rs.Finish(&Verdict{Status: model.RunSucceeded, Summary: "done", Evidence: []EvidenceResult{
+		{Claim: "go test passes", Met: true, How: "task_1 acceptance"},
+		{Claim: "email arrives", Met: false, How: "no SMTP"},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "not met") {
+		t.Fatalf("succeeded with an unmet proof must be refused, got %v", err)
+	}
+	// Met without how.
+	err = rs.Finish(&Verdict{Status: model.RunSucceeded, Summary: "done", Evidence: []EvidenceResult{
+		{Claim: "go test passes", Met: true, How: "task_1 acceptance"},
+		{Claim: "email arrives", Met: true},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "no verification") {
+		t.Fatalf("met without how must be refused, got %v", err)
+	}
+	// Failed with the gap named is always fine, and records the results.
+	if err := rs.Finish(&Verdict{Status: model.RunFailed, Summary: "no way to send mail", Evidence: []EvidenceResult{
+		{Claim: "go test passes", Met: true, How: "task_1 acceptance"},
+		{Claim: "email arrives", Met: false, How: "user has no credentials"},
+	}}); err != nil {
+		t.Fatalf("honest failure must be accepted: %v", err)
+	}
+	ev := rs.Evidence()
+	if len(ev) != 2 || !ev[1].Met || ev[0].Met || ev[0].How != "user has no credentials" {
+		t.Fatalf("results should be recorded on the run: %+v", ev)
+	}
+}
+
+// ---- independent review gate ----
+
+func TestFinishRequiresIndependentReviewAfterLastCodeChange(t *testing.T) {
+	h := New("http://test", func() ([]*model.Agent, error) { return nil, nil })
+	budget := openBudget()
+	run := &model.Run{ID: "run_review", Mode: model.ModeDynamic, Tasks: map[string]*model.Task{}}
+	rs := h.OpenRun(context.Background(), RunConfig{
+		Run: run, Workflow: &model.Workflow{Mode: model.ModeDynamic, Budget: &budget},
+		Pool: []*model.Agent{
+			{Name: "implementer", Description: "codes", Tools: "Read,Write,Edit,Bash"},
+			{Name: "doc-writer", Description: "docs", Tools: "Read,Write"},
+			{Name: "reviewer", Description: "reviews", Tools: "Read", Independent: true},
+		},
+		Workspace: t.TempDir(), Exec: newFakeExec(), OnChange: func(*model.Run) {},
+	})
+	t.Cleanup(rs.Close)
+	declareTestEvidence(t, rs)
+	os.WriteFile(filepath.Join(rs.Workspace(), "x.go"), []byte("package x"), 0o644)
+	finish := func() error {
+		rs.Inspect("x.go")
+		return rs.Finish(&Verdict{Status: model.RunSucceeded, Summary: "ok", Evidence: testEvidenceMet()})
+	}
+	complete := func(agent string) *model.Task {
+		task := mustDelegate(t, rs, agent)
+		rs.TaskStarted(task.ID)
+		rs.CompleteTaskWith(task.ID, "done", []string{"x.go"}, nil, "", nil)
+		time.Sleep(2 * time.Millisecond) // EndedAt ordering
+		return task
+	}
+
+	complete("implementer")
+	if err := finish(); err == nil || !strings.Contains(err.Error(), "independently reviewed") {
+		t.Fatalf("success after unreviewed implementation must be refused, got %v", err)
+	}
+	complete("reviewer")
+	complete("implementer") // fixes after the review → review is stale
+	if err := finish(); err == nil || !strings.Contains(err.Error(), "independently reviewed") {
+		t.Fatalf("a review older than the last code change must not count, got %v", err)
+	}
+	complete("reviewer")
+	complete("doc-writer") // documents after the review do not invalidate it
+	if err := finish(); err != nil {
+		t.Fatalf("reviewed implementation should be allowed to succeed: %v", err)
+	}
+}
+
+// Without an independent agent in the pool nobody could review, so the gate
+// does not apply (the prompt already says review is impossible there).
+func TestReviewGateNeedsAnIndependentAgent(t *testing.T) {
+	rs, _ := testSession(t, openBudget()) // pool: alpha, beta, writer, vip — none independent
+	os.WriteFile(filepath.Join(rs.Workspace(), "x.go"), []byte("package x"), 0o644)
+	task := mustDelegate(t, rs, "writer")
+	rs.TaskStarted(task.ID)
+	rs.CompleteTaskWith(task.ID, "done", []string{"x.go"}, nil, "", nil)
+	rs.Inspect("x.go")
+	if err := rs.Finish(&Verdict{Status: model.RunSucceeded, Summary: "ok", Evidence: testEvidenceMet()}); err != nil {
+		t.Fatalf("no independent agent → no review gate: %v", err)
 	}
 }

@@ -446,6 +446,16 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
   max-height: 34%; overflow-y: auto; flex-shrink: 0;
 }
 .wf-run-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+/* Definition of done — the declared proofs and their settled state. */
+.wf-evidence { margin: 0 0 8px; font-size: 12px; }
+.wf-evidence summary { cursor: pointer; color: var(--muted); font-size: 11.5px; user-select: none; }
+.wf-evidence summary .badge { margin-left: 6px; }
+.ev-item { display: flex; align-items: baseline; gap: 7px; padding: 3px 4px; }
+.ev-dot { color: var(--muted); font-size: 11px; flex-shrink: 0; width: 12px; text-align: center; }
+.ev-item.met .ev-dot { color: #86efac; }
+.ev-claim { min-width: 0; }
+.ev-need { color: var(--warn); font-size: 11px; white-space: nowrap; }
+.ev-how { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
 .wf-tasks { display: flex; flex-direction: column; gap: 5px; }
 .wf-task {
   display: flex; align-items: center; gap: 10px; padding: 7px 11px;
@@ -556,6 +566,133 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
 }
 .wf-chat-input textarea:focus { box-shadow: none; border: none; }
 .composer-bar { display: flex; align-items: center; gap: 8px; padding: 4px 2px 0; }
+
+/* Workspace selector — the project directory this session works on, picked
+   above the prompt instead of typed into it. Shape borrowed from .ses-chip
+   (same pill radius, same gradient-border "selected"), panel from
+   .thread-panel's frosted glass. No new colours: selection is --grad-full,
+   hover is --panel2, exactly as everywhere else. */
+.ws-pick { position: relative; padding: 0 2px 6px; }
+.ws-selector {
+  display: inline-flex; align-items: center; gap: 7px; max-width: 100%;
+  padding: 5px 10px; border: 1px solid var(--border); border-radius: 999px;
+  background: rgba(255, 255, 255, 0.025); color: var(--muted);
+  font-size: 12px; cursor: pointer; user-select: none;
+  transition: border-color .15s, color .15s;
+}
+.ws-selector:hover { border-color: rgba(139, 92, 246, 0.45); color: var(--text); }
+.ws-selector:focus-visible { outline: none; border-color: rgba(139, 92, 246, 0.6); }
+.ws-pick.on .ws-selector {
+  border: 1.5px solid transparent; padding: 4.5px 9.5px; color: var(--text);
+  background: linear-gradient(#1a2138, #1a2138) padding-box, var(--grad-full) border-box;
+}
+/* A frozen session's workspace is readable but not editable: no caret, no ✕. */
+.ws-pick.locked .ws-selector { cursor: default; opacity: .85; }
+.ws-pick.locked .ws-caret { display: none; }
+.ws-selector .ws-ico { display: inline-flex; flex-shrink: 0; }
+.ws-selector .ws-ico svg { width: 13px; height: 13px; display: block; }
+.ws-label { display: inline-flex; align-items: baseline; gap: 7px; min-width: 0; }
+.ws-label b { font-weight: 600; flex-shrink: 0; }
+.ws-label .ws-path {
+  color: var(--muted); font-size: 11px; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px;
+}
+.ws-label .ws-none { white-space: nowrap; }
+/* The default workspace is a quiet fact, not a choice: a small tag says so. */
+.ws-tag {
+  font-size: 10px; color: var(--muted); border: 1px solid var(--border);
+  border-radius: 999px; padding: 0 6px; line-height: 15px; flex-shrink: 0; align-self: center;
+}
+.ws-selector .ws-x {
+  color: var(--muted); padding: 0 3px; border-radius: 50%; line-height: 1;
+  font-size: 11px; flex-shrink: 0;
+}
+.ws-selector .ws-x:hover { color: #fda4af; }
+.ws-selector .ws-x[hidden] { display: none; }
+.ws-caret { color: var(--muted); font-size: 10px; flex-shrink: 0; }
+
+/* The dropdown opens UPWARD: the composer sits at the bottom of the viewport,
+   so a downward panel would be clipped by the window. */
+.ws-dropdown {
+  position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 8;
+  width: min(460px, calc(100vw - 48px)); padding: 8px;
+  border: 1px solid var(--border); border-radius: 14px;
+  background: rgba(15, 20, 38, 0.96); backdrop-filter: blur(22px);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+}
+.ws-dropdown[hidden], .ws-dropdown #wf-ws-main[hidden] { display: none; }
+.ws-manual { display: flex; gap: 8px; align-items: center; padding: 0 2px; }
+.ws-manual input {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; min-width: 0;
+}
+.ws-manual button { flex-shrink: 0; }
+.ws-sec-head { font-size: 11px; color: var(--muted); padding: 10px 6px 5px; }
+.ws-recent { max-height: 240px; overflow-y: auto; }
+.ws-recent-item {
+  display: flex; align-items: baseline; gap: 8px; padding: 6px 8px;
+  border-radius: 9px; cursor: pointer; font-size: 12.5px;
+}
+.ws-recent-item:hover { background: var(--panel2); }
+.ws-recent-item.selected {
+  background: linear-gradient(120deg, rgba(139, 92, 246, .18), rgba(34, 211, 238, .10));
+}
+.ws-item-name { font-weight: 600; flex-shrink: 0; }
+.ws-item-path {
+  color: var(--muted); font-size: 11px; flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Selecting is the primary action here; removing is secondary, so the ✕ only
+   materializes on hover instead of permanently fragmenting the click target. */
+.ws-item-x {
+  padding: 0 5px; color: var(--muted); border-radius: 50%; line-height: 1;
+  font-size: 11px; opacity: 0; flex-shrink: 0; transition: opacity .12s;
+}
+.ws-recent-item:hover .ws-item-x { opacity: 1; }
+.ws-item-x:hover { color: #fda4af; }
+.ws-empty { font-size: 11.5px; color: var(--muted); padding: 10px 8px; line-height: 1.6; }
+.ws-foot { display: flex; align-items: center; gap: 8px; padding: 8px 2px 2px; }
+
+/* Folder browser — replaces the dropdown's body in place rather than stacking
+   a modal on top: one popover, one focus context, one Escape to leave. */
+.ws-browse-panel[hidden] { display: none; }
+.ws-crumb {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px;
+  color: var(--muted); padding: 2px 4px 8px; word-break: break-all;
+}
+.ws-dirs {
+  height: 260px; overflow-y: auto; padding: 4px;
+  border: 1px solid var(--border-soft); border-radius: 10px;
+}
+.ws-dir-entry {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+  border-radius: 8px; cursor: pointer; font-size: 13px; user-select: none;
+}
+.ws-dir-entry:hover { background: var(--panel2); }
+.ws-dir-entry.selected {
+  background: linear-gradient(120deg, rgba(139, 92, 246, .18), rgba(34, 211, 238, .10));
+}
+.ws-dir-entry svg { width: 15px; height: 15px; flex-shrink: 0; color: var(--muted); }
+.ws-dir-entry span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-dir-entry .ws-dir-name { flex: 1; min-width: 0; }
+/* Rename is secondary to navigation: the ✎ shows on hover, like the recent
+   list's ✕, and only on empty folders (the server enforces the same rule). */
+.ws-dir-edit {
+  padding: 0 5px; color: var(--muted); border-radius: 6px; line-height: 1;
+  font-size: 12px; opacity: 0; flex-shrink: 0; transition: opacity .12s;
+}
+.ws-dir-entry:hover .ws-dir-edit, .ws-dir-entry.selected .ws-dir-edit { opacity: 1; }
+.ws-dir-edit:hover { color: var(--text); background: var(--panel2); }
+.ws-inline {
+  width: 100%; min-width: 0; padding: 2px 6px; font-size: 12.5px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.ws-dir-new { cursor: default; }
+
+@media (max-width: 760px) {
+  .ws-label .ws-path { max-width: 130px; }
+  .ws-dropdown { width: calc(100vw - 40px); }
+  .ws-dirs { height: 200px; }
+}
 
 /* Icon buttons (attach etc.): quiet until hovered, same radius family as the
    rest of the chrome, icon inherits currentColor. */
@@ -677,3 +814,92 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
   color: var(--muted); padding: 0 4px; border-radius: 50%; line-height: 1;
 }
 .ses-chip .ses-x:hover { color: #fda4af; }
+
+/* run view tabs — detail and topology are two readings of one snapshot */
+.rtabs { display: flex; gap: 6px; margin: -6px 0 14px; }
+.rtab {
+  padding: 6px 14px; border-radius: 999px; font-size: 12.5px; font-weight: 500;
+  color: var(--muted); border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.025); transition: color .15s, border-color .15s;
+}
+.rtab:hover { color: var(--text); border-color: rgba(139, 92, 246, 0.45); }
+.rtab.active {
+  color: var(--text); border: 1.5px solid transparent; padding: 5.5px 13.5px;
+  background: linear-gradient(#1a2138, #1a2138) padding-box, var(--grad-full) border-box;
+}
+
+/* topology: the canvas owns its own pixels, so the stage is only a frame —
+   everything layered over it (tip, legend, HUD) is positioned in the canvas's
+   own CSS-pixel space and must not eat pointer events. */
+.topo-stat { font-size: 12px; color: var(--muted); }
+.topo-panel { display: grid; grid-template-columns: 1fr 340px; gap: 14px; align-items: start; }
+.topo-stage {
+  position: relative; height: min(72vh, 720px); min-height: 420px; overflow: hidden;
+  border: 1px solid var(--border); border-radius: 16px; backdrop-filter: blur(14px);
+  background: radial-gradient(120% 90% at 50% 45%, rgba(139, 92, 246, 0.10), transparent 62%),
+              var(--panel-glass);
+}
+.topo-stage canvas { display: block; width: 100%; height: 100%; }
+.topo-tip {
+  position: absolute; z-index: 3; pointer-events: none; max-width: 260px;
+  padding: 8px 11px; border-radius: 12px; font-size: 12.5px; line-height: 1.5;
+  background: rgba(10, 13, 28, 0.92); border: 1px solid var(--border);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45); backdrop-filter: blur(8px);
+}
+/* the engine toggles the hidden property, which a display rule would defeat */
+.topo-tip[hidden] { display: none; }
+.topo-hud {
+  position: absolute; left: 14px; top: 12px; pointer-events: none;
+  font-size: 11.5px; color: var(--muted); line-height: 1.7;
+}
+.topo-legend {
+  position: absolute; left: 14px; bottom: 12px; pointer-events: none;
+  display: flex; gap: 6px; flex-wrap: wrap;
+}
+.topo-legend .chip { font-size: 10.5px; padding: 2px 8px; background: rgba(10, 13, 28, 0.55); }
+.topo-side { max-height: min(72vh, 720px); min-height: 420px; overflow-y: auto; }
+.topo-side h3 { font-size: 14px; margin-bottom: 4px; }
+.topo-side [data-back] { margin-bottom: 10px; }
+@media (max-width: 1000px) {
+  .topo-panel { grid-template-columns: 1fr; }
+  .topo-side { max-height: none; min-height: 0; }
+}
+
+/* ---- level control & live trace ---- */
+.lvl-sel { font-size: 11px; padding: 1px 4px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel-solid); color: var(--text); }
+.lvl-sel.solo, .badge.lvl.solo { border-color: var(--ok); }
+.lvl-sel.pair, .badge.lvl.pair { border-color: var(--accent); }
+.lvl-sel.orchestrate, .badge.lvl.orchestrate { border-color: var(--warn); }
+.ctrace { margin-top: 6px; font-size: 11px; color: var(--muted); }
+.ctrace summary { cursor: pointer; }
+.ctrace-line { padding: 1px 0 1px 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 640px; }
+.cursor { animation: blink 1s steps(2) infinite; color: var(--accent); }
+@keyframes blink { 50% { opacity: 0; } }
+.cmsg.sys .cbody { border-style: dashed; }
+.triage-card .badge.lvl { margin-right: 6px; }
+
+/* ---- session list (left column of 会话) ---- */
+.ses-list { display: flex; flex-direction: column; gap: 4px; }
+.ses-item { padding: 7px 9px; border-radius: 8px; border: 1px solid transparent; cursor: pointer; }
+.ses-item:hover { background: var(--panel2); }
+.ses-item.selected { background: var(--panel2); border-color: var(--border); }
+.ses-row { display: flex; align-items: center; gap: 6px; }
+.ses-goal { flex: 1; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ses-meta { font-size: 11px; padding-left: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ses-item .ses-x { opacity: 0; }
+.ses-item:hover .ses-x { opacity: 1; }
+.wf-sessions { display: none !important; }
+.settings-tabs { display: flex; gap: 6px; margin: 0 0 14px; }
+.settings-tabs a { padding: 6px 12px; border-radius: 8px; border: 1px solid var(--border); font-size: 12.5px; color: var(--muted); }
+.settings-tabs a.on { color: var(--text); background: var(--panel2); }
+.tpl-card { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; margin-bottom: 8px; }
+.tpl-card .tpl-main { flex: 1; min-width: 0; }
+.tpl-card .tpl-desc { font-size: 12px; color: var(--muted); }
+.ses-item .tdot { width: 7px; height: 7px; border-radius: 50%; background: var(--idle); flex-shrink: 0; }
+.ses-item.running .tdot, .ses-item.planning .tdot { background: #67e8f9; animation: pulse 1.2s infinite; }
+.ses-item.succeeded .tdot { background: #86efac; }
+.ses-item.failed .tdot { background: #fda4af; }
+.ses-item.awaiting_approval .tdot { background: var(--warn); box-shadow: 0 0 8px rgba(251, 191, 36, 0.5); }
+.ses-item .ses-x { color: var(--muted); padding: 0 4px; border-radius: 50%; line-height: 1; cursor: pointer; }
+.ses-item .ses-x:hover { color: #fda4af; }
+.badge { white-space: nowrap; }

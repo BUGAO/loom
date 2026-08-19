@@ -68,7 +68,7 @@ data/agents/<name>/
     .claude/skills/      该 agent 的私有 skills(SKILL.md,会话自动加载)
 ```
 
-节点执行时 ACP 会话在 agent 自己的 home 中启动——AGENTS.md 和私有 skills 被运行时原生加载(实测:agent 会在任务中显式调用自己的 skill)。工具白名单**双重强制**:除了应答权限请求,loom 在每次开会话前把白名单编译成 Claude Code 原生 `permissions.deny` 规则写入会话 cwd 的 `.claude/settings.local.json`(loom 托管,勿手改)——只读工具与 Task 默认不发权限请求,deny 规则是对它们唯一有效的机制层拦截;coordinator 白名单为空,因此除 hub 工具外一切被禁,派活是它唯一能做的事。deny 规则还带**路径级条目(path-deny)**:即使 Write/Edit 在白名单里,loom 自身的控制面(agent 定义与 AGENTS.md/私有 skills、workflow 配置、run 台账、会话自己的 settings 文件)对它们也是死的——agent 改不了自己的身份、别人的身份和自己的锁;Bash 无法被路径规则约束,是与直接使用 Claude Code 相同的信任边界。coordinator 每次开新会话前,其 cwd 中被投放的 AGENTS.md/CLAUDE.md 会被清除(防 worker 注入)。跨节点协作走 run 的**交换目录** `data/runs/<id>/workspace/`:节点 prompt 中给出其绝对路径,上游产物在此,交付物必须写到此;agent 自己的 home 用于草稿和跨 run 积累。skills 可在 UI 的 agent 编辑器中直接增删改。
+节点执行时 ACP 会话在 agent 自己的 home 中启动——AGENTS.md 和私有 skills 被运行时原生加载(实测:agent 会在任务中显式调用自己的 skill)。工具白名单**双重强制**:除了应答权限请求,loom 在每次开会话前把白名单编译成 Claude Code 原生 `permissions.deny` 规则写入会话 cwd 的 `.claude/settings.local.json`(loom 托管,勿手改)——只读工具与 Task 默认不发权限请求,deny 规则是对它们唯一有效的机制层拦截;main agent 的白名单来自工作流设置(默认全部),何时允许动手由 level 经 hook 网关实时判定(D38/D39)。deny 规则还带**路径级条目(path-deny)**:即使 Write/Edit 在白名单里,loom 自身的控制面(agent 定义与 AGENTS.md/私有 skills、workflow 配置、run 台账、会话自己的 settings 文件)对它们也是死的——agent 改不了自己的身份、别人的身份和自己的锁;Bash 无法被路径规则约束,是与直接使用 Claude Code 相同的信任边界。hook 网关按会话身份实时判定每次工具调用(白名单、loom 控制面、任务 scope、level),拒绝时把原因原文交给模型;用户工作区里的 settings.local.json 只合并 loom 的路径规则与 hook 条目,最后一个会话退出即清理。跨节点协作走 run 的**交换目录** `data/runs/<id>/workspace/`:节点 prompt 中给出其绝对路径,上游产物在此,交付物必须写到此;agent 自己的 home 用于草稿和跨 run 积累。skills 可在 UI 的 agent 编辑器中直接增删改。
 
 ## 运行生命周期(static)
 
@@ -172,8 +172,12 @@ worker 下一轮收到通知),引擎按修订后的契约判定。
 一轮结束时台账零变化,引擎注入一次纠正提示(常见于 delegate 被拒后模型放弃重试),再安静就挂起等事件,
 不空转、不判死。goal 是对话的第一条消息;用户随时追加,下一个轮次送达,每轮的收尾文本作为 main agent
 的聊天回复展示给用户。对话持久化在 run 里,用户消息同时进审计事件流。
-coordinator 的会话没有任何文件工具:它读产物的唯一通道是 hub 的 `inspect` 工具——有审计、有计数,
-这也是「验收实读门槛」能成为机制而非期望的原因。
+main agent 是**飞行员**(D39):它的会话住在 run 的工作区里、有自己的文件工具和 shell(`coordinator.tools`,
+默认全部),像一个 Claude Code 会话;但它什么时候**能动手**由 run 的 **level** 决定——`solo` 自己动手、`pair`
+自己动手 + 常驻伙伴、`orchestrate` 只派单(写操作被引擎的 **hook 网关**(D38)当场拒绝并告诉它原因)。level 由
+工作流钉死、引擎默认或用户在会话头上随时改,main agent 自己改不了。它自己写的代码同样要过独立评审门。
+读产物的**审计**通道仍是 hub 的 `inspect` 工具——finish 门只认它的计数,这是「验收实读门槛」能成为机制而非
+期望的原因。
 
 状态全部外置的直接收益:**会话可恢复、可重开**。进程死掉后 run 标记 `interrupted`,已验收任务原样保留、
 在途任务判 failed(blocked,可返工),`POST /api/runs/{id}/resume` 从台账续跑;已交付的会话被新消息
@@ -202,12 +206,13 @@ static 模式的节点 prompt 只给它上游**产物路径**、不给上游自�
 会附上独立评审指引:实质性实现里程碑在接受前应委派独立评审(coordinator 自己的 inspect 读过作者汇报,
 不算独立),高严重度发现按 blocked 返工——这是给 main agent 的判断依据,不是引擎门禁,机械/低风险工作可跳过。
 
-**产物目录:`~/workflow-output/<主题名>/`**
+**工作区:一个 run 只有一个目录**
 
-dynamic run 的交换目录本体就在输出根下(`-output` flag / `LOOM_OUTPUT`,默认 `~/workflow-output`),
-产物外部实时可见。短名由 main agent 按主题起:`name_output` 工具或 `propose_plan.output_name`
-(kebab-case ≤40 字符,重名自动 `-2` 后缀);**首个任务派发时冻结**,没起名自动兜底 `MMDD-<runid短>`。
-删除会话不删产物目录。static 模式维持内部交换目录。
+每个 run 只有一个目录——**工作区**:既是 agent 读写的项目目录,也是所有产物落地的地方,没有独立的
+"产物目录/交换目录"。工作区在会话发起时由用户在 UI 里选(选择器支持最近使用、浏览、**新建文件夹并重命名**),
+不选则用默认工作区(`-output` flag / `LOOM_OUTPUT`,默认 `~/workflow-output`)。coordinator 不再给
+产物起名(`name_output` 已移除),也不会问"交付到哪";它自己的会话 cwd 是 run 目录下的私有文件夹,
+与工作区无关。删除会话不删工作区。旧 run(有 `output_dir` 的)下次激活时以原产物目录为工作区继续。
 
 **Bash 走真实 terminal**:loom 的 ACP client 实现了 terminal capability(claude-code-acp 用它执行 Bash)——
 每个 terminal 一个真实 OS 进程、有界输出缓冲、诚实退出码,会话结束统一收割;白名单无 Bash 的会话在

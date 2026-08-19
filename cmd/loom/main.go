@@ -83,7 +83,7 @@ stdout, Ctrl-C to stop). Use "loom start" for a background server.`,
 	pf.StringVar(&flagBackend, "backend", "", "deprecated: 'mock' means --dry-run; other values are ignored")
 	pf.MarkHidden("backend")
 
-	root.AddCommand(startCmd(), stopCmd(), restartCmd(), statusCmd(), doctorCmd())
+	root.AddCommand(startCmd(), stopCmd(), restartCmd(), statusCmd(), doctorCmd(), gateCmd())
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}

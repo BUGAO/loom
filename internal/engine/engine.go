@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -32,19 +33,46 @@ type Engine struct {
 	broker   *Broker
 	hub      *hub.Hub
 
-	// outputRoot is where dynamic runs' named deliverable folders live.
+	// outputRoot is the DEFAULT run workspace (~/workflow-output at the CLI):
+	// the directory a run works in and delivers to when the user picked none.
 	outputRoot string
 
 	mu     sync.Mutex
 	active map[string]*handle
 }
 
-// SetOutputRoot points dynamic-run deliverables at dir (~/workflow-output by
-// default at the CLI).
+// SetOutputRoot sets the default workspace: the directory a run works in and
+// delivers to when the user selected none (~/workflow-output at the CLI).
 func (e *Engine) SetOutputRoot(dir string) { e.outputRoot = dir }
 
-// OutputRoot reports the configured deliverable root (for prompt previews).
+// OutputRoot reports the default workspace (for the UI's picker and prompt
+// previews).
 func (e *Engine) OutputRoot() string { return e.outputRoot }
+
+// runWorkspace resolves THE directory of a run — the project the agents work
+// on and where every deliverable lands — and pins it on the run.
+//   - run.Workspace: the user's choice, or the default root at StartRun.
+//   - legacy runs (pre-unification) delivered into OutputDir while Workspace
+//     was a separate "project" pointer; the work IS in OutputDir, so that is
+//     the workspace they resume with. Older still: the internal run folder.
+//
+// The resolved value is written back so the UI and every later activation
+// see one answer.
+func (e *Engine) runWorkspace(run *model.Run) string {
+	ws := run.Workspace
+	if run.OutputDir != "" {
+		ws = run.OutputDir
+	}
+	if ws == "" {
+		ws = e.store.RunWorkspace(run.ID)
+	}
+	if run.Workspace != ws {
+		run.Workspace = ws
+		e.store.SaveRun(run)
+	}
+	os.MkdirAll(ws, 0o755)
+	return ws
+}
 
 // Lesson injection caps: how many user-confirmed behavior rules ride into a
 // new activation's opening prompt. MaxLessons is exported so the UI can say
@@ -187,9 +215,29 @@ func (e *Engine) runtimeFor(agentRuntime string, dryRun bool) (llm.Backend, erro
 // which real runtime each agent uses is the agent's own declaration. Images
 // attached to the goal message are persisted as run uploads and shown to a
 // dynamic run's coordinator (static mode has no conversation to carry them).
-func (e *Engine) StartRun(wf *model.Workflow, goal string, dryRun bool, images ...llm.Image) (*model.Run, error) {
+//
+// workspace is the directory this run works in AND delivers to — the project
+// and the output folder are one and the same. Empty means the user picked
+// none: the run uses the default root (~/workflow-output). It is recorded on
+// the run, named in the coordinator's and every worker's prompt, and mounted
+// into each worker session.
+func (e *Engine) StartRun(wf *model.Workflow, goal, workspace string, dryRun bool, images ...llm.Image) (*model.Run, error) {
+	return e.startRun(wf, goal, workspace, dryRun, "", "", images...)
+}
+
+// startRun is StartRun with an optional parent: a static run driven as a
+// TEMPLATE TASK of a dynamic run records which run and task it serves.
+func (e *Engine) startRun(wf *model.Workflow, goal, workspace string, dryRun bool, parentRun, parentTask string, images ...llm.Image) (*model.Run, error) {
 	if _, err := e.runtimeFor("", dryRun); err != nil {
 		return nil, err // fail fast: the default runtime must exist
+	}
+	if workspace == "" {
+		workspace = e.outputRoot
+	}
+	if workspace != "" {
+		if err := os.MkdirAll(workspace, 0o755); err != nil {
+			return nil, fmt.Errorf("cannot create workspace %s: %v", workspace, err)
+		}
 	}
 	pool, err := e.resolvePool(wf)
 	if err != nil {
@@ -207,11 +255,21 @@ func (e *Engine) StartRun(wf *model.Workflow, goal string, dryRun bool, images .
 			return nil, err
 		}
 	}
-	run, err := e.store.NewRun(wf, goal, backendLabel)
+	run, err := e.store.NewRun(wf, goal, backendLabel, workspace)
 	if err != nil {
 		return nil, err
 	}
 	run.DryRun = dryRun
+	run.ParentRunID, run.ParentTaskID = parentRun, parentTask
+	if wf.EffectiveMode() == model.ModeDynamic {
+		// The run's opening level: the workflow's pinned one, else the
+		// engine default. Triage (later) refines it per task; the user can
+		// override any time. Recorded on the run so the gate — and the UI —
+		// have one answer from the first tool call.
+		level, source := wf.Coordinator.EffectiveLevel()
+		run.Level, run.LevelSource = level, source
+		run.LevelLog = []model.LevelChange{{Ts: time.Now(), Level: level, Source: source}}
+	}
 	if names, err := e.saveUploads(run.ID, images); err != nil {
 		return nil, err
 	} else if len(names) > 0 {
@@ -298,6 +356,43 @@ func (e *Engine) SendToTask(runID, taskID, text string) error {
 	}
 	_, err := rs.Send(taskID, "user", text)
 	return err
+}
+
+// SetLevel is the user's override of a run's collaboration level. On a live
+// run it takes effect at the next tool call (the gate reads it) and the main
+// agent is told; on an idle run it is stored for the next activation.
+func (e *Engine) SetLevel(runID, level, reason string) (*model.Run, error) {
+	switch level {
+	case model.LevelSolo, model.LevelPair, model.LevelOrchestrate:
+	default:
+		return nil, fmt.Errorf("unknown level %q (solo | pair | orchestrate)", level)
+	}
+	e.mu.Lock()
+	h := e.active[runID]
+	e.mu.Unlock()
+	if h != nil {
+		if rs := h.runSession(); rs != nil {
+			if err := rs.SetLevel(level, "user", reason); err != nil {
+				return nil, err
+			}
+			rs.InjectNotice(fmt.Sprintf("SYSTEM: the user set this run's level to %s. %s", level, hub.LevelLine(level)))
+			return rs.Run(), nil
+		}
+	}
+	run, err := e.store.LoadRun(runID)
+	if err != nil {
+		return nil, err
+	}
+	if run.EffectiveMode() != model.ModeDynamic {
+		return nil, fmt.Errorf("run %s is not a dynamic run", runID)
+	}
+	if run.Level != level {
+		run.Level, run.LevelSource = level, "user"
+		run.LevelLog = append(run.LevelLog, model.LevelChange{Ts: time.Now(), Level: level, Source: "user", Reason: reason})
+		e.store.SaveRun(run)
+		e.publish(run)
+	}
+	return run, nil
 }
 
 // IsActive reports whether a run is currently being driven by this process.
@@ -639,6 +734,8 @@ type nodeActivity struct {
 func (e *Engine) execute(ctx context.Context, wf *model.Workflow, run *model.Run,
 	pool []*model.Agent, dryRun bool) {
 
+	// Resolved once, up front: node goroutines read it without touching run.
+	workspace := e.runWorkspace(run)
 	parallelism := wf.Parallelism
 	if parallelism <= 0 {
 		parallelism = defaultParallelism
@@ -738,8 +835,8 @@ func (e *Engine) execute(ctx context.Context, wf *model.Workflow, run *model.Run
 				ns.StartedAt = time.Now()
 				running++
 				e.event(run, "node_status", n.ID, fmt.Sprintf("running (agent %s)", n.Agent))
-				prompt := e.buildNodePrompt(run, n, agent, nodeByID)
-				go e.execNode(ctx, run, n, agent, backend, timeout, wf.MaxRetries, prompt, results, activities)
+				prompt := e.buildNodePrompt(run, n, agent, nodeByID, workspace)
+				go e.execNode(ctx, run.ID, workspace, n, agent, backend, timeout, wf.MaxRetries, prompt, results, activities)
 			}
 		}
 
@@ -898,7 +995,7 @@ func (e *Engine) replan(ctx context.Context, wf *model.Workflow, run *model.Run,
 // buildNodePrompt renders the executor prompt: instruction, upstream context
 // (dependency summaries; for replanned nodes also all earlier successes), the
 // workspace note, and the output-envelope contract.
-func (e *Engine) buildNodePrompt(run *model.Run, n model.PlanNode, agent *model.Agent, nodeByID func(string) *model.PlanNode) string {
+func (e *Engine) buildNodePrompt(run *model.Run, n model.PlanNode, agent *model.Agent, nodeByID func(string) *model.PlanNode, workspace string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "You are executor agent %q running node %q (%s) of a workflow run.\n\n", n.Agent, n.Title, n.ID)
 	fmt.Fprintf(&b, "## Overall goal\n%s\n\n## Your task\n%s\n", run.Goal, n.Instruction)
@@ -955,7 +1052,7 @@ func (e *Engine) buildNodePrompt(run *model.Run, n model.PlanNode, agent *model.
 	toolNote := "You have NO tools: complete the task entirely in your reply text."
 	if agent.Tools != "" {
 		toolNote = fmt.Sprintf(`You have EXACTLY these tools: %s. Nothing else.
-- Access the exchange directory with your file tools using ABSOLUTE paths (e.g. Read/Write the full path directly). Do not try to list it first if you lack a shell.
+- Access the workspace with your file tools using ABSOLUTE paths (e.g. Read/Write the full path directly). Do not try to list it first if you lack a shell.
 - Any tool not listed above (including Bash/Terminal) will be REJECTED — do not attempt it; work within your granted tools.`, agent.Tools)
 	}
 	fmt.Fprintf(&b, `
@@ -963,17 +1060,17 @@ func (e *Engine) buildNodePrompt(run *model.Run, n model.PlanNode, agent *model.
 %s
 
 ## Directories
-- Your current directory is your OWN persistent workspace (private to you as an agent; survives across runs). Use it for notes and scratch work.
-- This run's shared exchange directory is: %s
-  Upstream artifacts are there. Every deliverable of this task MUST be written there.
+- Your current directory is your OWN private home (persistent, yours alone; survives across runs). Use it for notes and scratch work.
+- This run's workspace is: %s
+  It is the ONE directory of this run: the project you read and modify, AND where every deliverable of this task MUST be written. Upstream artifacts are there.
 
 ## Output contract
 End your reply with a fenced json block:
 `+"```json"+`
-{"status": "ok", "summary": "<self-contained summary of what you did and produced>", "artifacts": ["<paths relative to the exchange directory>"]}
+{"status": "ok", "summary": "<self-contained summary of what you did and produced>", "artifacts": ["<paths relative to the workspace>"]}
 `+"```"+`
 Use "status": "error" with an explanatory summary if you could not complete the task. This envelope is REQUIRED — a reply without it is treated as a failed node.
-`, toolNote, e.store.RunWorkspace(run.ID))
+`, toolNote, workspace)
 	return b.String()
 }
 
@@ -1014,7 +1111,7 @@ func parseEnvelope(text string) (envelope, bool) {
 
 // execNode runs one node with retries and reports on the results channel.
 // It never touches run state directly — the execute loop owns that.
-func (e *Engine) execNode(ctx context.Context, run *model.Run, n model.PlanNode,
+func (e *Engine) execNode(ctx context.Context, runID, workspace string, n model.PlanNode,
 	agent *model.Agent, backend llm.Backend, timeout time.Duration, maxRetries int,
 	prompt string, results chan<- nodeResult, activities chan<- nodeActivity) {
 
@@ -1035,7 +1132,7 @@ func (e *Engine) execNode(ctx context.Context, run *model.Run, n model.PlanNode,
 			Prompt:       prompt,
 			Model:        agent.Model,
 			WorkDir:      e.store.AgentHome(agent.Name),
-			AddDirs:      []string{e.store.RunWorkspace(run.ID)},
+			AddDirs:      []string{workspace},
 			Tools:        agent.Tools,
 			MaxTurns:     agent.MaxTurns,
 			OnActivity:   onActivity,
@@ -1085,6 +1182,6 @@ func (e *Engine) execNode(ctx context.Context, run *model.Run, n model.PlanNode,
 			}
 		}
 	}
-	e.store.WriteNodeOutput(run.ID, n.ID, transcript.String())
+	e.store.WriteNodeOutput(runID, n.ID, transcript.String())
 	results <- out
 }

@@ -220,7 +220,7 @@ func TestWorkerPromptCarriesCraftMemory(t *testing.T) {
 	if !strings.Contains(wp, "## Your craft memory") || !strings.Contains(wp, "always run the linter") {
 		t.Error("worker prompt does not carry the agent's craft memory")
 	}
-	if !strings.Contains(wp, "MEMORY.md in your private workspace is your durable CRAFT memory") {
+	if !strings.Contains(wp, "MEMORY.md in your private home directory is your durable CRAFT memory") {
 		t.Error("file-tool agent got no write-side memory guidance")
 	}
 
@@ -319,11 +319,11 @@ func TestCoordinatorPromptIndependentReviewGuidance(t *testing.T) {
 		{Name: "implementer", Description: "codes"},
 		{Name: "reviewer", Description: "reviews", Independent: true},
 	}
-	p := CoordinatorPrompt(&model.Run{}, wf, model.DefaultBudget(), "/out", "", withReviewer, nil)
-	if !strings.Contains(p, "## Independent review") || !strings.Contains(p, "BEFORE accepting the milestone") {
+	p := CoordinatorPrompt(&model.Run{}, wf, model.DefaultBudget(), "/ws", withReviewer, nil)
+	if !strings.Contains(p, "## Independent review") || !strings.Contains(p, "REFUSED while the newest code change") {
 		t.Error("independent-review guidance missing despite an independent agent in the pool")
 	}
-	q := CoordinatorPrompt(&model.Run{}, wf, model.DefaultBudget(), "/out", "",
+	q := CoordinatorPrompt(&model.Run{}, wf, model.DefaultBudget(), "/ws",
 		[]*model.Agent{{Name: "implementer", Description: "codes"}}, nil)
 	if strings.Contains(q, "## Independent review") {
 		t.Error("independent-review guidance rendered with no independent agent to perform it")
@@ -351,7 +351,7 @@ func TestConsolidateMessageGetsMaintenanceFraming(t *testing.T) {
 func TestCoordinatorPromptCarriesLessons(t *testing.T) {
 	wf := &model.Workflow{Mode: model.ModeDynamic}
 	rules := []*model.Lesson{{ID: "lesson_x1", Text: "lead the report with the verdict, argumentation after"}}
-	p := CoordinatorPrompt(&model.Run{}, wf, model.DefaultBudget(), "/out", "", nil, rules)
+	p := CoordinatorPrompt(&model.Run{}, wf, model.DefaultBudget(), "/ws", nil, rules)
 	if !strings.Contains(p, "## Standing rules of this workflow") || !strings.Contains(p, "lead the report with the verdict") {
 		t.Error("standing-rules section missing from coordinator prompt")
 	}
@@ -361,7 +361,34 @@ func TestCoordinatorPromptCarriesLessons(t *testing.T) {
 	if !strings.Contains(p, "propose_agent_amendment") {
 		t.Error("amendment guidance missing from coordinator prompt")
 	}
-	if q := CoordinatorPrompt(&model.Run{}, wf, model.DefaultBudget(), "/out", "", nil, nil); strings.Contains(q, "## Standing rules of this workflow") {
+	if q := CoordinatorPrompt(&model.Run{}, wf, model.DefaultBudget(), "/ws", nil, nil); strings.Contains(q, "## Standing rules of this workflow") {
 		t.Error("standing-rules section rendered with no lessons")
+	}
+}
+
+// One directory, one word for it: both prompts name the workspace as the place
+// the project lives AND deliverables land, and neither speaks of a separate
+// output folder, exchange directory, or name_output — the vocabulary that once
+// got a whole project copied into the coordinator's cwd.
+func TestPromptsSpeakOfOneWorkspace(t *testing.T) {
+	rs, _ := testSession(t, openBudget())
+	ws := rs.Workspace()
+	wf := &model.Workflow{Mode: model.ModeDynamic, PairAgent: "alpha"}
+	cp := CoordinatorPrompt(rs.run, wf, model.DefaultBudget(), ws, nil, nil)
+	if !strings.Contains(cp, "## Workspace") || !strings.Contains(cp, ws) {
+		t.Fatalf("coordinator prompt should carry the workspace section with the path:\n%s", cp)
+	}
+	task := mustDelegate(t, rs, "alpha")
+	home := t.TempDir()
+	wp := WorkerPrompt(task, &model.Agent{Name: "alpha", Tools: "Read,Write"}, rs.run, ws, home, false)
+	if !strings.Contains(wp, "This run's workspace is: "+ws) || !strings.Contains(wp, "is: "+home) {
+		t.Fatalf("worker prompt should name the workspace and the private home:\n%s", wp)
+	}
+	for _, p := range []string{cp, wp} {
+		for _, banned := range []string{"xchange director", "name_output", "output root", "private workspace"} {
+			if strings.Contains(p, banned) {
+				t.Errorf("prompt still contains %q", banned)
+			}
+		}
 	}
 }

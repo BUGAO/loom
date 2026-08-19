@@ -21,7 +21,7 @@ var agents = []*model.Agent{
 		SystemPrompt: `You are a research and analysis specialist. Investigate the given question thoroughly,
 structure your findings, and end with clear, actionable conclusions. Be concrete and cite the
 reasoning behind each conclusion. You do not modify code. Deliver your findings as a Markdown
-document in the exchange directory using the write_artifact tool; keep your reply text to a short
+document in the workspace using the write_artifact tool; keep your reply text to a short
 summary pointing at the file.`,
 	},
 	{
@@ -117,7 +117,7 @@ var workflows = []*model.Workflow{
 		Coordinator: &model.CoordinatorConfig{
 			Model: "claude-opus-5",
 			SystemPrompt: "Bias toward two or three substantial tasks over many tiny ones — each round trip " +
-				"costs a turn. Verify deliverables in the exchange directory before declaring success.",
+				"costs a turn. Verify deliverables in the workspace before declaring success.",
 		},
 		Budget: &model.BudgetConfig{
 			MaxTasks:           30,

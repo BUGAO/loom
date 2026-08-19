@@ -42,6 +42,9 @@ function autoGrow(ta) {
 // Inline SVG for the attach-image button — emoji glyphs render inconsistently
 // across platforms; an outlined icon stays on-theme everywhere.
 const ICON_IMG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="4"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.5-3.5a2 2 0 0 0-2.8 0L6 20"/></svg>`;
+// Folder outline for the workspace selector — same stroke language as ICON_IMG,
+// and an SVG rather than 📁 for the same reason: emoji glyphs are inconsistent.
+const ICON_FOLDER = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>`;
 
 function toast(msg) {
   const el = document.createElement("div");
@@ -177,50 +180,135 @@ let cleanup = null; // per-page teardown (SSE, timers)
 function router() {
   if (cleanup) { cleanup(); cleanup = null; }
   $overlay.innerHTML = "";
-  const hash = location.hash || "#/workflows";
+  const hash = location.hash || "#/sessions";
   const parts = hash.slice(2).split("/").filter(Boolean); // e.g. ["runs","run_x"]
-  const section = parts[0] || "workflows";
+  let section = parts[0] || "sessions";
+  // Workflow editing lives under 设置 now; the old entry points still work.
+  if (section === "workflows" && !parts[1]) { location.hash = "#/sessions"; return; }
+  const navKey = section === "workflows" ? "settings" : section;
   document.querySelectorAll("[data-nav]").forEach((a) =>
-    a.classList.toggle("active", a.dataset.nav === section));
+    a.classList.toggle("active", a.dataset.nav === navKey));
   // The conversation page is the one full-bleed surface; everything else
   // keeps the readable 1280px column.
-  $main.classList.toggle("wide", section === "workflows" && !parts[1]);
+  $main.classList.toggle("wide", section === "sessions");
   if (section === "workflows" && parts[1] === "new") return wfEditPage(null);
   if (section === "workflows" && parts[2] === "edit") return wfEditPage(parts[1]);
-  if (section === "workflows") return wfListPage();
+  if (section === "sessions") return sessionsPage();
+  if (section === "settings") return settingsPage(parts[1] || "main");
+  if (section === "runs" && parts[1] && parts[2] === "topology") return topologyPage(parts[1]);
   if (section === "runs" && parts[1]) return runPage(parts[1]);
   if (section === "runs") return runsListPage();
   if (section === "agents") return agentsPage();
-  wfListPage();
+  sessionsPage();
 }
 window.addEventListener("hashchange", router);
 
 // openSession jumps to the workflow page with a specific session selected —
 // the bridge from run records back into the conversation.
 function openSession(wfId, runId) {
-  sessionStorage.setItem("wfSel", wfId);
-  sessionStorage.setItem("wfSes:" + wfId, runId);
-  location.hash = "#/workflows";
+  sessionStorage.setItem("wfSes", runId);
+  location.hash = "#/sessions";
 }
 
-// ---------- workflows: list + conversation ----------
+// ---------- settings: main agent / templates / general ----------
+
+const settingsTabs = (tab) => `
+  <div class="settings-tabs">
+    <a href="#/settings" class="${tab === "main" ? "on" : ""}">主 agent</a>
+    <a href="#/settings/templates" class="${tab === "templates" ? "on" : ""}">静态模板</a>
+    <a href="#/settings/general" class="${tab === "general" ? "on" : ""}">通用</a>
+  </div>`;
+
+async function settingsPage(tab) {
+  if (tab === "main") {
+    const main = await api("/main");
+    return wfEditPage(main.id, { prefix: settingsTabs("main"), back: "#/settings" });
+  }
+  if (tab === "templates") {
+    const wfs = (await api("/workflows")).filter((w) => w.mode !== "dynamic");
+    $main.innerHTML = settingsTabs("templates") + `
+      <div class="page-head">
+        <h1>静态模板</h1>
+        <button class="primary" onclick="location.hash='#/workflows/new'">+ 新建模板</button>
+      </div>
+      <div class="muted" style="font-size:12.5px;margin-bottom:12px">每个模板是一个 planner + 确定性执行的 DAG。main agent 在会话里可用 run_template 把它当一个任务跑;这里也可以直接运行(产生一条静态记录)。</div>
+      <div id="tpl-list">${wfs.map((w) => `
+        <div class="tpl-card">
+          <div class="tpl-main">
+            <div><b>${esc(w.name)}</b> <span class="mono muted" style="font-size:11px">${esc(w.id)}</span></div>
+            <div class="tpl-desc">${esc(w.description || "")}</div>
+          </div>
+          <button class="small" data-run="${esc(w.id)}" title="用这个模板直接发起一次静态运行">运行</button>
+          <button class="small" onclick="location.hash='#/workflows/${esc(w.id)}/edit'">编辑</button>
+        </div>`).join("") || '<div class="empty">还没有模板</div>'}</div>`;
+    $main.querySelectorAll("[data-run]").forEach((b) => b.addEventListener("click", async () => {
+      const wf = wfs.find((w) => w.id === b.dataset.run);
+      const goal = await modalDialog({ title: `运行模板「${wf.name}」`, body: "目标会交给模板的 planner 组装 DAG;工作区用默认工作区(~/workflow-output)。",
+        inputPlaceholder: "写下这次运行的目标…", confirmText: "运行" });
+      if (goal === null || !goal.trim()) return;
+      try {
+        const run = await api(`/workflows/${wf.id}/runs`, { method: "POST", body: { goal, dry_run: !!meta.default_dry_run } });
+        toast("已发起静态运行");
+        location.hash = "#/runs/" + run.id;
+      } catch (e) { toast(e.message); }
+    }));
+    return;
+  }
+  // general
+  let ws = {};
+  try { ws = await api("/workspaces"); } catch {}
+  $main.innerHTML = settingsTabs("general") + `
+    <div class="page-head"><h1>通用</h1></div>
+    <div class="panel" style="max-width:760px">
+      <label class="field"><span>默认工作区 — 新会话不选工作区时用它(启动参数 --output / LOOM_OUTPUT)</span>
+        <input value="${esc(ws.default || "")}" readonly></label>
+      <label class="field"><span>运行时</span>
+        <input value="${esc((meta.runtimes || []).find((r) => r.id === meta.default_runtime)?.label || meta.default_runtime || "")}" readonly></label>
+      <label class="field"><span>默认演示模式(dry run)</span>
+        <input value="${meta.default_dry_run ? "开" : "关"}" readonly></label>
+      <div class="muted" style="font-size:12px">这些来自服务进程的启动参数;改它们请用 <span class="mono">loom start --help</span>。</div>
+    </div>`;
+}
+
+// ---------- sessions: one area, one main agent ----------
 
 // The workflow page is a conversation surface: pick a workflow on the left,
 // talk to its main agent on the right. The main agent decomposes, delegates,
 // and reports back; the runtime status above the chat is the live task tree.
-async function wfListPage() {
-  const wfs = await api("/workflows");
-  let selId = sessionStorage.getItem("wfSel");
-  if (!wfs.some((w) => w.id === selId)) selId = wfs[0]?.id || null;
+async function sessionsPage() {
+  // ONE session area: every session is a conversation with THE main agent
+  // (the single dynamic configuration, GET /api/main). Static workflows are
+  // templates the main agent runs as tasks; they live under 设置.
+  const mainWf = await api("/main");
+  const wfs = [mainWf];
+  let selId = mainWf.id;
   let sessions = []; // the selected workflow's runs, newest first — each IS a session
   let sesId = null;  // selected session; null = compose a new one
   let run = null;    // the selected session, fully loaded
   let es = null;
   let threadId = null; // task whose thread panel is open; null = closed
 
+  // ---- workspace selector state ----
+  // The directory the NEXT run works in and delivers to — project and output
+  // are one folder. A run freezes its workspace at birth, so this is a draft
+  // for the session being composed; a live dynamic session shows its own
+  // run.workspace instead, read-only.
+  let selectedWorkspace = ""; // "" = the default workspace (wsDefault)
+  let wsDefault = "";         // the server's default workspace (~/workflow-output)
+  let wsList = [];            // recent workspaces from the server, newest first
+  let wsHome = "";            // the user's home dir, for ~-shortening and browsing
+  let wsOpen = false;         // dropdown visibility
+  let wsBrowsePath = "";      // the folder browser's current directory
+  let wsBrowseDirs = [];      // the folder browser's current listing
+
   const terminalRun = (r) => ["succeeded", "failed", "canceled", "interrupted"].includes(r.status);
   const selWf = () => wfs.find((w) => w.id === selId);
-  const sesKey = () => "wfSes:" + selId;
+  // Sessions are dynamic runs — of any dynamic workflow, so history from
+  // before the single-config UI stays reachable. Template sub-runs (static)
+  // belong to 记录, not here.
+  const fetchSessions = async () => (await api("/runs")).filter((r) => r.mode === "dynamic");
+  const sesKey = () => "wfSes";
+  const wsKey = () => "wfWs:" + selId; // per-workflow draft, survives a reload
 
   const loadRun = async () => {
     run = null;
@@ -228,7 +316,7 @@ async function wfListPage() {
     threadId = null;
     if (!selId) return;
     try {
-      sessions = await api("/runs?workflow_id=" + selId); // newest first
+      sessions = await fetchSessions(); // newest first
     } catch { /* no runs yet */ }
     const stored = sessionStorage.getItem(sesKey());
     if (stored === "new") { sesId = null; return; }
@@ -244,6 +332,9 @@ async function wfListPage() {
   const resub = () => {
     if (es) { es.close(); es = null; }
     if (!run) return;
+    // The server closes the stream for a finished run, and EventSource would
+    // reconnect every few seconds forever. Nothing left to follow anyway.
+    if (terminalRun(run)) return;
     es = new EventSource(`/api/runs/${run.id}/events`);
     es.onmessage = (m) => {
       run = JSON.parse(m.data);
@@ -252,27 +343,15 @@ async function wfListPage() {
       renderRight();
     };
   };
-  cleanup = () => es && es.close();
-
-  const renderLeft = () => {
-    const list = $main.querySelector("#wf-list");
-    if (!list) return;
-    list.innerHTML = wfs.map((w) => `
-      <div class="wf-item ${w.id === selId ? "selected" : ""}" data-wf="${esc(w.id)}">
-        <div class="wf-item-head">
-          <b>${esc(w.name)}</b>
-          <span class="badge" style="color:${w.mode === "dynamic" ? "var(--accent)" : "var(--muted)"}">${w.mode === "dynamic" ? "dynamic" : "static"}</span>
-        </div>
-        <div class="muted" style="font-size:11.5px">${esc(w.description || "")}</div>
-      </div>`).join("") || '<div class="empty">还没有工作流</div>';
-    list.querySelectorAll("[data-wf]").forEach((el) =>
-      el.addEventListener("click", async () => {
-        selId = el.dataset.wf;
-        sessionStorage.setItem("wfSel", selId);
-        await loadRun();
-        renderLeft(); renderHead(); renderSessions(); renderRight(); resub();
-      }));
+  // Outside click closes the workspace dropdown. Registered once for the page
+  // and torn down with the stream, so leaving the page leaves nothing behind.
+  const onDocClick = (e) => { if (wsOpen && !e.target.closest("#wf-ws-wrap")) closeWsMenu(); };
+  cleanup = () => {
+    if (es) es.close();
+    document.removeEventListener("click", onDocClick);
   };
+
+  const renderLeft = () => renderSessions();
 
   const renderHead = () => {
     const head = $main.querySelector("#wf-head");
@@ -280,13 +359,13 @@ async function wfListPage() {
     if (!head) return;
     if (!wf) { head.innerHTML = ""; return; }
     head.innerHTML = `
-      <h2 style="margin:0">${esc(wf.name)}</h2>
-      <span class="badge">${wf.mode === "dynamic" ? "dynamic · main agent 对话式编排" : "static · planner 组装 DAG"}</span>
+      <h2 style="margin:0">main agent</h2>
+      <span class="badge" title="主 agent 的配置在「设置 › 主 agent」">${esc(wf.name)}</span>
       <span style="flex:1"></span>
-      ${wf.mode === "dynamic" ? '<button class="small" id="wf-new-session" title="开始一个全新会话(新 run)">+ 新会话</button>' : ""}
+      <button class="small" id="wf-new-session" title="开始一个全新会话(新 run)">+ 新会话</button>
       <button class="small" id="wf-feedback" title="复盘记录与行为规范:待确认的规范在这里批;已确认的注入之后每次 run">复盘</button>
-      <button class="small" onclick="location.hash='#/workflows/${esc(wf.id)}/edit'">设置</button>
-      <a class="btn small" href="#/runs" onclick="sessionStorage.setItem('wfFilter','${esc(wf.id)}')">历史</a>`;
+      <button class="small" onclick="location.hash='#/settings'">设置</button>
+      <a class="btn small" href="#/runs">记录</a>`;
     const nb = head.querySelector("#wf-new-session");
     if (nb) nb.addEventListener("click", () => {
       sesId = null;
@@ -311,22 +390,17 @@ async function wfListPage() {
   // the conversation (finished ones get reopened by the next message), × to
   // delete it for good.
   const renderSessions = () => {
-    const box = $main.querySelector("#wf-sessions");
-    const wf = selWf();
+    const box = $main.querySelector("#wf-list");
     if (!box) return;
-    if (!wf || !sessions.length) { box.innerHTML = ""; box.style.display = "none"; return; }
-    box.style.display = "";
-    const label = (r) => {
-      const t = new Date(r.created_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-      const goal = (r.goal || "").replace(/\s+/g, " ").slice(0, 14);
-      return `${t} · ${goal}${(r.goal || "").length > 14 ? "…" : ""}`;
-    };
+    if (!sessions.length) { box.innerHTML = '<div class="empty">还没有会话 — 在右边说出你的目标就开始了</div>'; return; }
+    const when = (r) => new Date(r.created_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+    const goal = (r) => (r.goal || "").replace(/\s+/g, " ").slice(0, 60);
     box.innerHTML = sessions.map((r) => `
-      <div class="ses-chip ${esc(r.status)} ${r.id === sesId ? "selected" : ""}" data-ses="${esc(r.id)}"
+      <div class="ses-item ${esc(r.status)} ${r.id === sesId ? "selected" : ""}" data-ses="${esc(r.id)}"
            title="${esc(r.goal || "")} · ${esc(RUN_LABEL[r.status] || r.status)}">
-        <span class="tdot"></span>
-        <span class="ses-label">${esc(label(r))}</span>
-        <span class="ses-x" data-del="${esc(r.id)}" title="删除该会话(含其任务台账与产物记录)">×</span>
+        <div class="ses-row"><span class="tdot"></span><span class="ses-goal">${esc(goal(r)) || "(无标题)"}</span>
+          <span class="ses-x" data-del="${esc(r.id)}" title="删除该会话(含其任务台账与产物记录)">×</span></div>
+        <div class="ses-meta muted">${when(r)} · ${esc(RUN_LABEL[r.status] || r.status)}${r.level ? " · " + esc(r.level) : ""}${r.workspace ? " · " + esc(wsBase(r.workspace)) : ""}</div>
       </div>`).join("");
     box.querySelectorAll("[data-ses]").forEach((chip) =>
       chip.addEventListener("click", async (e) => {
@@ -360,6 +434,19 @@ async function wfListPage() {
       }));
   };
 
+  // The run's collaboration level — what the main agent may do with its own
+  // hands — with the user's override. Enforced by the engine's tool gate; a
+  // change takes effect at the main agent's next tool call.
+  const LEVEL_LABEL = { solo: "solo · 自己动手", pair: "pair · 动手 + 常驻伙伴", orchestrate: "orchestrate · 只派单" };
+  const levelControl = (run) => {
+    const lvl = run.level || "orchestrate";
+    const src = run.level_source ? `(${{ user: "你设定", workflow: "工作流钉死", default: "默认", triage: "triage 判定" }[run.level_source] || run.level_source})` : "";
+    if (terminalRun(run)) return `<span class="badge lvl ${esc(lvl)}" title="level ${src}">${esc(LEVEL_LABEL[lvl] || lvl)}</span>`;
+    return `<select class="lvl-sel ${esc(lvl)}" data-level title="level ${src} — 改它 = 覆盖引擎判定;main agent 的下一次工具调用起生效">
+      ${["solo", "pair", "orchestrate"].map((l) => `<option value="${l}" ${l === lvl ? "selected" : ""}>${esc(LEVEL_LABEL[l])}</option>`).join("")}
+    </select>`;
+  };
+
   // Status zone: the selected run's live shape, compact. Deep inspection stays
   // on the run page — every element here links into it.
   const renderStatus = () => {
@@ -370,11 +457,12 @@ async function wfListPage() {
         <a href="#/runs/${esc(run.id)}" class="mono" style="font-size:11px">${esc(run.id)}</a>
         ${chip(run.status)}
         ${run.coordinator?.rounds ? `<span class="badge">第 ${run.coordinator.rounds} 轮</span>` : ""}
+        ${dyn ? levelControl(run) : ""}
         <span class="badge" title="按 API 牌价折算">est. ${fmtCost(run.cost_usd)}</span>
         <span class="badge">${runDuration(run)}</span>
         ${terminalRun(run) ? "" : '<button class="small danger" data-act="cancel">取消</button>'}
         ${run.status === "interrupted" && dyn ? '<button class="small primary" data-act="resume">▶ 恢复</button>' : ""}
-        ${run.output_dir ? `<span class="mono" style="font-size:10.5px;color:var(--muted)" title="产物目录(删除会话不影响它)">📁 ${esc(run.output_dir)}</span>` : ""}
+        ${run.workspace || run.output_dir ? `<span class="mono" style="font-size:10.5px;color:var(--muted)" title="工作区(删除会话不影响它)">📁 ${esc(run.workspace || run.output_dir)}</span>` : ""}
       </div>`;
     if (dyn) {
       const tasks = (run.task_order || []).map((id) => run.tasks[id]).filter(Boolean);
@@ -388,7 +476,7 @@ async function wfListPage() {
             ${t.failure_kind ? `<span class="mono" style="color:var(--bad)">${esc(t.failure_kind)}</span>` : ""}
           </span>
         </div>`).join("");
-      return header + (rows ? `<div class="wf-tasks">${rows}</div>` : '<div class="muted" style="font-size:12px;padding:6px 2px">main agent 还没有派发任务…</div>');
+      return header + renderEvidence(run) + (rows ? `<div class="wf-tasks">${rows}</div>` : '<div class="muted" style="font-size:12px;padding:6px 2px">main agent 还没有派发任务…</div>');
     }
     const nodes = run.plan?.nodes || [];
     const rows = nodes.map((n) => {
@@ -403,10 +491,31 @@ async function wfListPage() {
     return header + (rows ? `<div class="wf-tasks">${rows}</div>` : '<div class="muted" style="font-size:12px;padding:6px 2px">planner 正在组装 DAG…</div>');
   };
 
+  // The definition of done: the proofs the main agent declared up front, and
+  // how each was settled at finish. Shown compactly above the task list — this
+  // is what "succeeded" means for this session, so it belongs in view.
+  const renderEvidence = (run) => {
+    const ev = run.evidence || [];
+    if (!ev.length) return "";
+    const met = ev.filter((e) => e.met).length;
+    const items = ev.map((e) => `
+      <div class="ev-item ${e.met ? "met" : ""}" title="${esc(e.met ? "已验证:" + (e.how || "") : (e.needs_from_user ? "需要你提供:" + e.needs_from_user : "未验证"))}">
+        <span class="ev-dot">${e.met ? "✓" : "○"}</span>
+        <span class="ev-claim">${esc(e.claim)}</span>
+        ${e.needs_from_user && !e.met ? `<span class="ev-need">需你提供:${esc(e.needs_from_user)}</span>` : ""}
+        ${e.met && e.how ? `<span class="ev-how">${esc(e.how)}</span>` : ""}
+      </div>`).join("");
+    return `<details class="wf-evidence" ${terminalRun(run) ? "" : "open"}>
+      <summary>完成判据 <span class="badge">${met}/${ev.length} 已验证</span></summary>
+      ${items}
+    </details>`;
+  };
+
   // A dispatch card is one delegation shown inline in the conversation — the
   // thread root, Lark-style: click it to open the coordinator ↔ worker thread.
   const dispatchCard = (t) => {
-    const who = t.created_by === "coordinator" ? "main agent · 派发任务"
+    const who = t.agent?.startsWith("template:") ? "main agent · 运行模板"
+      : t.created_by === "coordinator" ? "main agent · 派发任务"
       : t.created_by === "external" ? "外部 · 提交任务"
       : `任务 ${esc(String(t.created_by).slice(-8))} · 交接子任务`;
     const sub = t.status === "working" && t.activity
@@ -428,8 +537,31 @@ async function wfListPage() {
               ${t.failure_kind ? `<span class="mono" style="color:var(--bad)">${esc(t.failure_kind)}</span>` : ""}
             </div>
           </div>
-          <span class="dthread">💬 ${n} ›</span>
+          <span class="dthread">${t.sub_run_id ? `<a href="#/runs/${esc(t.sub_run_id)}" title="打开模板子运行(静态 DAG)" onclick="event.stopPropagation()">⧉ 子运行 ›</a>` : `💬 ${n} ›`}</span>
         </div>
+      </div>`;
+  };
+
+  // System cards in the conversation: a triage verdict (the level the engine
+  // chose for the task just assessed, and why — change it with the level
+  // control in the header), or an engine notice (e.g. the listener failing).
+  const systemCard = (m) => {
+    if (m.kind === "triage") {
+      const [head, ...rest] = String(m.text).split("\n");
+      const lvl = head.split(" ")[0];
+      return `
+      <div class="cmsg agent sys">
+        <div class="cwho">triage · ${fmtTime(m.ts)}</div>
+        <div class="cbody triage-card">
+          <span class="badge lvl ${esc(lvl)}">${esc(LEVEL_LABEL[lvl] || lvl)}</span> ${esc(head.slice(lvl.length + 3))}
+          ${rest.length ? `<div class="muted" style="font-size:11.5px;margin-top:4px">${esc(rest.join(" "))}</div>` : ""}
+        </div>
+      </div>`;
+    }
+    return `
+      <div class="cmsg agent sys">
+        <div class="cwho">系统 · ${fmtTime(m.ts)}</div>
+        <div class="cbody" style="color:var(--warn)">${esc(m.text)}</div>
       </div>`;
   };
 
@@ -443,7 +575,7 @@ async function wfListPage() {
          <img class="cimg" src="/api/runs/${esc(run.id)}/uploads/${esc(n)}" alt="${esc(n)}" loading="lazy"></a>`).join("");
     const items = (run.chat || []).map((m) => ({
       ts: m.ts,
-      html: `
+      html: m.from === "system" ? systemCard(m) : `
       <div class="cmsg ${m.from === "user" ? "me" : "agent"}">
         <div class="cwho">${m.from === "user" ? (m.kind === "feedback" ? "你 · 复盘反馈" : m.kind === "consolidate" ? "你 · 规范整理" : "你") : "main agent"} · ${fmtTime(m.ts)}</div>
         <div class="cbody">${esc(m.text)}${m.images?.length ? `<div class="cimgs">${chatImgs(m)}</div>` : ""}</div>
@@ -498,9 +630,14 @@ async function wfListPage() {
           </div>
         </div>`;
     } else if (!terminalRun(run) && run.mode === "dynamic") {
-      tail = run.coordinator?.status === "awaiting_user"
+      const c = run.coordinator || {};
+      const trace = (c.trace || []).length
+        ? `<details class="ctrace" open><summary>⚙ 本轮动作 ${c.trace.length}</summary>${c.trace.map((l) => `<div class="ctrace-line mono">${esc(l)}</div>`).join("")}</details>` : "";
+      tail = c.status === "awaiting_user"
         ? '<div class="cmsg agent typing"><div class="cbody" style="color:var(--warn);font-style:normal">❓ main agent 在等你回答上面的问题——直接在下面输入即可</div></div>'
-        : `<div class="cmsg agent typing"><div class="cbody">⋯ main agent 工作中(${esc(run.coordinator?.activity || "等待任务推进")})</div></div>`;
+        : c.draft
+          ? `<div class="cmsg agent"><div class="cwho">main agent · 正在输入…</div><div class="cbody">${esc(c.draft)}<span class="cursor">▍</span></div>${trace}</div>`
+          : `<div class="cmsg agent typing"><div class="cbody">⋯ main agent 工作中(${esc(c.activity || "等待任务推进")})</div>${trace}</div>`;
     }
     return msgs + tail;
   };
@@ -522,8 +659,16 @@ async function wfListPage() {
     // to a session being composed, so it only shows then.
     const dryWrap = $main.querySelector("#wf-dry-wrap");
     if (dryWrap) dryWrap.style.display = !run ? "" : "none";
+    renderWsBar(); // locked ↔ editable follows the same rule as the dry-run toggle
     st.querySelectorAll("[data-act]").forEach(wireAct);
     log.querySelectorAll("[data-act]").forEach(wireAct);
+    st.querySelectorAll("[data-level]").forEach((sel) => sel.addEventListener("change", async () => {
+      try {
+        run = await api(`/runs/${run.id}/level`, { method: "POST", body: { level: sel.value } });
+        toast("level → " + sel.value);
+        renderRight();
+      } catch (e) { toast(e.message); renderRight(); }
+    }));
     const openThread = (el) => el.addEventListener("click", () => {
       threadId = threadId === el.dataset.thread ? null : el.dataset.thread;
       renderRight();
@@ -683,6 +828,275 @@ async function wfListPage() {
     }
   };
 
+  // ---- workspace selector ----
+  // The directory this session works in and delivers to, picked here instead of
+  // typed into the prompt. A run freezes its workspace at birth, so the bar is
+  // only editable while a session is being composed. Nothing selected means the
+  // default workspace — there is no "no workspace" state any more.
+
+  // A dynamic session CONTINUES the selected run, so that run's workspace is
+  // frozen and the bar is read-only. Static mode starts a brand-new run on
+  // every send, so it stays editable even with a past run selected.
+  const wsLocked = () => !!run && selWf()?.mode === "dynamic";
+  const wsCurrent = () => (wsLocked() ? run.workspace || "" : selectedWorkspace || wsDefault);
+  const wsIsDefault = () => !wsLocked() && !selectedWorkspace;
+  // ~/x for anything under home, bare ~ for home itself (the browse root shows
+  // it, even though home is never a legal workspace), absolute otherwise.
+  const wsShort = (p) => {
+    if (!wsHome) return p;
+    if (p === wsHome) return "~";
+    return p.startsWith(wsHome + "/") ? "~" + p.slice(wsHome.length) : p;
+  };
+  const wsBase = (p) => p.split("/").filter(Boolean).pop() || p;
+
+  const renderWsBar = () => {
+    const wrap = $main.querySelector("#wf-ws-wrap");
+    const label = $main.querySelector("#wf-ws-label");
+    if (!wrap || !label) return;
+    const cur = wsCurrent();
+    const locked = wsLocked();
+    const isDefault = wsIsDefault();
+    // "on" = an explicit choice; the default is shown quietly, with a tag.
+    wrap.classList.toggle("on", !!cur && !isDefault);
+    wrap.classList.toggle("locked", locked);
+    if (cur) {
+      label.innerHTML = `<b>${esc(wsBase(cur))}</b><span class="ws-path">${esc(wsShort(cur))}</span>` +
+        (isDefault ? '<span class="ws-tag">默认</span>' : "");
+    } else {
+      label.innerHTML = `<span class="ws-none">${locked ? "本会话未记录工作区" : "选择工作区"}</span>`;
+    }
+    $main.querySelector("#wf-ws-btn").title = locked
+      ? (cur ? "本会话的工作区(创建时已固定):" + cur : "该会话创建时未记录工作区,无法更改")
+      : (isDefault ? "本次运行的工作区(默认):" + cur + " — 点击更换或新建文件夹" : "本次运行的工作区:" + cur);
+    // The ✕ returns an explicit choice to the default; nothing to clear on a
+    // frozen session or on the default itself.
+    $main.querySelector("#wf-ws-x").hidden = isDefault || locked;
+    if (locked) closeWsMenu();
+  };
+
+  const setWorkspace = (p) => {
+    selectedWorkspace = p || "";
+    if (selectedWorkspace) sessionStorage.setItem(wsKey(), selectedWorkspace);
+    else sessionStorage.removeItem(wsKey());
+    renderWsBar();
+    renderWsRecent();
+  };
+
+  const loadWsList = async () => {
+    try {
+      const d = await api("/workspaces");
+      wsList = (d.workspaces || []).filter((p) => p !== d.default);
+      wsHome = d.home || wsHome;
+      wsDefault = d.default || wsDefault;
+    } catch { wsList = []; }
+  };
+
+  const renderWsRecent = () => {
+    const box = $main.querySelector("#wf-ws-recent");
+    if (!box) return;
+    const cur = wsCurrent();
+    // The default workspace heads the list; "" is its selection value.
+    const head = wsDefault ? `
+      <div class="ws-recent-item ${!selectedWorkspace ? "selected" : ""}" data-ws="" title="${esc(wsDefault)}">
+        <span class="ws-item-name">${esc(wsBase(wsDefault))}</span>
+        <span class="ws-item-path">${esc(wsShort(wsDefault))}</span>
+        <span class="ws-tag">默认</span>
+      </div>` : "";
+    const rest = wsList.map((p) => `
+      <div class="ws-recent-item ${p === cur ? "selected" : ""}" data-ws="${esc(p)}" title="${esc(p)}">
+        <span class="ws-item-name">${esc(wsBase(p))}</span>
+        <span class="ws-item-path">${esc(wsShort(p))}</span>
+        <span class="ws-item-x" data-wsrm="${esc(p)}" title="从历史中移除">✕</span>
+      </div>`).join("");
+    box.innerHTML = head + (rest || '<div class="ws-empty">还没有用过其它工作区——在上面输入路径,或点「浏览文件夹」新建一个</div>');
+    box.querySelectorAll("[data-ws]").forEach((el) => el.addEventListener("click", (e) => {
+      if (e.target.closest("[data-wsrm]")) return; // the ✕ is not a selection
+      setWorkspace(el.dataset.ws);
+      closeWsMenu();
+    }));
+    box.querySelectorAll("[data-wsrm]").forEach((el) => el.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const p = el.dataset.wsrm;
+      try { await api("/workspaces?path=" + encodeURIComponent(p), { method: "DELETE" }); } catch {}
+      wsList = wsList.filter((x) => x !== p);
+      renderWsRecent(); // forgetting the history does NOT unselect a live choice
+    }));
+  };
+
+  const closeWsMenu = () => {
+    wsOpen = false;
+    const m = $main.querySelector("#wf-ws-menu");
+    if (m) m.hidden = true;
+    $main.querySelector("#wf-ws-wrap")?.classList.remove("open");
+    showWsBrowser(false);
+  };
+
+  const openWsMenu = async () => {
+    if (wsLocked()) {
+      toast("工作区在会话创建时固定;要换项目请开一个新会话");
+      return;
+    }
+    wsOpen = true;
+    $main.querySelector("#wf-ws-menu").hidden = false;
+    $main.querySelector("#wf-ws-wrap").classList.add("open");
+    showWsBrowser(false);
+    const inp = $main.querySelector("#wf-ws-input");
+    inp.value = selectedWorkspace || "";
+    await loadWsList(); // always fresh: another tab may have started runs
+    inp.placeholder = "输入工作区路径…如 ~/projects/app";
+    renderWsRecent();
+    inp.focus();
+  };
+
+  // applyManualWs pre-checks a typed path through the browse endpoint: anything
+  // it can list exists and is readable. A path OUTSIDE the home directory is
+  // refused by that endpoint on purpose (it is the browser's confinement rule,
+  // not a limit on workspaces), so we accept it as typed and let the server
+  // decide when the run starts — projects on external volumes stay usable.
+  const applyManualWs = async () => {
+    const raw = $main.querySelector("#wf-ws-input").value.trim();
+    if (!raw) { setWorkspace(""); closeWsMenu(); return; }
+    try {
+      const d = await api("/workspaces/browse", { method: "POST", body: { path: raw } });
+      setWorkspace(d.path === wsDefault ? "" : d.path); // the server-normalized form, not the raw text
+      closeWsMenu();
+    } catch (e) {
+      if (String(e.message).includes("outside the home directory")) {
+        setWorkspace(raw);
+        closeWsMenu();
+        toast("该路径不在主目录内,无法预校验;发送时由服务端最终裁决");
+        return;
+      }
+      toast("这个路径用不了:" + e.message);
+    }
+  };
+
+  // ---- folder browser (a panel inside the dropdown, not a separate modal) ----
+
+  const showWsBrowser = (on) => {
+    const panel = $main.querySelector("#wf-ws-browser");
+    const main = $main.querySelector("#wf-ws-main");
+    if (!panel || !main) return;
+    panel.hidden = !on;
+    main.hidden = !!on;
+  };
+
+  const loadWsDirs = async (path) => {
+    let d;
+    try { d = await api("/workspaces/browse", { method: "POST", body: { path } }); }
+    catch (e) { toast("打不开这个目录:" + e.message); return; }
+    wsBrowsePath = d.path;
+    wsBrowseDirs = d.dirs || [];
+    wsHome = d.home || wsHome;
+    $main.querySelector("#wf-ws-crumb").textContent = wsShort(wsBrowsePath);
+    const up = $main.querySelector("#wf-ws-up");
+    up.disabled = !d.parent;
+    up.dataset.parent = d.parent || "";
+    renderWsDirs(d.truncated);
+    $main.querySelector("#wf-ws-dirs").scrollTop = 0;
+  };
+
+  // renderWsDirs paints the current listing. An entry that is the selected
+  // workspace is highlighted; an EMPTY entry (the kind "新建文件夹" makes) gets
+  // a ✎ that turns its name into an inline rename field — the server refuses
+  // to rename anything with content, so the affordance only appears where it
+  // will work.
+  const renderWsDirs = (truncated) => {
+    const list = $main.querySelector("#wf-ws-dirs");
+    const cur = wsCurrent();
+    list.innerHTML = wsBrowseDirs.map((x) => `
+      <div class="ws-dir-entry ${x.path === cur ? "selected" : ""}" data-go="${esc(x.path)}" title="${esc(x.path)}">
+        ${ICON_FOLDER}<span class="ws-dir-name">${esc(x.name)}</span>
+        ${x.empty ? `<span class="ws-dir-edit" data-rename="${esc(x.path)}" title="重命名(仅空文件夹)">✎</span>` : ""}
+      </div>`).join("") || '<div class="ws-empty">这里没有子目录——可以直接「选择此目录」,或「新建文件夹」</div>';
+    if (truncated) {
+      list.insertAdjacentHTML("beforeend", '<div class="ws-empty">子目录过多,只显示前 500 个</div>');
+    }
+    list.querySelectorAll("[data-go]").forEach((el) =>
+      el.addEventListener("click", (e) => {
+        if (e.target.closest("[data-rename]") || e.target.closest("input")) return;
+        loadWsDirs(el.dataset.go);
+      }));
+    list.querySelectorAll("[data-rename]").forEach((el) =>
+      el.addEventListener("click", (e) => { e.stopPropagation(); startWsRename(el.dataset.rename); }));
+  };
+
+  // startWsRename swaps one entry's name for an input. Enter commits, Escape
+  // or blur cancels; the listing is repainted either way.
+  const startWsRename = (path) => {
+    const entry = $main.querySelector(`.ws-dir-entry[data-go="${CSS.escape(path)}"]`);
+    if (!entry) return;
+    const nameEl = entry.querySelector(".ws-dir-name");
+    const old = wsBase(path);
+    nameEl.innerHTML = `<input type="text" class="ws-inline" value="${esc(old)}" spellcheck="false">`;
+    entry.querySelector("[data-rename]")?.remove();
+    const inp = nameEl.querySelector("input");
+    inp.focus(); inp.select();
+    let done = false;
+    const finish = async (commit) => {
+      if (done) return;
+      done = true;
+      const name = inp.value.trim();
+      if (!commit || !name || name === old) { renderWsDirs(false); return; }
+      try {
+        const d = await api("/workspaces/rename", { method: "POST", body: { path, name } });
+        if (selectedWorkspace === path) setWorkspace(d.path);
+        toast(`已重命名为 ${d.path}`);
+      } catch (e) { toast("重命名失败:" + e.message); }
+      await loadWsDirs(wsBrowsePath);
+    };
+    inp.addEventListener("keydown", (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === "Enter") { e.preventDefault(); finish(true); }
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); finish(false); }
+    });
+    inp.addEventListener("blur", () => finish(false));
+    inp.addEventListener("click", (e) => e.stopPropagation());
+  };
+
+  // startWsCreate opens an inline "new folder" row at the top of the listing.
+  // A created folder is immediately selected as the workspace (that is why
+  // one creates it) and stays highlighted in the parent, ✎ at hand.
+  const startWsCreate = () => {
+    const list = $main.querySelector("#wf-ws-dirs");
+    if (list.querySelector(".ws-dir-new")) { list.querySelector(".ws-dir-new input")?.focus(); return; }
+    list.insertAdjacentHTML("afterbegin", `
+      <div class="ws-dir-entry ws-dir-new">${ICON_FOLDER}
+        <span class="ws-dir-name"><input type="text" class="ws-inline" placeholder="新文件夹名称" spellcheck="false"></span>
+      </div>`);
+    const row = list.querySelector(".ws-dir-new");
+    const inp = row.querySelector("input");
+    inp.focus();
+    let done = false;
+    const finish = async (commit) => {
+      if (done) return;
+      done = true;
+      const name = inp.value.trim();
+      if (!commit || !name) { row.remove(); return; }
+      try {
+        const d = await api("/workspaces/mkdir", { method: "POST", body: { parent: wsBrowsePath, name } });
+        setWorkspace(d.path);
+        toast(`已创建并选为工作区:${wsShort(d.path)}(可点 ✎ 重命名)`);
+      } catch (e) { toast("创建失败:" + e.message); }
+      await loadWsDirs(wsBrowsePath);
+    };
+    inp.addEventListener("keydown", (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === "Enter") { e.preventDefault(); finish(true); }
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); finish(false); }
+    });
+    inp.addEventListener("blur", () => finish(false));
+    inp.addEventListener("click", (e) => e.stopPropagation());
+  };
+
+  const openWsBrowser = async () => {
+    showWsBrowser(true);
+    // Start where the draft points; a picked folder opens at its parent so it
+    // shows up highlighted (and renamable) instead of as an empty listing.
+    const start = selectedWorkspace ? selectedWorkspace.replace(/\/[^/]+$/, "") : (wsDefault || wsHome || "");
+    await loadWsDirs(start || wsHome || "");
+  };
+
   const send = async () => {
     const box = $main.querySelector("#wf-input");
     const text = box.value.trim();
@@ -698,16 +1112,22 @@ async function wfListPage() {
     box.dispatchEvent(new Event("input")); // collapse the auto-grown composer
     try {
       const dry = $main.querySelector("#wf-dry")?.checked || false;
+      // Only a NEW run carries a workspace; continuing a session keeps the one
+      // it was born with (the server ignores the field there anyway).
+      const ws = wsLocked() ? "" : selectedWorkspace;
       let r;
       if (wf.mode === "dynamic") {
         // The message goes to the selected session; with none selected it
         // opens a new one. Finished sessions are reopened server-side.
         r = await api(`/workflows/${wf.id}/chat`, {
           method: "POST",
-          body: { text, images, dry_run: dry, run_id: sesId || "", new_session: sesId === null },
+          body: { text, images, dry_run: dry, workspace: ws, run_id: sesId || "", new_session: sesId === null },
         });
       } else {
-        r = await api(`/workflows/${wf.id}/runs`, { method: "POST", body: { goal: text, dry_run: dry } });
+        r = await api(`/workflows/${wf.id}/runs`, {
+          method: "POST",
+          body: { goal: text, dry_run: dry, workspace: ws },
+        });
       }
       pendingImgs.forEach((p) => URL.revokeObjectURL(p.url));
       pendingImgs = [];
@@ -716,8 +1136,18 @@ async function wfListPage() {
       run = r;
       sesId = r.id;
       sessionStorage.setItem(sesKey(), sesId);
+      // The run owns the workspace now and the bar switches to its locked form
+      // showing r.workspace (the server's normalized, authoritative value), so
+      // the draft is spent. Static mode keeps its draft: every send there opens
+      // a new run and the bar stays editable — blanking it under the user's
+      // cursor would be nothing but a surprise.
+      if (wsLocked()) {
+        selectedWorkspace = "";
+        sessionStorage.removeItem(wsKey());
+      }
+      if (ws) loadWsList(); // the server just promoted it in the MRU
       if (isNew || !sessions.some((s) => s.id === r.id)) {
-        try { sessions = await api("/runs?workflow_id=" + selId); } catch {}
+        try { sessions = await fetchSessions(); } catch {}
       }
       renderSessions();
       resub();
@@ -729,10 +1159,10 @@ async function wfListPage() {
     <div class="wf-split">
       <div class="wf-left">
         <div class="wf-left-head">
-          <h1 style="font-size:16px;margin:0">工作流</h1>
-          <button class="small primary" onclick="location.hash='#/workflows/new'">+ 新建</button>
+          <h1 style="font-size:16px;margin:0">会话</h1>
+          <button class="small primary" id="wf-new-left" title="开始一个全新会话">+ 新会话</button>
         </div>
-        <div id="wf-list"></div>
+        <div id="wf-list" class="ses-list"></div>
       </div>
       <div class="wf-right">
         <div class="wf-head" id="wf-head"></div>
@@ -744,6 +1174,41 @@ async function wfListPage() {
           <label class="check" id="wf-dry-wrap" style="font-size:11.5px;padding:2px 4px 6px">
             <input type="checkbox" id="wf-dry" ${meta.default_dry_run ? "checked" : ""}>
             <span>演示模式(dry run,零成本)— 仅对新发起的运行生效</span></label>
+          <div class="ws-pick" id="wf-ws-wrap">
+            <div class="ws-selector" id="wf-ws-btn" role="button" tabindex="0"
+                 title="选择本次运行的工作区(项目与产物所在目录)">
+              <span class="ws-ico">${ICON_FOLDER}</span>
+              <span class="ws-label" id="wf-ws-label"><span class="ws-none">选择工作区</span></span>
+              <span class="ws-x" id="wf-ws-x" title="改回默认工作区" hidden>✕</span>
+              <span class="ws-caret">▾</span>
+            </div>
+            <div class="ws-dropdown" id="wf-ws-menu" hidden>
+              <div id="wf-ws-main">
+                <div class="ws-manual">
+                  <input type="text" id="wf-ws-input" spellcheck="false" placeholder="输入项目路径…">
+                  <button class="small" id="wf-ws-apply">使用</button>
+                </div>
+                <div class="ws-sec-head">最近使用</div>
+                <div class="ws-recent" id="wf-ws-recent"></div>
+                <div class="ws-foot">
+                  <button class="small" id="wf-ws-browse">浏览文件夹 / 新建</button>
+                  <span style="flex:1"></span>
+                  <button class="small" id="wf-ws-clear">使用默认工作区</button>
+                </div>
+              </div>
+              <div class="ws-browse-panel" id="wf-ws-browser" hidden>
+                <div class="ws-crumb" id="wf-ws-crumb"></div>
+                <div class="ws-dirs" id="wf-ws-dirs"></div>
+                <div class="ws-foot">
+                  <button class="small" id="wf-ws-up">↑ 上级目录</button>
+                  <button class="small" id="wf-ws-new">+ 新建文件夹</button>
+                  <span style="flex:1"></span>
+                  <button class="small" id="wf-ws-back">返回</button>
+                  <button class="small primary" id="wf-ws-pick">选择此目录</button>
+                </div>
+              </div>
+            </div>
+          </div>
           <div class="attach-strip" id="wf-attach" style="display:none"></div>
           <textarea id="wf-input" rows="1" placeholder="对 main agent 说出目标或追加要求…(Enter 发送,Shift+Enter 换行,可粘贴图片)"></textarea>
           <div class="composer-bar">
@@ -757,8 +1222,13 @@ async function wfListPage() {
     </div>`;
   renderLeft();
   await loadRun();
+  selectedWorkspace = sessionStorage.getItem(wsKey()) || "";
   renderHead(); renderSessions(); renderRight(); resub();
+  // Non-blocking: the bar renders immediately and re-renders once home arrives,
+  // which is what turns absolute paths into their ~ form.
+  loadWsList().then(() => { renderWsBar(); renderWsRecent(); });
   $main.querySelector("#wf-send").addEventListener("click", send);
+  $main.querySelector("#wf-new-left").addEventListener("click", () => $main.querySelector("#wf-new-session")?.click());
   autoGrow($main.querySelector("#wf-input"));
   $main.querySelector("#wf-input").addEventListener("keydown", (e) => {
     // An Enter that is confirming an IME composition (pinyin etc.) belongs to
@@ -777,11 +1247,52 @@ async function wfListPage() {
   const fileInput = $main.querySelector("#wf-file");
   $main.querySelector("#wf-attachbtn").addEventListener("click", () => fileInput.click());
   fileInput.addEventListener("change", () => { addImages([...fileInput.files]); fileInput.value = ""; });
+
+  // Workspace selector — bound once. The composer is built a single time and
+  // never replaced by a re-render, so these listeners survive every SSE push.
+  $main.querySelector("#wf-ws-btn").addEventListener("click", (e) => {
+    if (e.target.closest("#wf-ws-x")) return; // the ✕ is handled below
+    e.stopPropagation();
+    wsOpen ? closeWsMenu() : openWsMenu();
+  });
+  $main.querySelector("#wf-ws-btn").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); wsOpen ? closeWsMenu() : openWsMenu(); }
+  });
+  $main.querySelector("#wf-ws-x").addEventListener("click", (e) => {
+    e.stopPropagation();
+    setWorkspace("");
+    closeWsMenu();
+  });
+  $main.querySelector("#wf-ws-apply").addEventListener("click", applyManualWs);
+  $main.querySelector("#wf-ws-input").addEventListener("keydown", (e) => {
+    // An Enter confirming an IME composition belongs to the IME, not to us.
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === "Enter") { e.preventDefault(); applyManualWs(); }
+    if (e.key === "Escape") closeWsMenu();
+  });
+  $main.querySelector("#wf-ws-browse").addEventListener("click", openWsBrowser);
+  $main.querySelector("#wf-ws-clear").addEventListener("click", () => { setWorkspace(""); closeWsMenu(); });
+  $main.querySelector("#wf-ws-up").addEventListener("click", (e) => {
+    const p = e.currentTarget.dataset.parent;
+    if (p) loadWsDirs(p);
+  });
+  $main.querySelector("#wf-ws-back").addEventListener("click", () => showWsBrowser(false));
+  $main.querySelector("#wf-ws-new").addEventListener("click", startWsCreate);
+  $main.querySelector("#wf-ws-pick").addEventListener("click", () => {
+    if (wsBrowsePath) setWorkspace(wsBrowsePath === wsDefault ? "" : wsBrowsePath);
+    closeWsMenu();
+  });
+  document.addEventListener("click", onDocClick);
 }
 
 // ---------- workflow editor ----------
 
-async function wfEditPage(id) {
+// wfEditPage edits one workflow record. Since the pilot UI there are only two
+// kinds — THE main-agent configuration (dynamic, exactly one, under 设置 › 主
+// agent) and static TEMPLATES (under 设置 › 静态模板) — the mode is a fact of
+// the record, never a choice on this form. opts.prefix is HTML rendered
+// above the form (the settings tabs); opts.back is where 保存/删除 returns.
+async function wfEditPage(id, opts = {}) {
   const [agents, wf] = await Promise.all([
     api("/agents"),
     id ? api("/workflows/" + id) : Promise.resolve({
@@ -794,28 +1305,22 @@ async function wfEditPage(id) {
   const pool = new Set(wf.agent_pool || []);
   const b = wf.budget || {};
   let mode = wf.mode === "dynamic" ? "dynamic" : "static";
+  const back = opts.back || (mode === "dynamic" ? "#/settings" : "#/settings/templates");
+  const title = mode === "dynamic" ? "主 agent 设置" : (id ? "编辑模板" : "新建模板");
 
   const render = () => {
     const dyn = mode === "dynamic";
-    $main.innerHTML = `
+    $main.innerHTML = (opts.prefix || "") + `
     <div class="page-head">
-      <h1>${id ? "编辑" : "新建"}工作流</h1>
-      ${id ? '<button class="danger" id="wf-del">删除</button>' : ""}
+      <h1>${title}</h1>
+      ${id && !dyn ? '<button class="danger" id="wf-del">删除</button>' : ""}
       <button class="primary" id="wf-save">保存</button>
     </div>
     <div class="panel" style="max-width:760px">
+      ${dyn ? `<div class="muted" style="font-size:12.5px;margin-bottom:12px">每个会话都由这个 main agent 驱动:它住在会话的工作区里、有自己的工具,按 level(solo / pair / orchestrate)决定何时动手、何时派单;静态模板在「静态模板」页维护,它可以把模板当一个任务来跑。</div>` :
+        `<div class="muted" style="font-size:12.5px;margin-bottom:12px">静态模板:planner 先出完整 DAG,审批后确定性执行。main agent 可用 run_template 把它当一个任务跑;也可以在模板列表直接运行。</div>`}
       <label class="field"><span>名称</span><input id="f-name" value="${esc(wf.name)}"></label>
       <label class="field"><span>描述</span><input id="f-desc" value="${esc(wf.description || "")}"></label>
-
-      <label class="field"><span>模式</span></label>
-      <div class="mode-pick">
-        <label class="${dyn ? "" : "on"}"><input type="radio" name="mode" value="static" ${dyn ? "" : "checked"}>
-          <b>static</b>
-          <span class="why">planner 先出完整 DAG,审批后确定性执行。形状可预判、要复现审计的任务。终止由无环结构保证。</span></label>
-        <label class="${dyn ? "on" : ""}"><input type="radio" name="mode" value="dynamic" ${dyn ? "checked" : ""}>
-          <b>dynamic</b>
-          <span class="why">coordinator 边做边分解、委派、收敛,任务树运行时涌现。需要循环、反问的任务。终止由预算硬限保证。</span></label>
-      </div>
 
       ${dyn ? `
       <label class="field"><span>Coordinator 附加指导 — 统筹风格 / 领域偏好</span>
@@ -829,11 +1334,33 @@ async function wfEditPage(id) {
             <option value="none" ${b.approval_policy === "none" ? "selected" : ""}>无审批(仅靠预算兜底)</option>
           </select></label>
       </div>
-      <label class="field"><span>常驻 implementer(pair 模式)— 该 agent 的所有任务共用一个持久会话串行执行,cwd 为交换目录,项目理解跨任务累积;留空关闭</span>
-        <select id="f-pair-agent">
-          <option value="">(关闭)</option>
-          ${agents.map((a) => `<option value="${esc(a.name)}" ${wf.pair_agent === a.name ? "selected" : ""}>${esc(a.name)}</option>`).join("")}
-        </select></label>
+      <div class="row">
+        <label class="field" style="flex:1"><span>main agent 的手 — 它自己在工作区里可用的工具(留空 = 全部)。什么时候允许动手由 level 决定,引擎在工具调用处强制</span>
+          <input id="f-coord-tools" value="${esc(wf.coordinator?.tools || "")}" placeholder="read,grep,glob,edit,write,bash,webfetch,websearch"></label>
+        <label class="field" style="flex:1"><span>起始 level(钉死)— 空 = 引擎默认(solo)</span>
+          <select id="f-coord-level">
+            <option value="" ${!wf.coordinator?.level ? "selected" : ""}>自动(默认 solo)</option>
+            <option value="solo" ${wf.coordinator?.level === "solo" ? "selected" : ""}>solo — 自己动手,需要时派单</option>
+            <option value="pair" ${wf.coordinator?.level === "pair" ? "selected" : ""}>pair — 自己动手 + 常驻伙伴</option>
+            <option value="orchestrate" ${wf.coordinator?.level === "orchestrate" ? "selected" : ""}>orchestrate — 只派单,不动手(写操作被拒)</option>
+          </select></label>
+      </div>
+      <label class="field"><span>常驻伙伴(pair)— 勾选的 agent 各有一个持久会话住在工作区,派给它的任务在该会话上串行执行,项目理解跨任务累积。implementer 与 reviewer 可同时常驻</span></label>
+      <div class="row" style="flex-wrap:wrap;gap:6px 14px;margin-bottom:12px" id="f-pair-agents">
+        ${agents.map((a) => `<label class="check"><input type="checkbox" value="${esc(a.name)}" ${(wf.pair_agents || []).includes(a.name) || wf.pair_agent === a.name ? "checked" : ""}> ${esc(a.name)}${a.independent ? ' <span class="badge">independent</span>' : ""}</label>`).join("") || '<span class="muted">池里还没有 agent</span>'}
+      </div>
+      <label class="field"><span>Triage 阈值 — main agent 每个任务前提交结构化评估,引擎按这些阈值定 level(任一达到 → orchestrate);改代码默认 ≥ pair。留空用默认。</span></label>
+      <div class="row">
+        <label class="field" style="flex:1"><span>步骤数 ≥</span><input id="f-tr-steps" type="number" placeholder="6" value="${wf.triage?.orchestrate_steps || ""}"></label>
+        <label class="field" style="flex:1"><span>独立分支 ≥</span><input id="f-tr-branches" type="number" placeholder="2" value="${wf.triage?.orchestrate_branches || ""}"></label>
+        <label class="field" style="flex:1"><span>角色种类 ≥</span><input id="f-tr-roles" type="number" placeholder="2" value="${wf.triage?.orchestrate_roles || ""}"></label>
+        <label class="field" style="flex:1"><span>预计文件 ≥</span><input id="f-tr-files" type="number" placeholder="8" value="${wf.triage?.orchestrate_files || ""}"></label>
+      </div>
+      <div class="row" style="margin-bottom:12px">
+        <label class="field" style="flex:1"><span>中途重判:自己改了 N 个文件</span><input id="f-tr-refiles" type="number" placeholder="8" value="${wf.triage?.reassess_files || ""}"></label>
+        <label class="field" style="flex:1"><span>中途重判:验收失败 K 次</span><input id="f-tr-refails" type="number" placeholder="3" value="${wf.triage?.reassess_test_failures || ""}"></label>
+        <label class="check" style="align-self:flex-end"><input type="checkbox" id="f-tr-pairoff" ${wf.triage?.pair_off_for_code ? "checked" : ""}> 改代码不自动升到 pair</label>
+      </div>
       <label class="field"><span>预算护栏 — 由引擎硬执行,不依赖 coordinator 自觉。这是 dynamic 模式唯一的终止保证。</span></label>
       <div class="row">
         <label class="field" style="flex:1"><span>最大任务数</span>
@@ -962,14 +1489,14 @@ async function wfEditPage(id) {
       if (!wf.name) return toast("请填写名称");
       try {
         await api("/workflows", { method: "POST", body: wf });
-        location.hash = "#/workflows";
+        location.hash = back;
       } catch (e) { toast("保存失败:" + e.message); }
     };
     const del = $main.querySelector("#wf-del");
     if (del) del.onclick = async () => {
       if (!(await confirmModal("删除工作流", "运行记录会保留,仅删除工作流定义。", "删除"))) return;
       await api("/workflows/" + id, { method: "DELETE" });
-      location.hash = "#/workflows";
+      location.hash = back;
     };
   };
 
@@ -983,7 +1510,19 @@ async function wfEditPage(id) {
         model: val("#f-coord-model", wf.coordinator?.model || "").trim(),
         system_prompt: val("#f-coord-sp", wf.coordinator?.system_prompt || "").trim(),
       };
-      wf.pair_agent = val("#f-pair-agent", wf.pair_agent || "");
+      wf.coordinator.tools = val("#f-coord-tools", wf.coordinator?.tools || "").trim();
+      wf.coordinator.level = val("#f-coord-level", wf.coordinator?.level || "");
+      wf.pair_agent = ""; // legacy single field, folded into the list
+      wf.pair_agents = [...$main.querySelectorAll("#f-pair-agents input:checked")].map((i) => i.value);
+      wf.triage = {
+        orchestrate_steps: +val("#f-tr-steps", 0) || 0,
+        orchestrate_branches: +val("#f-tr-branches", 0) || 0,
+        orchestrate_roles: +val("#f-tr-roles", 0) || 0,
+        orchestrate_files: +val("#f-tr-files", 0) || 0,
+        reassess_files: +val("#f-tr-refiles", 0) || 0,
+        reassess_test_failures: +val("#f-tr-refails", 0) || 0,
+        pair_off_for_code: checked("#f-tr-pairoff"),
+      };
       wf.budget = {
         max_tasks: +val("#f-max-tasks", 30),
         max_delegation_depth: +val("#f-max-depth", 3),
@@ -1039,7 +1578,7 @@ async function runsListPage() {
       return `
       <tr class="click" data-run="${esc(r.id)}">
         <td class="mono">${esc(r.id.slice(0, 24))}</td>
-        <td>${esc(r.workflow_name)} <span class="badge">${esc(r.mode || "static")}</span></td>
+        <td>${esc(r.workflow_name)} <span class="badge">${r.mode === "dynamic" ? "会话" : "模板"}</span>${r.level ? `<span class="badge lvl ${esc(r.level)}">${esc(r.level)}</span>` : ""}${r.parent_run_id ? `<a class="badge" href="#/runs/${esc(r.parent_run_id)}" title="由会话中的模板任务发起">⧉ 子运行</a>` : ""}</td>
         <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.goal)}</td>
         <td>${chip(r.status)}</td>
         <td class="mono">${progress}</td>
@@ -1076,6 +1615,18 @@ async function runsListPage() {
 
 // ---------- run detail ----------
 
+// Detail and topology are two views of one snapshot. The strip is a plain
+// anchor set so the hash stays the single source of truth — a reload, a
+// back button or a pasted link all land on the same view.
+function runTabs(id, which) {
+  const tab = (key, suffix, label) =>
+    `<a class="rtab${which === key ? " active" : ""}" href="#/runs/${esc(id)}${suffix}">${label}</a>`;
+  return `<div class="rtabs">
+      ${tab("detail", "", "📋 详情")}
+      ${tab("topology", "/topology", "🕸 拓扑")}
+    </div>`;
+}
+
 async function runPage(id) {
   let run;
   try { run = await api("/runs/" + id); }
@@ -1106,10 +1657,12 @@ async function runPage(id) {
     $main.innerHTML = `
       <div class="page-head">
         <h1>${esc(run.workflow_name)}</h1>
-        <span class="badge">${esc(run.mode || "static")}</span>
+        <span class="badge">${run.mode === "dynamic" ? "会话" : "模板"}</span>
+        ${run.parent_run_id ? `<a class="badge" href="#/runs/${esc(run.parent_run_id)}" title="回到发起它的会话运行">⧉ 父运行 ${esc(run.parent_run_id)}</a>` : ""}
         ${chip(run.status)}
         ${controls.join("")}
       </div>
+      ${runTabs(id, "detail")}
       <div class="panel">
         <div class="run-goal">${esc(run.goal)}</div>
         <div class="run-meta">
@@ -1119,7 +1672,7 @@ async function runPage(id) {
           <span class="mono">${fmtTokens(run.usage)}</span>
           ${dyn ? `<span>任务: <b class="mono">${Object.keys(run.tasks || {}).length}</b></span>`
                 : `<span>replan: <b class="mono">${run.replans}</b></span>`}
-          ${run.output_dir ? `<span title="产物目录">📁 <b class="mono">${esc(run.output_dir)}</b></span>` : ""}
+          ${run.workspace || run.output_dir ? `<span title="工作区">📁 <b class="mono">${esc(run.workspace || run.output_dir)}</b></span>` : ""}
           <span>耗时: <b class="mono">${runDuration(run)}</b></span>
           <span>${fmtTime(run.created_at)}</span>
         </div>
@@ -1236,7 +1789,10 @@ async function runPage(id) {
     es = new EventSource(`/api/runs/${id}/events`);
     es.onmessage = (m) => { run = JSON.parse(m.data); render(); };
   };
-  resub();
+  // Only follow a run that can still move. A terminal run's stream closes
+  // right after the snapshot, and EventSource would just reconnect in a loop.
+  // resub() stays ungated so a retry can pick the stream back up.
+  if (!["succeeded", "failed", "canceled", "interrupted"].includes(run.status)) resub();
   cleanup = () => es && es.close();
   render();
 }
@@ -1401,6 +1957,190 @@ function renderTaskDrawer(run, taskID) {
       <button class="small" data-output="${esc(t.id)}">查看完整输出</button>
     </div>
     <div id="node-output"></div>`;
+}
+
+// ---------- topology ----------
+
+// A page of its own rather than a panel inside runPage: the canvas engine is
+// stateful across snapshots, and runPage replaces its whole innerHTML on every
+// SSE frame — that would tear the engine down several times a second. Here only
+// the header, the HUD and the side panel are re-rendered; the canvas is handed
+// each snapshot and diffs it itself.
+async function topologyPage(id) {
+  let run;
+  try { run = await api("/runs/" + id); }
+  catch (e) { $main.innerHTML = `<div class="empty">运行不存在:${esc(e.message)}</div>`; return; }
+
+  const dyn = run.mode === "dynamic";
+  const legend = ["working", "input-required", "submitted", "completed", "failed"]
+    .map((st) => `<span class="chip ${st}">${esc(TASK_LABEL[st] || st)}</span>`).join("");
+
+  $main.innerHTML = `
+    <div class="page-head" id="topo-head"></div>
+    ${runTabs(id, "topology")}
+    ${dyn ? `
+    <div class="topo-panel">
+      <div class="topo-stage" id="topo-stage">
+        <canvas id="topo-canvas"></canvas>
+        <div class="topo-tip" id="topo-tip" hidden></div>
+        <div class="topo-legend" id="topo-legend">${legend}</div>
+        <div class="topo-hud" id="topo-hud"></div>
+      </div>
+      <div class="panel topo-side" id="topo-side"></div>
+    </div>`
+    : '<div class="empty">拓扑画的是 coordinator 在运行时委派出来的网络。static 模式的形状在批准那一刻就固定了,详情页的 DAG 画得更准。</div>'}`;
+
+  const $head = document.getElementById("topo-head");
+  const updateTopoHeader = () => {
+    $head.innerHTML = `
+      <h1>${esc(run.workflow_name)}</h1>
+      <span class="badge">${esc(run.mode || "static")}</span>
+      ${chip(run.status)}
+      <span class="topo-stat" title="按 Claude API 牌价折算,非实际账单">est. <b class="mono">${fmtCost(run.cost_usd)}</b></span>
+      <span class="topo-stat">耗时 <b class="mono">${runDuration(run)}</b></span>`;
+  };
+  updateTopoHeader();
+  if (!dyn) return;
+
+  const $hud = document.getElementById("topo-hud");
+  const $side = document.getElementById("topo-side");
+  let sel = null;      // {kind,label,taskIds} — whatever node the canvas selected
+  let selTask = null;  // a task drilled into from that node's list
+
+  const updateHud = () => {
+    const tasks = Object.values(run.tasks || {});
+    const n = (st) => tasks.filter((t) => t.status === st).length;
+    const c = run.coordinator || {};
+    $hud.innerHTML = `
+      <div>🧭 ${c.rounds ? `第 ${c.rounds} 轮` : "未启动"}${c.activity ? " · " + esc(c.activity) : ""}</div>
+      <div class="mono">${tasks.length} 任务 · 执行中 ${n("working")} · 待答复 ${n("input-required")} · 完成 ${n("completed")} · 失败 ${n("failed")}</div>`;
+  };
+
+  const coordSide = () => {
+    const c = run.coordinator || {};
+    return `
+      <h3>🧭 coordinator</h3>
+      <div class="muted mono" style="font-size:11px">${esc(c.model || "—")}</div>
+      ${c.activity ? `<div class="summary" style="color:var(--run)">⚙ ${esc(c.activity)}</div>` : ""}
+      <div class="kv">
+        <dt>状态</dt><dd>${c.status === "awaiting_user"
+          ? '<span class="chip input-required">等待用户回答</span>'
+          : chip(c.status === "done" ? "succeeded" : c.status === "failed" ? "failed" : "running")}</dd>
+        <dt>轮次</dt><dd class="mono" title="每轮上下文由任务台账重建,不跨轮累积">${c.rounds || 0}</dd>
+        <dt>已委派</dt><dd class="mono">${Object.keys(run.tasks || {}).length}</dd>
+        <dt>est.成本</dt><dd class="mono">${fmtCost(c.cost_usd)}</dd>
+      </div>
+      ${c.decision ? `<div class="muted" style="font-size:12px">最近决策</div><div class="summary">${esc(c.decision)}</div>` : ""}`;
+  };
+
+  const userSide = () => {
+    const chat = run.chat || [];
+    return `
+      <h3>你</h3>
+      <div class="muted" style="font-size:11.5px">与 main agent 的会话 · ${chat.length} 条</div>
+      <div class="thread">
+        ${chat.slice(-12).map((m) => `
+          <div class="msg">
+            <div class="who"><b>${m.from === "user" ? "你" : "main agent"}</b><span>${fmtTime(m.ts)}</span></div>
+            <div class="body">${esc(m.text)}</div>
+          </div>`).join("") || '<span class="muted" style="font-size:12px">还没有对话</span>'}
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="small" onclick="openSession('${esc(run.workflow_id)}','${esc(run.id)}')">💬 打开会话</button>
+      </div>`;
+  };
+
+  const agentSide = () => {
+    const tasks = (sel.taskIds || []).map((tid) => (run.tasks || {})[tid]).filter(Boolean);
+    return `
+      <h3>${esc(sel.label)}</h3>
+      <div class="muted" style="font-size:11.5px">${tasks.length} 个任务 · 点一条看完整往来</div>
+      <div class="tree" style="margin-top:8px">
+        ${tasks.map((t) => `
+          <div class="tnode ${esc(t.status)}" data-task="${esc(t.id)}">
+            <span class="tdot"></span>
+            <span class="ttitle">${esc(t.title || t.id)}</span>
+            <span class="tmeta">
+              ${modelBadge(t.model)}
+              <span>${esc(TASK_LABEL[t.status] || t.status)}</span>
+              ${t.duration_ms ? `<span>${fmtDur(t.duration_ms)}</span>` : ""}
+            </span>
+          </div>`).join("") || '<div class="muted" style="font-size:12px">还没有任务</div>'}
+      </div>`;
+  };
+
+  const sideHTML = () => {
+    if (selTask && (run.tasks || {})[selTask]) {
+      return `<button class="small" data-back>‹ 返回 ${esc(sel ? sel.label : "节点")}</button>`
+        + renderTaskDrawer(run, selTask);
+    }
+    if (!sel) return '<div class="muted" style="font-size:13px">点击节点:看它承担的任务、消息往来与产物</div>';
+    if (sel.kind === "coordinator") return coordSide();
+    if (sel.kind === "user") return userSide();
+    return agentSide();
+  };
+
+  // Re-rendered on every SSE push, so a half-typed reply has to survive it.
+  const renderSide = () => {
+    const draft = $side.querySelector("#task-msg")?.value;
+    $side.innerHTML = sideHTML();
+    if (draft) {
+      const box = $side.querySelector("#task-msg");
+      if (box) box.value = draft;
+    }
+    $side.querySelectorAll("[data-task]").forEach((el) =>
+      el.addEventListener("click", () => { selTask = el.dataset.task; renderSide(); }));
+    const back = $side.querySelector("[data-back]");
+    if (back) back.addEventListener("click", () => { selTask = null; renderSide(); });
+    const out = $side.querySelector("[data-output]");
+    if (out) out.addEventListener("click", async () => {
+      try {
+        const text = await fetch(`/api/runs/${run.id}/nodes/${out.dataset.output}/output`).then((r) => {
+          if (!r.ok) throw new Error("暂无输出文件");
+          return r.text();
+        });
+        const box = $side.querySelector("#node-output");
+        if (box) box.innerHTML = `<pre>${esc(text)}</pre>`;
+      } catch (e) { toast(e.message); }
+    });
+    const send = $side.querySelector("[data-send]");
+    if (send) send.addEventListener("click", async () => {
+      const box = $side.querySelector("#task-msg");
+      const text = box.value.trim();
+      if (!text) return toast("请填写内容");
+      try {
+        await api(`/runs/${run.id}/tasks/${selTask}/message`, { method: "POST", body: { text } });
+        box.value = "";
+        toast("已发送");
+      } catch (e) { toast(e.message); }
+    });
+  };
+
+  const topo = LoomTopology.create(document.getElementById("topo-canvas"), {
+    tip: document.getElementById("topo-tip"),
+    // The canvas hands back its own node id ("agent:x"), never a task id — the
+    // task list has to come from info.taskIds.
+    onSelect: (nodeId, info) => { sel = info; selTask = null; renderSide(); },
+  });
+  topo.ingest(run, { initial: true });
+  updateHud();
+  renderSide();
+
+  // A finished run has nothing left to push; skip the stream entirely.
+  const terminal = ["succeeded", "failed", "canceled", "interrupted"].includes(run.status);
+  if (!terminal) {
+    const es = new EventSource(`/api/runs/${id}/events`);
+    es.onmessage = (m) => {
+      run = JSON.parse(m.data);
+      topo.ingest(run);
+      updateTopoHeader();
+      updateHud();
+      renderSide();
+    };
+    cleanup = () => { es.close(); topo.destroy(); };
+  } else {
+    cleanup = () => { topo.destroy(); };
+  }
 }
 
 // ---------- DAG rendering ----------

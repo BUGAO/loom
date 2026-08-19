@@ -90,7 +90,7 @@ func TestRunSuccessDiamond(t *testing.T) {
 		},
 	}
 	eng, st, wf := setup(t, be)
-	run, err := eng.StartRun(wf, "test goal", false)
+	run, err := eng.StartRun(wf, "test goal", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestUpstreamContextFlows(t *testing.T) {
 		},
 	}
 	eng, st, wf := setup(t, be)
-	run, _ := eng.StartRun(wf, "goal", false)
+	run, _ := eng.StartRun(wf, "goal", "", false)
 	final := waitTerminal(t, st, run.ID)
 	if final.Status != model.RunSucceeded {
 		t.Fatalf("run: %s (%s)", final.Status, final.Error)
@@ -147,7 +147,7 @@ func TestApprovalGate(t *testing.T) {
 	wf.RequireApproval = true
 	st.SaveWorkflow(wf)
 
-	run, _ := eng.StartRun(wf, "goal", false)
+	run, _ := eng.StartRun(wf, "goal", "", false)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		r, _ := st.LoadRun(run.ID)
@@ -195,7 +195,7 @@ func TestReplanOnFailure(t *testing.T) {
 	wf.MaxReplans = 1
 	st.SaveWorkflow(wf)
 
-	run, _ := eng.StartRun(wf, "goal", false)
+	run, _ := eng.StartRun(wf, "goal", "", false)
 	final := waitTerminal(t, st, run.ID)
 	if final.Status != model.RunSucceeded {
 		t.Fatalf("recovered replan should succeed, got %s (%s)", final.Status, final.Error)
@@ -230,7 +230,7 @@ func TestPlannerCreatedAgent(t *testing.T) {
 	wf.AgentPool = []string{"a", "b"} // explicit subset → expect extension
 	st.SaveWorkflow(wf)
 
-	run, err := eng.StartRun(wf, "write a poem", false)
+	run, err := eng.StartRun(wf, "write a poem", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestAgentCreationRejectedWhenDisabled(t *testing.T) {
 		nodeFn: func(req llm.Request) (*llm.Result, error) { return okNode("x"), nil },
 	}
 	eng, st, wf := setup(t, be) // AllowAgentCreation defaults to false
-	run, _ := eng.StartRun(wf, "goal", false)
+	run, _ := eng.StartRun(wf, "goal", "", false)
 	final := waitTerminal(t, st, run.ID)
 	if final.Status != model.RunFailed {
 		t.Fatalf("want failed (creation not allowed), got %s", final.Status)
@@ -296,7 +296,7 @@ func TestCancel(t *testing.T) {
 		},
 	}
 	eng, st, wf := setup(t, be)
-	run, _ := eng.StartRun(wf, "goal", false)
+	run, _ := eng.StartRun(wf, "goal", "", false)
 	<-started
 	if err := eng.Cancel(run.ID); err != nil {
 		t.Fatal(err)

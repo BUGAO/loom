@@ -384,7 +384,7 @@ worker 下一轮次边界收到通知);引擎判定时按修订后契约加锁�
 配套:reviewer 白名单放宽为 Read,Grep,Glob(可自主发现文件);消息通道仅用于协调、产物必须落文件;
 外部事实先派廉价核实任务;coordinator transcript 跨激活追加不覆盖。
 
-## D27 `[约定]` 产物目录:~/workflow-output/<主题名>/
+## D27 `[约定]` 产物目录:~/workflow-output/<主题名>/(已被 D36 取代)
 
 dynamic run 的交换目录本体就是 `<output根>/<短名>/`(`-output` flag / `LOOM_OUTPUT`,默认 ~/workflow-output)。
 短名由 coordinator 按主题起(`name_output` 工具或 `propose_plan.output_name`,kebab ≤40 字符,重名自动 -2 后缀);
@@ -546,7 +546,7 @@ D33 的规范集只进不出,增长模式可预见:同一条教训被反复复�
 - 不做的:按命中率衰减(无法可靠归因一条规范是否起效)、按时间过期(行为偏好不随时间失效)。
 - 不变量重申:提案可以自动,合并、退役、生效必须过人;陈旧提案不许覆盖人的更新编辑。
 
-## D35 `[提示词]` dynamic 实现里程碑的独立评审:建议而非门禁
+## D35 `[提示词]` dynamic 实现里程碑的独立评审:建议而非门禁(已被 D37 收紧为门禁)
 
 dynamic 模式此前对质量只有两道闸:验收命令(引擎跑,挡"跑不过")与 coordinator 的 inspect
 纪律(零 inspect 拒绝 finish_run)。但 coordinator 的 inspect 不是独立评审——它已读过作者
@@ -559,3 +559,143 @@ gate)」节——仅当池内确有 `independent` agent 时渲染(建议一个�
 而非"做对";机械/低风险工作可跳过,但跳过即是在决定"机器检查 + 被污染的自读"已经足够。
 **明确不做机制强制**(如 require_review 开关):评不评审是 main agent 的判断,引擎的门禁
 保持验收 + inspect 两道不加码——机制约束留给确有复发证据之后再议。
+
+## D36 `[约定]` 一个 run 一个工作区:用户选的目录既是项目也是产物落点(取代 D27)
+
+D27 的两套目录(用户选的 project workspace + coordinator 起名的 `~/workflow-output/<短名>` 交换目录)
+在实战里出了两次事:空目录起新项目时 coordinator 把整个 app 当"产物"建到了交换目录;用户抱怨后,
+它又把"workspace"理解成自己会话的 cwd(`~/.loom/data/runs/<run>/workspace`,恰好叫 workspace),
+让 worker 把项目复制进了 loom 的内部目录——用户选的目录始终是空的。加上 pair 会话 cwd 是项目、
+但 prompt 却说"当前目录是你的私有工作区",implementer 把 craft MEMORY.md 写进了用户项目。
+
+改为:**一个 run 只有一个目录,叫工作区**——`Run.Workspace`,由用户在会话里选(不选=默认根
+`~/workflow-output`,`-output`/`LOOM_OUTPUT`),项目与产物都在里面;coordinator/worker prompt、
+工具描述、验收路径统一只说 workspace,"exchange directory / output folder / name_output /
+propose_plan.output_name" 全部移除,coordinator 也不再被要求确认交付位置。coordinator 会话 cwd
+改为 `runs/<run>/coordinator`(私有、不叫 workspace);worker prompt 把"私有 home"和"工作区"分开
+写明,pair 会话 cwd=工作区。UI 选择器:默认工作区显式展示、可"使用默认工作区"、文件夹浏览里可
+**新建文件夹**(创建即选中)并对**空文件夹**就地重命名(服务端同样只允许重命名空目录、限 $HOME 内,
+MRU 历史跟着改名)。旧 run 兼容:有 `output_dir` 的以它为工作区继续(工作在那里),更旧的回退内部目录。
+
+## D37 `[机制]` 完成判据四道门:测试契约、真实路径、目标证据、独立评审
+
+newspush run 的复盘:13 个任务的验收全是 artifact_exists/contains + go build/vet/gofmt,项目 0 个测试;
+E2E 由 coordinator 自己写成 `send --dry-run`,拿 "7/7 PASS" 当结论;邮件一封没发出去仍 finish_run(succeeded);
+池里的 reviewer 一次没用。根因:loom 验证的是"契约过了",不是"目标达成了",而写契约的正是被验证的人。
+四道门全部在引擎层,不靠提示词自觉:
+
+1. **契约必须含测试**(`hub.ValidateChecks`):acceptance 中出现 build/lint 类命令(go build/vet、gofmt、npm run
+   build、tsc、cargo build、make build…)而没有 test 类命令(go test、npm test、pytest、cargo test、make test…)
+   → 派单/修约被拒,错误信息点名哪条检查、要补什么。纯文档任务(无 build 检查)不受影响。
+2. **禁止 dry-run 式验收**:acceptance 命令含 `--dry-run/--dry_run/--mock/--no-send/--simulate/…` → 拒绝。
+   验收跑真实路径;真实路径需要用户才有的东西(凭据/账号)就先 ask_user;拿不到就是"未达成",不是"验证通过"。
+3. **目标证据(definition of done)**:新工具 `declare_evidence`(或 `propose_plan.evidence`)在**第一次 delegate 前**
+   必须声明"目标达成的可观察证据"(≤12 条,如"收件箱收到一封 digest 邮件");证据项可标 `needs_from_user`,
+   标了就必须先 ask_user 才能 delegate。`finish_run(succeeded)` 必须对每条证据报 `met + how`,缺报/未 met/
+   met 无 how 均拒绝——只能 `failed` 并说明缺口(failed 永远允许)。证据与结果持久化在 `Run.Evidence`,
+   round prompt 每轮回显,UI 会话面板显示 "完成判据 n/m 已验证"。
+4. **独立评审门禁**(收紧 D35):池内有 `independent` agent 时,`finish_run(succeeded)` 要求最后一个"实现类"
+   已完成任务(agent 工具含 Edit/Bash)之后存在一个 independent agent 的已完成任务;评审早于最后一次代码改动
+   即视为过期。仅 Write 的文档类任务不算实现、也不使评审过期。池内无 independent agent 则不适用。
+
+mock coordinator 同步遵守协议(declare → delegate → inspect → finish 带 evidence)。
+
+## D38 `[机制]` Hook 网关:工具面按身份、scope、level 实时判定,reason 原文回给模型
+
+飞行员改造(见 loom-pilot-plan)第一阶段。动机:模式(solo/pair/orchestrate)若只靠提示词,主 agent 必滑向
+"全部自己做";要让它"不能不按",判定必须落在工具调用上。已用真实运行时验证(`internal/llm/live_hook_test.go`,
+`live_gate_test.go`,`LOOM_LIVE_REPRO=1`):ACP 适配层执行会话 cwd settings 里的 PreToolUse/PostToolUse command
+hook;`bypassPermissions` 下 `permissionDecision: deny` 仍生效;`permissionDecisionReason` 原文进模型上下文;hook
+拿到 `tool_input`(文件路径、Bash 命令行);hook 子进程继承适配层进程环境变量。
+
+机制:
+- 每个 loom 会话的 jail(`.claude/settings.local.json`)多写两条静态 hook:`'<loom 二进制>' gate`(PreToolUse 匹配
+  全部受管工具,PostToolUse 匹配写类工具 + Bash)。**凭据不落盘**:`LOOM_GATE_URL/LOOM_GATE_TOKEN` 走会话进程环境,
+  hook 继承——同一 cwd 的并发会话(pilot + pair、同一 agent home 的并发任务)互不串身份。
+- `loom gate` 子命令把 stdin 的 hook JSON 转发到 `POST /gate`(Bearer token),原样打印应答;**fail-open**:
+  无凭据/无服务/超时/非 200 → 不打印、exit 0,调用放行(引擎挂了 run 也就死了;loom 之外的 Claude Code 打开同一
+  workspace,hook 因无凭据而惰性)。
+- `hub.Gate`(`internal/hub/gate.go`)按 token → RunSession + identity 判定,顺序:① 身份绑定的工具白名单(受管
+  工具表 `model.ToolGrants` 与静态 jail 共用一份;Task 永远拒绝并指向 delegate);② loom 自身控制面(workflow 文件、
+  agent.md、agent home 的 .claude、run.json、数据目录下的 AGENTS.md/CLAUDE.md、任何 settings.local.json)任何会话不写;
+  ③ 任务 scope 所有权(`Task.Scope`,delegate 时声明,相对 workspace 的文件/目录前缀;worker 写 scope 外被拒、任何人写
+  他人在飞 scope 被拒,任务 settled 即释放);④ run 的 level:ORCHESTRATE 下 main agent 写 workspace 被拒(reason 指向
+  delegate),Bash 明显写操作(重定向到文件、tee、sed -i、rm/mv/cp/mkdir/touch、git 变更类子命令、包管理 install/add…)
+  同样被拒,验证类命令放行;worker 的 shell 仍是信任边界。PostToolUse 记 `Run.Writes`(谁用什么工具写了哪条
+  workspace 相对路径 / 谁跑了写类 shell),供评审门归因(上限 400 条)。
+- `Run.Level/LevelSource/LevelLog`,`RunSession.SetLevel(level, source, reason)`;legacy run 无 level 视为 orchestrate
+  (旧 coordinator 本来就没有手)。
+- jail 写入改为**区分归属**:agent home(数据目录下)是 loom 的文件,整体重写;用户 workspace 的 settings.local.json
+  **合并不覆盖**——只加 loom 的路径规则与 hook 条目(精确记账),工具级 deny 不写(由网关按身份判,避免共享 cwd 的两个
+  会话互相继承 jail),最后一个 loom 会话关闭时精确移除 loom 条目(loom 创建的空文件/目录一并删除)。无网关凭据的会话
+  仍写完整 deny(不比从前弱)。
+
+## D39 `[机制]` 飞行员:main agent 住进工作区、有手;level 决定何时能动手;常驻伙伴可多选
+
+飞行员改造第二阶段(取代 D-早期 "coordinator 无文件工具" 的设计)。动机:用户真正想要的是 Claude Code 的体验
+(直接和干活的那个会话说话、流式可见、随时打断)加上 loom 的显性治理;而"说话的人没有手、只能派单"是体验差的根源。
+拆法:**说话的人**(main agent)可以有手,**守规则的人**(引擎的门 + hook 网关)决定手什么时候能用。
+
+- main agent 会话 `WorkDir = run workspace`,工具 = `CoordinatorConfig.Tools`(空 = 全部 `model.DefaultPilotTools`),
+  MCP = hub;转录仍落在 `runs/<id>/coordinator/`。项目自己的 CLAUDE.md/AGENTS.md 对它生效(和任何住在那里的会话一样)。
+- `Run.Level`(solo | pair | orchestrate)开 run 时由 `CoordinatorConfig.Level`(钉死)或默认 `solo` 写入,来源记入
+  `LevelSource/LevelLog`;用户可随时改(`POST /api/runs/{id}/level`,活 run 下一次工具调用生效并以 notice 告知 main
+  agent;闲置 run 存下供下次激活)。main agent 不能自己改 level(后续 triage 只能申请升档)。
+- 网关(D38)按 level 放行/拒绝 main agent 的写;orchestrate = 手被绑(Edit/Write 进 workspace、写类 shell 均拒,reason
+  指向 delegate)。评审门(D37 第四道)把 main agent **自己**写的代码(`Run.Writes` 中 by=coordinator 且非文档)也算实现
+  改动:最后一次改动之后必须有 independent agent 的已完成任务,否则 finish(succeeded) 拒。文档(.md/.txt/docs/)不算。
+- 常驻伙伴 `Workflow.PairAgents []string`(legacy `PairAgent` 并入,`EffectivePairAgents()`):每个伙伴一条持久会话住在
+  workspace,各自的任务在自己会话上串行;implementer 与 reviewer 可同时常驻;hub 凭据 `IssuePairToken(run, agent)` 带
+  agent 名,`SetPairTask(agent, task)` 按伙伴绑定。
+- 流式:`SessionRequest.OnText` 逐块回传正文 → `CoordinatorState.Draft`(≤4 次/秒发布);工具行 → `CoordinatorState.Trace`
+  (本轮,上限 40);round 结束 `CoordinatorReply` 提交正文、清空 draft/trace。UI 会话区显示"正在输入…"与本轮动作。
+- 提示词:coordinator prompt 改为飞行员身份——"你的手与 level"段说明三档含义与网关行为;验证纪律:可以直接读,但
+  finish 门只认 inspect 的审计读;workspace 段:cwd 即 workspace;常驻伙伴段列出每个伙伴及角色。round prompt 顶部回显
+  level 与一句含义。
+
+## D40 `[机制]` 监听 + 评估 + Triage:level 由引擎从结构化评估算出,main agent 只能申请升档
+
+飞行员改造第三阶段。前提(D38/D39):level 能被网关强制;本阶段解决"level 由谁、何时、凭什么定"。结论:不交给
+main agent 自选(必滑向 solo),而是**强制它交评估、引擎按阈值判**。
+
+- **评估强制**:`RunSession.assessPending` 为真时,main agent 对 workspace 的写(Edit/Write/写类 shell)被网关拒、
+  `delegate` 被 ledger 拒,reason 都指向 `assess_task`。置为 pending 的三个时机:run 开始(goal 本身就是任务)、
+  监听器把新用户消息判为 task、中途重判信号。round prompt 顶部回显 "Assessment: PENDING — 原因"。
+- **`assess_task`** 工具:`{summary, steps, modules, parallel_branches, roles, changes_code, est_files}` →
+  `hub.Triage`(纯函数)按 `TriageConfig` 阈值出 level 与理由:steps ≥6 / 独立分支 ≥2 / 角色种类 ≥2 / 预计文件 ≥8
+  任一 → orchestrate;否则 changes_code 且(配置了常驻伙伴或池里有 independent agent)→ pair(可关);否则 solo。
+  结果写 `Run.Assessments`(上限 20)、level 变化记 `LevelLog(source=triage)`、聊天里出一张 system/triage 判定卡。
+  **不覆盖**:工作流钉死的 level 与用户在本 run 设定的 level(`LevelSource=user`)一律不被 triage 改动,卡片上注明
+  "triage 建议 X,未应用"。
+- **`request_level`**:main agent 只能申请比当前更高的 level(source=pilot);降档是用户的事;用户已设定时拒绝。
+- **中途重判**:自上次评估起 main agent 自己改过的**不同**代码文件数 ≥ `reassess_files`(默认 8),或 acceptance 命令
+  失败次数 ≥ `reassess_test_failures`(默认 3)→ 置 pending + notice(每次评估只触发一次)。
+- **监听器**:每条进入活 run 的用户消息,引擎**并发**用 haiku 单轮、无工具分类为 task / continuation / question /
+  meta(消息本身立即送达 main agent,不等分类);task → 置 pending + notice。失败 = move on(不阻塞);**连续 3 次**
+  起每次失败都在聊天里出 system/notice 提示,成功一次重置。mock 后端按动词判(dry run 可测)。首条消息不走监听
+  (按构造即任务);重开 run 的消息走监听。
+- 已知取舍:分类与送达并发,新任务判定落地前的几秒内 main agent 可能已经开始写——可接受(写入会被归因,评审门兜底)。
+
+## D41 `[机制]` 模板即任务:静态工作流作为动态 run 的一个 task 运行
+
+飞行员改造第四阶段。静态工作流不再是另一种"会话",而是 main agent 可以调用的**模板**:`list_templates` 列出所有
+static 工作流,`run_template{template_id, goal}` 在本 run 的 ledger 里创建一个 `Agent = "template:<id>"` 的 task,
+过与 delegate 相同的门(评估、完成判据、审批、任务数预算);引擎 `execTemplateTask` 用现有静态管线(planner 出 DAG →
+deterministic execute)在**同一 workspace** 启一个子 run(`Run.ParentRunID/ParentTaskID`,task 侧 `Task.SubRunID` 双向链接),
+轮询至终态后以子 run 的结果落定 task(失败记 blocked,可返工;父 run 取消则子 run 一并取消)。动态预算把整个模板算一个
+task——模板自身的结构由 DAG 无环保证。UI 任务卡片对模板任务显示"⧉ 子运行"链接到静态 run 页(拓扑页复用)。
+mock coordinator 以 `simulate-template` 标记演示该路径。未做(有意推迟):triage 用 LLM 自动匹配模板并让用户确认——
+现阶段由 main agent 按 list_templates 的描述自行选择;模板页"用此模板开始"仍是直接启动静态 run。
+
+## D42 `[UI]` 一个会话区;static / dynamic 退为设置(主 agent 一份,静态模板多份)
+
+飞行员改造第五阶段(初版,用了再调)。导航:**会话 / 记录 / Agent 池 / 设置**。
+- **会话**:左栏是所有会话(= dynamic run,最新在上,带状态、level、工作区名),右侧是与 main agent 的对话;新会话 =
+  工作区选择器 + 第一条消息,一律挂在**唯一**的主 agent 配置(`GET /api/main`:`wf-dynamic`,否则第一个 dynamic
+  工作流,都没有就现场建一个)。会话头显示 level 控件(可改)、完成判据、任务树;聊天里有 triage 判定卡、系统提示卡、
+  main agent 的流式正文与本轮动作、模板任务的"⧉ 子运行"链接。
+- **设置 › 主 agent**:原 dynamic 表单(模型、附加指导、审批、main agent 的手、起始 level、常驻伙伴多选、triage 阈值、
+  预算、池);**设置 › 静态模板**:静态工作流列表(运行 / 编辑 / 新建),表单不再有 static/dynamic 单选——模式是记录的
+  事实,不是表单的选择;**设置 › 通用**:默认工作区、运行时、演示模式(只读,来自启动参数)。
+- **记录**:沿用运行列表;工作流列标"会话 / 模板",带 level 徽章与"⧉ 子运行"链接;run 详情页对子运行显示父运行链接。
+- 旧入口 `#/workflows` 重定向到 `#/sessions`;`#/workflows/:id/edit`、`#/workflows/new` 仍可用(模板编辑)。

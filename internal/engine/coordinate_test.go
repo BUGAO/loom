@@ -61,7 +61,7 @@ func noApproval() model.BudgetConfig {
 // workers' envelopes, and delivers a verdict.
 func TestDynamicDelegateAndReport(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
-	run, err := eng.StartRun(wf, "build the thing", true)
+	run, err := eng.StartRun(wf, "build the thing", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestDynamicDelegateAndReport(t *testing.T) {
 // input-required and resumes on the coordinator's answer.
 func TestDynamicAskCoordinator(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
-	run, err := eng.StartRun(wf, "do it, simulate-ask", true)
+	run, err := eng.StartRun(wf, "do it, simulate-ask", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestDynamicBudgetConverges(t *testing.T) {
 	b.MaxParallel = 2
 	eng, st, wf := dynSetup(t, b)
 
-	run, err := eng.StartRun(wf, "keep going, simulate-budget", true)
+	run, err := eng.StartRun(wf, "keep going, simulate-budget", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestDynamicPeerHandoff(t *testing.T) {
 	b.AllowPeerHandoff = true
 	eng, st, wf := dynSetup(t, b)
 
-	run, err := eng.StartRun(wf, "split it, simulate-handoff", true)
+	run, err := eng.StartRun(wf, "split it, simulate-handoff", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestDynamicHandoffRejectedWhenDisabled(t *testing.T) {
 	b := noApproval() // AllowPeerHandoff defaults to false
 	eng, st, wf := dynSetup(t, b)
 
-	run, err := eng.StartRun(wf, "split it, simulate-handoff", true)
+	run, err := eng.StartRun(wf, "split it, simulate-handoff", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestDynamicApprovalGate(t *testing.T) {
 	b.ApprovalPolicy = model.ApprovalInitial
 	eng, st, wf := dynSetup(t, b)
 
-	run, err := eng.StartRun(wf, "build the thing", true)
+	run, err := eng.StartRun(wf, "build the thing", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +253,7 @@ func TestDynamicApprovalRejected(t *testing.T) {
 	b.ApprovalPolicy = model.ApprovalInitial
 	eng, st, wf := dynSetup(t, b)
 
-	run, err := eng.StartRun(wf, "build the thing", true)
+	run, err := eng.StartRun(wf, "build the thing", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +284,7 @@ func TestDynamicApprovalRejected(t *testing.T) {
 // result is gone, so offering one would be a lie.
 func TestDynamicRetryRefused(t *testing.T) {
 	eng, st, wf := dynSetup(t, noApproval())
-	run, _ := eng.StartRun(wf, "build the thing", true)
+	run, _ := eng.StartRun(wf, "build the thing", "", true)
 	final := waitTerminal(t, st, run.ID)
 	var anyTask string
 	for id := range final.Tasks {
@@ -305,11 +305,11 @@ func TestDynamicRefusesSessionlessRuntime(t *testing.T) {
 		planFn: func(llm.Request) (*llm.Result, error) { return okNode("x"), nil },
 		nodeFn: func(llm.Request) (*llm.Result, error) { return okNode("x"), nil },
 	}
-	if _, err := eng.StartRun(wf, "goal", false); err == nil {
+	if _, err := eng.StartRun(wf, "goal", "", false); err == nil {
 		t.Fatal("expected dynamic mode to refuse a sessionless runtime")
 	}
 	// Dry-run on the same workflow still works: mock bypasses the runtime.
-	run, err := eng.StartRun(wf, "goal", true)
+	run, err := eng.StartRun(wf, "goal", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +328,7 @@ func TestDynamicCoordinatorSessionPersists(t *testing.T) {
 	eng, st, wf := dynSetup(t, b)
 	mock := eng.backends["mock"].(*llm.Mock)
 
-	run, err := eng.StartRun(wf, "build the thing", true)
+	run, err := eng.StartRun(wf, "build the thing", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +359,7 @@ func TestDynamicCoordinatorSessionRebuiltAfterLoss(t *testing.T) {
 	// woken by the approval — is made to fail.
 	mock.FailCoordinatorPrompt = 2
 
-	run, err := eng.StartRun(wf, "build the thing", true)
+	run, err := eng.StartRun(wf, "build the thing", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestPairAgentSharesOneSession(t *testing.T) {
 	}
 	mock := eng.backends["mock"].(*llm.Mock)
 
-	run, err := eng.StartRun(wf, "build the thing", true)
+	run, err := eng.StartRun(wf, "build the thing", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +428,7 @@ func TestPairAgentMustBeInPool(t *testing.T) {
 	if err := st.SaveWorkflow(wf); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := eng.StartRun(wf, "build the thing", true); err == nil {
+	if _, err := eng.StartRun(wf, "build the thing", "", true); err == nil {
 		t.Fatal("expected StartRun to refuse an unknown pair agent")
 	}
 }
@@ -458,7 +458,7 @@ func TestChatWhileAwaitingApprovalDoesNotSpin(t *testing.T) {
 	b.ApprovalPolicy = model.ApprovalInitial
 	eng, st, wf := dynSetup(t, b)
 
-	run, err := eng.StartRun(wf, "build the thing", true)
+	run, err := eng.StartRun(wf, "build the thing", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
