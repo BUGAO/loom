@@ -187,7 +187,8 @@ func (rs *RunSession) gateWorkspaceWriteLocked(id identity, rel, tool string) Ga
 			t := rs.run.Tasks[ownTask]
 			if t != nil && len(t.Scope) > 0 && !underScope(rel, t.Scope) {
 				return deny("%s is outside your task's scope (%s). Stay inside it; if the task genuinely needs this path, "+
-					"ask_coordinator to widen the scope before writing", rel, strings.Join(t.Scope, ", "))
+					"ask_coordinator to widen the scope (it must call amend_scope — a verbal \"approved\" changes nothing "+
+					"here) before writing", rel, strings.Join(t.Scope, ", "))
 			}
 		}
 	}

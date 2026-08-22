@@ -91,7 +91,7 @@ type BudgetConfig struct {
     MaxDelegationDepth int  `json:"max_delegation_depth"` // 默认 3(coordinator=0)
     MaxParallel        int  `json:"max_parallel"`         // 默认 3,复用信号量
     TaskTimeoutSec     int  `json:"task_timeout_sec"`     // 默认 1800
-    RunTimeoutSec      int  `json:"run_timeout_sec"`      // 默认 7200,硬墙钟
+    RunTimeoutSec      int  `json:"run_timeout_sec"`      // 默认 36000,工作时钟:等人(审批/ask_user)不计时;到点软截止(停止委派、在飞任务跑完、coordinator 必须 finish_run),宽限期后才硬停。见 hub/clock.go
     MaxTurnsPerTask    int  `json:"max_turns_per_task"`   // 单任务会话最大消息轮次,默认 6
     AllowAgentCreation bool `json:"allow_agent_creation"` // 复用现有护栏
     AllowPeerHandoff   bool `json:"allow_peer_handoff"`   // worker 间直接交接

@@ -125,6 +125,7 @@ func (h *Hub) OpenRun(ctx context.Context, cfg RunConfig) *RunSession {
 	h.mu.Unlock()
 
 	go rs.watchStall(ctx)
+	go rs.watchClock(ctx)
 	return rs
 }
 

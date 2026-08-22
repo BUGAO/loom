@@ -213,6 +213,11 @@ type amendAcceptanceIn struct {
 	Acceptance []acceptanceCheckIn `json:"acceptance" jsonschema:"the corrected machine-checkable criteria; at least one — a contract cannot be waived"`
 }
 
+type amendScopeIn struct {
+	TaskID string   `json:"task_id"`
+	Scope  []string `json:"scope" jsonschema:"the task's complete new list of owned workspace paths (relative; files or directory prefixes) — include the paths it already had plus the ones you are granting"`
+}
+
 type recordNoteIn struct {
 	Text string `json:"text" jsonschema:"the note; keep it short and decision-relevant"`
 }
@@ -482,6 +487,20 @@ func (h *Hub) addCoordinatorTools(srv *mcp.Server, rs *RunSession) {
 			return toolErr("%v", err), nil, nil
 		}
 		return okf(rs, "Contract of %s amended; the engine will judge the task by the new checks.", in.TaskID), nil, nil
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "amend_scope",
+		Description: "Replace an in-flight task's owned paths (its scope). This is the ONLY way to widen a scope: " +
+			"answering \"approved\" to a worker changes nothing the engine's gate enforces. Pass the complete new list " +
+			"(existing paths plus the additions). Refused if it would overlap another in-flight task's scope. The " +
+			"worker is notified; if it is parked on a question, answer it with send_message afterwards.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in amendScopeIn) (*mcp.CallToolResult, any, error) {
+		activity("amend_scope " + in.TaskID)
+		if err := rs.AmendScope(in.TaskID, in.Scope); err != nil {
+			return toolErr("%v", err), nil, nil
+		}
+		return okf(rs, "Scope of %s is now: %s. The gate enforces it immediately.", in.TaskID, strings.Join(rs.ScopeOf(in.TaskID), ", ")), nil, nil
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{

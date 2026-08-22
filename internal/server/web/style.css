@@ -477,6 +477,10 @@ tr.click:hover td { background: rgba(255, 255, 255, 0.03); }
   border: 1px solid var(--border); border-radius: 14px;
   background: var(--panel-glass); padding: 14px;
 }
+/* History and live tail render independently (only the changed half is
+   rebuilt per SSE frame); display:contents keeps them invisible to the
+   flex layout above. */
+#wf-chat-msgs, #wf-chat-tail { display: contents; }
 .cmsg { max-width: 78%; }
 .cmsg.me { align-self: flex-end; text-align: right; }
 .cmsg.agent { align-self: flex-start; }

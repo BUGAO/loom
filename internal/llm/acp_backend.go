@@ -978,7 +978,11 @@ func (s *acpSession) promptBlocks(ctx context.Context, blocks []acp.ContentBlock
 		return res, ctx.Err()
 	}
 	if err != nil {
-		return res, fmt.Errorf("acp prompt: %w (stderr: %s)", err, s.stderrTail())
+		// Classified: a provider overload / 5xx is transient (the engine
+		// retries on this same session), everything else is a real failure.
+		// Either way the message is one readable line, not a JSON-RPC
+		// envelope around a provider envelope around a stderr dump.
+		return res, classifyPromptError(fmt.Errorf("acp prompt: %w", err), s.stderrTail())
 	}
 	switch resp.StopReason {
 	case acp.StopReasonEndTurn, acp.StopReasonMaxTurnRequests, "":

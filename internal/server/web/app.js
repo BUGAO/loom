@@ -288,6 +288,17 @@ async function sessionsPage() {
   let es = null;
   let threadId = null; // task whose thread panel is open; null = closed
 
+  // ---- render cache & disclosure state ----
+  // The server pushes a full snapshot per streamed delta. Rebuilding the whole
+  // DOM per snapshot janks the stream and resets every <details> the user
+  // collapsed, so each region only re-renders when its HTML actually changed,
+  // and manual fold state survives re-renders.
+  let traceOpen = true;    // 「本轮动作」fold state
+  let evidenceOpen = null; // 「完成判据」; null = follow default (open while live)
+  let lastStatusHtml = null, lastMsgsHtml = null, lastTailHtml = null;
+  let lastChatRunId = null, lastThreadKey = null;
+  let renderQueued = false;
+
   // ---- workspace selector state ----
   // The directory the NEXT run works in and delivers to — project and output
   // are one folder. A run freezes its workspace at birth, so this is a draft
@@ -340,8 +351,18 @@ async function sessionsPage() {
       run = JSON.parse(m.data);
       const s = sessions.find((x) => x.id === run.id);
       if (s && s.status !== run.status) { s.status = run.status; renderSessions(); }
-      renderRight();
+      scheduleRender();
     };
+  };
+  // Deltas can arrive faster than the display refreshes; coalescing them into
+  // one render per animation frame keeps the stream smooth. rAF never fires
+  // while the page is hidden, so a timer keeps the DOM current in background.
+  const scheduleRender = () => {
+    if (renderQueued) return;
+    renderQueued = true;
+    const flush = () => { renderQueued = false; renderRight(); };
+    if (document.hidden) setTimeout(flush, 250);
+    else requestAnimationFrame(flush);
   };
   // Outside click closes the workspace dropdown. Registered once for the page
   // and torn down with the stream, so leaving the page leaves nothing behind.
@@ -505,7 +526,7 @@ async function sessionsPage() {
         ${e.needs_from_user && !e.met ? `<span class="ev-need">需你提供:${esc(e.needs_from_user)}</span>` : ""}
         ${e.met && e.how ? `<span class="ev-how">${esc(e.how)}</span>` : ""}
       </div>`).join("");
-    return `<details class="wf-evidence" ${terminalRun(run) ? "" : "open"}>
+    return `<details class="wf-evidence" ${(evidenceOpen ?? !terminalRun(run)) ? "open" : ""}>
       <summary>完成判据 <span class="badge">${met}/${ev.length} 已验证</span></summary>
       ${items}
     </details>`;
@@ -568,8 +589,11 @@ async function sessionsPage() {
   // Chat zone: the conversation with the main agent, with every delegation
   // shown inline as a thread root at the moment it happened, plus decision
   // moments (approval, verdict) where they occur.
+  // Returns {msgs, tail}: the settled history and the live tail (draft,
+  // approval, feedback box). During streaming only the tail changes, so the
+  // caller can leave the heavy history DOM alone.
   const renderChat = () => {
-    if (!run) return "";
+    if (!run) return { msgs: "", tail: "" };
     const chatImgs = (m) => (m.images || []).map((n) =>
       `<a href="/api/runs/${esc(run.id)}/uploads/${esc(n)}" target="_blank" rel="noopener">
          <img class="cimg" src="/api/runs/${esc(run.id)}/uploads/${esc(n)}" alt="${esc(n)}" loading="lazy"></a>`).join("");
@@ -632,27 +656,76 @@ async function sessionsPage() {
     } else if (!terminalRun(run) && run.mode === "dynamic") {
       const c = run.coordinator || {};
       const trace = (c.trace || []).length
-        ? `<details class="ctrace" open><summary>⚙ 本轮动作 ${c.trace.length}</summary>${c.trace.map((l) => `<div class="ctrace-line mono">${esc(l)}</div>`).join("")}</details>` : "";
+        ? `<details class="ctrace"${traceOpen ? " open" : ""}><summary>⚙ 本轮动作 ${c.trace.length}</summary>${c.trace.map((l) => `<div class="ctrace-line mono">${esc(l)}</div>`).join("")}</details>` : "";
       tail = c.status === "awaiting_user"
         ? '<div class="cmsg agent typing"><div class="cbody" style="color:var(--warn);font-style:normal">❓ main agent 在等你回答上面的问题——直接在下面输入即可</div></div>'
         : c.draft
           ? `<div class="cmsg agent"><div class="cwho">main agent · 正在输入…</div><div class="cbody">${esc(c.draft)}<span class="cursor">▍</span></div>${trace}</div>`
           : `<div class="cmsg agent typing"><div class="cbody">⋯ main agent 工作中(${esc(c.activity || "等待任务推进")})</div>${trace}</div>`;
     }
-    return msgs + tail;
+    return { msgs, tail };
   };
 
   const renderRight = () => {
     const st = $main.querySelector("#wf-status");
     const log = $main.querySelector("#wf-chat-log");
     if (!st || !log) return;
-    st.innerHTML = renderStatus();
+    const openThread = (el) => el.addEventListener("click", () => {
+      threadId = threadId === el.dataset.thread ? null : el.dataset.thread;
+      renderRight();
+    });
+    // Listeners are (re)wired only when a region's DOM was actually rebuilt —
+    // untouched DOM keeps its old listeners, so wiring again would double them.
+    const wire = (root) => {
+      root.querySelectorAll("[data-act]").forEach(wireAct);
+      root.querySelectorAll("[data-thread]").forEach(openThread);
+    };
+    // Fold state is captured from the live DOM right before rendering — the
+    // user's click lands on the DOM synchronously, so this can't lose a
+    // toggle to an already-queued render the way a toggle listener could.
+    const liveTrace = log.querySelector("details.ctrace");
+    if (liveTrace) traceOpen = liveTrace.open;
+    const liveEv = st.querySelector("details.wf-evidence");
+    if (liveEv) evidenceOpen = liveEv.open;
+    const stHtml = renderStatus();
+    if (stHtml !== lastStatusHtml) {
+      lastStatusHtml = stHtml;
+      st.innerHTML = stHtml;
+      wire(st);
+      st.querySelectorAll("[data-level]").forEach((sel) => sel.addEventListener("change", async () => {
+        try {
+          run = await api(`/runs/${run.id}/level`, { method: "POST", body: { level: sel.value } });
+          toast("level → " + sel.value);
+          renderRight();
+        } catch (e) { toast(e.message); renderRight(); }
+      }));
+    }
+    // Chat log is split into settled history and live tail (display: contents,
+    // so both stay transparent to the flex layout). Streaming only touches the
+    // tail; the history DOM — the expensive part — is left alone.
+    if ((run?.id || "") !== lastChatRunId || !log.querySelector("#wf-chat-msgs")) {
+      lastChatRunId = run?.id || "";
+      lastMsgsHtml = lastTailHtml = null;
+      log.innerHTML = '<div id="wf-chat-msgs"></div><div id="wf-chat-tail"></div>';
+    }
     const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
-    const prevFb = log.querySelector("#fb-input")?.value; // survive re-renders
-    log.innerHTML = renderChat();
-    if (prevFb !== undefined) {
-      const fb = log.querySelector("#fb-input");
-      if (fb) fb.value = prevFb;
+    const { msgs, tail } = renderChat();
+    if (msgs !== lastMsgsHtml) {
+      lastMsgsHtml = msgs;
+      const el = log.querySelector("#wf-chat-msgs");
+      el.innerHTML = msgs;
+      wire(el);
+    }
+    if (tail !== lastTailHtml) {
+      lastTailHtml = tail;
+      const el = log.querySelector("#wf-chat-tail");
+      const prevFb = el.querySelector("#fb-input")?.value; // survive re-renders
+      el.innerHTML = tail;
+      if (prevFb !== undefined) {
+        const fb = el.querySelector("#fb-input");
+        if (fb) fb.value = prevFb;
+      }
+      wire(el);
     }
     if (atBottom) log.scrollTop = log.scrollHeight;
     // Dry-run is a property fixed at session birth; the toggle only applies
@@ -660,21 +733,6 @@ async function sessionsPage() {
     const dryWrap = $main.querySelector("#wf-dry-wrap");
     if (dryWrap) dryWrap.style.display = !run ? "" : "none";
     renderWsBar(); // locked ↔ editable follows the same rule as the dry-run toggle
-    st.querySelectorAll("[data-act]").forEach(wireAct);
-    log.querySelectorAll("[data-act]").forEach(wireAct);
-    st.querySelectorAll("[data-level]").forEach((sel) => sel.addEventListener("change", async () => {
-      try {
-        run = await api(`/runs/${run.id}/level`, { method: "POST", body: { level: sel.value } });
-        toast("level → " + sel.value);
-        renderRight();
-      } catch (e) { toast(e.message); renderRight(); }
-    }));
-    const openThread = (el) => el.addEventListener("click", () => {
-      threadId = threadId === el.dataset.thread ? null : el.dataset.thread;
-      renderRight();
-    });
-    st.querySelectorAll("[data-thread]").forEach(openThread);
-    log.querySelectorAll("[data-thread]").forEach(openThread);
     renderThread();
   };
 
@@ -687,6 +745,7 @@ async function sessionsPage() {
     const t = threadId && run && run.tasks ? run.tasks[threadId] : null;
     if (!t) {
       threadId = null;
+      lastThreadKey = null;
       panel.style.display = "none";
       panel.innerHTML = "";
       return;
@@ -705,7 +764,7 @@ async function sessionsPage() {
         : m.from === "user" ? "你"
         : `任务 ${String(m.from).slice(-8)}`;
     panel.style.display = "";
-    panel.innerHTML = `
+    const html = `
       <div class="th-head">
         <div class="th-title">
           <b>${esc(t.title || t.id)}</b>
@@ -736,6 +795,12 @@ async function sessionsPage() {
         <textarea id="th-input" rows="1" placeholder="${t.status === "input-required" ? "回答 worker 的反问…" : "对该任务插话或调整方向…"}(Enter 发送)"></textarea>
         <button class="primary small" id="th-send">发送</button>
       </div>` : `<div class="th-done muted">任务已${esc(TASK_LABEL[t.status] || t.status)},thread 只读</div>`}`;
+    // Unchanged content: leave the DOM alone — input, scroll position and
+    // listeners all survive for free.
+    const key = t.id + " " + html;
+    if (key === lastThreadKey) return;
+    lastThreadKey = key;
+    panel.innerHTML = html;
     const list = panel.querySelector(".th-msgs");
     list.scrollTop = atBottom ? list.scrollHeight : prevScroll;
     panel.querySelector("#th-close").onclick = () => { threadId = null; renderRight(); };

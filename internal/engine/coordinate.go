@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -39,10 +40,13 @@ func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, 
 
 	budget := wf.EffectiveBudget()
 
-	// The run wall clock is a hard ceiling, not a suggestion: it is the last
-	// guarantee of termination once the DAG's acyclicity is gone.
-	ctx, cancelRun := context.WithTimeout(ctx, time.Duration(budget.RunTimeoutSec)*time.Second)
-	defer cancelRun()
+	// The run wall clock is the last guarantee of termination once the DAG's
+	// acyclicity is gone — but it is a WORK clock with a soft deadline, kept
+	// by the ledger (hub/clock.go): time parked on a human does not count,
+	// and reaching it closes delegation rather than killing in-flight work.
+	// Only the hard stop after the grace period cancels this context.
+	ctx, cancelRun := context.WithCancelCause(ctx)
+	defer cancelRun(nil)
 
 	// The coordinator runs on the default runtime (it is loom's own role, not
 	// a pool agent); dry-run swaps it for the mock like everything else.
@@ -85,7 +89,9 @@ func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, 
 		PilotTools:    wf.Coordinator.EffectiveTools(),
 		Exec:          d,
 		OnChange:      func(r *model.Run) { e.store.SaveRun(r); e.publish(r) },
+		OnLive:        e.publish, // draft/trace ticks: broadcast only, no disk write
 		OnCost:        func(entry store.CostEntry) { e.store.AppendCost(entry) },
+		OnExpire:      func() { cancelRun(errRunTimeout) },
 		SaveAgent:     func(a *model.Agent) error { return e.materializeOne(wf, run, a) },
 		SaveAmendment: func(am *model.Amendment) error { return e.store.SaveAmendment(am) },
 		SaveLesson:    func(l *model.Lesson) error { return e.store.SaveLesson(l) },
@@ -138,8 +144,8 @@ func (e *Engine) coordinate(ctx context.Context, h *handle, wf *model.Workflow, 
 		} else {
 			e.finish(run, model.RunFailed, msg)
 		}
-	case ctx.Err() == context.DeadlineExceeded:
-		e.finish(run, model.RunFailed, fmt.Sprintf("run exceeded its %ds wall clock before the coordinator delivered a verdict", budget.RunTimeoutSec))
+	case context.Cause(ctx) == errRunTimeout:
+		e.finish(run, model.RunFailed, fmt.Sprintf("run used up its %ds working-time budget and the grace period, and the coordinator delivered no verdict", budget.RunTimeoutSec))
 	case ctx.Err() != nil:
 		e.finish(run, model.RunCanceled, "")
 	case err != nil:
@@ -276,6 +282,9 @@ func (e *Engine) reactivate(runID, text, kind string, requireInterrupted bool, i
 	go e.coordinate(ctx, h, wf, run, pool, dryRun, opening)
 	return run, nil
 }
+
+// errRunTimeout is the cancellation cause of a run's hard stop.
+var errRunTimeout = errors.New("run wall clock expired")
 
 // coordinatorAgentName is how the coordinator appears in the cost ledger.
 const coordinatorAgentName = "(coordinator)"
@@ -435,7 +444,18 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 		for _, m := range userMsgs {
 			imgNames = append(imgNames, m.Images...)
 		}
-		res, perr := e.promptWithUploads(ctx, sess, d.run.ID, prompt, imgNames)
+		res, perr := promptRetry(ctx, func(ctx context.Context, p string) (*llm.Result, error) {
+			return e.promptWithUploads(ctx, sess, d.run.ID, p, imgNames)
+		}, prompt, func(res *llm.Result) {
+			modelID := res.Model
+			if modelID == "" {
+				modelID = d.run.Coordinator.Model
+			}
+			rs.RecordCoordinatorCost(coordinatorAgentName, modelID, res.Usage, res.CostUSD, time.Since(start).Milliseconds())
+		}, func(attempt int, wait time.Duration, err error) {
+			rs.AppendEvent("transient_error", "", fmt.Sprintf("coordinator: upstream error: %s — retrying on the same session in %s (attempt %d/%d)",
+				llm.CleanError(err), wait, attempt, len(transientBackoff)))
+		})
 		if res != nil {
 			modelID := res.Model
 			if modelID == "" {
@@ -465,7 +485,7 @@ func (d *dynamicRun) runCoordinator(ctx context.Context, rs *hub.RunSession, poo
 				if notice != "" {
 					rs.InjectNotice(notice)
 				}
-				rs.AppendEvent("run_status", "", "coordinator session lost ("+firstLineOf(perr.Error())+"); rebuilding from the ledger")
+				rs.AppendEvent("run_status", "", "coordinator session lost ("+firstLineOf(llm.CleanError(perr))+"); rebuilding from the ledger")
 				continue
 			}
 			rs.UpdateCoordinator(func(c *model.CoordinatorState) { c.Status = "failed" })
@@ -985,8 +1005,7 @@ func (d *dynamicRun) runTaskTurns(taskCtx, ctx context.Context, rs *hub.RunSessi
 	var haveEnv bool
 	for {
 		used, max := rs.TurnSpent(taskID)
-		res, err := sess.Prompt(taskCtx, prompt)
-		if res != nil {
+		record := func(res *llm.Result) {
 			modelID := res.Model
 			if modelID == "" {
 				modelID = taskModel
@@ -1001,18 +1020,38 @@ func (d *dynamicRun) runTaskTurns(taskCtx, ctx context.Context, rs *hub.RunSessi
 			}
 			fmt.Fprintf(&transcript, "## Turn %d\n\n%s\n\n", used, body)
 		}
+		retries := 0
+		res, err := promptRetry(taskCtx, sess.Prompt, prompt, record, func(attempt int, wait time.Duration, err error) {
+			retries = attempt
+			rs.AppendEvent("transient_error", taskID, fmt.Sprintf("upstream error: %s — retrying on the same session in %s (attempt %d/%d)",
+				llm.CleanError(err), wait, attempt, len(transientBackoff)))
+		})
+		if res != nil {
+			record(res)
+		}
 		if err != nil {
 			e.store.WriteNodeOutput(d.run.ID, taskID, transcript.String())
-			if taskCtx.Err() == context.DeadlineExceeded {
+			switch {
+			case taskCtx.Err() == context.DeadlineExceeded:
 				rs.CompleteTaskWith(taskID, "", nil,
 					fmt.Errorf("task exceeded its %ds timeout", budget.TaskTimeoutSec), model.FailBlocked, nil)
-				return true
-			}
-			if ctx.Err() != nil {
+			case ctx.Err() != nil:
 				rs.CompleteTask(taskID, "", nil, fmt.Errorf("canceled"))
-				return true
+			case llm.IsTransient(err):
+				// The provider, not the worker, failed — and kept failing
+				// through the retry budget. "blocked" keeps the task
+				// rework-eligible: the right move is to resend it, not to
+				// re-plan around the weather.
+				rs.CompleteTaskWith(taskID, "", nil,
+					fmt.Errorf("upstream runtime failure, not the worker's: %s (retried %d time(s) on the same session); "+
+						"delegate the same task again as rework once the provider recovers", llm.CleanError(err), retries),
+					model.FailBlocked, nil)
+			default:
+				// The session itself died (adapter crash, transport). Still
+				// not a verdict on the work: rework-eligible, one clean line.
+				rs.CompleteTaskWith(taskID, "", nil,
+					fmt.Errorf("worker session failed: %s", llm.CleanError(err)), model.FailBlocked, nil)
 			}
-			rs.CompleteTask(taskID, "", nil, err)
 			return true
 		}
 		// The structured report_result call is the primary channel; a trailing

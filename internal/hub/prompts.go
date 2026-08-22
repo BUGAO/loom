@@ -156,7 +156,8 @@ where waiting is exactly the job.
   for text-heavy work (research, analysis, review, specs) always demand a Markdown deliverable and
   pin it in acceptance (artifact_exists / artifact_contains) — never accept the result "in the reply".
 - You can NEVER waive a contract — telling a worker to "ignore the checks" is a lie the engine will
-  expose. If a contract turns out wrong, fix it with amend_acceptance.
+  expose. If a contract turns out wrong, fix it with amend_acceptance; if a worker needs a path outside
+  its scope, widen it with amend_scope (the gate enforces the stored list, not your answer).
 - Everything lives in the run workspace: the project's code AND the deliverables. Tell each worker
   which upstream artifacts to read and what to write. Downstream tasks read upstream md files from the
   workspace — pass file paths in instructions, never paste one worker's output into another's instruction. Messages are for
@@ -291,7 +292,9 @@ existing project: look at it (or at orchestrate, delegate the cheap impact surve
 - at most %d tasks running at once; the rest queue automatically
 - at most %d messages exchanged per task
 - at most %d reworks per failed task
-- the whole run is capped at %d seconds
+- this activation has %d seconds of WORKING time (time parked on the user — approval, ask_user — does
+  not count). You get a checkpoint notice before it runs out; when it does, delegate closes, tasks
+  already in flight finish, and you must deliver finish_run with what was achieved and what remains
 `, budget.MaxTasks, budget.MaxDelegationDepth, budget.MaxParallel, budget.MaxTurnsPerTask,
 		budget.MaxReworksPerTask, budget.RunTimeoutSec)
 
@@ -635,7 +638,9 @@ func WorkerPrompt(t *model.Task, agent *model.Agent, run *model.Run, workspace, 
 	if len(t.Scope) > 0 {
 		fmt.Fprintf(&b, "\n## Scope (enforced by the engine)\nThis task OWNS these workspace paths while it runs: %s\n"+
 			"Writes outside them are refused by the engine (not a suggestion — the tool call fails with the reason). "+
-			"If the task genuinely needs another path, ask_coordinator to widen the scope before writing. Other "+
+			"If the task genuinely needs another path, ask_coordinator to widen the scope before writing — the "+
+			"coordinator widens it with amend_scope; a verbal \"approved\" does not change what the gate enforces, so "+
+			"if a write is still refused after an answer, say so and ask for amend_scope explicitly. Other "+
 			"tasks' scopes are closed to you the same way.\n", strings.Join(t.Scope, ", "))
 	}
 	if t.Constraints != "" && !strings.EqualFold(t.Constraints, "none") {

@@ -124,7 +124,7 @@ var workflows = []*model.Workflow{
 			MaxDelegationDepth: 3,
 			MaxParallel:        3,
 			TaskTimeoutSec:     1800,
-			RunTimeoutSec:      7200,
+			RunTimeoutSec:      36000,
 			MaxTurnsPerTask:    6,
 			StallSec:           600,
 			ApprovalPolicy:     model.ApprovalInitial,

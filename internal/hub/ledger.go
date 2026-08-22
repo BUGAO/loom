@@ -55,8 +55,17 @@ type RunConfig struct {
 	// OnChange persists and publishes a run snapshot. It is called with the
 	// session lock held, so it must not call back into the RunSession.
 	OnChange func(*model.Run)
+	// OnLive publishes a snapshot WITHOUT persisting: the streamed reply
+	// draft and the tool trace tick many times a second, and writing the
+	// whole run to disk on each tick is what made the stream stutter. nil
+	// falls back to OnChange. Same lock rule as OnChange.
+	OnLive func(*model.Run)
 	// OnCost records a priced unit into the global ledger.
 	OnCost func(store.CostEntry)
+	// OnExpire fires once at the HARD deadline (see clock.go): the soft
+	// deadline closed delegation, the grace period is over, and whatever is
+	// still running must be stopped. Called without the session lock.
+	OnExpire func()
 	// SaveAgent persists a coordinator-created agent into the shared pool.
 	SaveAgent func(*model.Agent) error
 	// SaveAmendment persists a coordinator-proposed revision of an agent's
@@ -146,6 +155,13 @@ type RunSession struct {
 	// coordinator liveness / stall detection
 	lastTransition time.Time
 	pendingNotice  string
+
+	// work clock (see clock.go): working time consumed by this activation,
+	// the checkpoint/soft-deadline latches, and when the soft deadline hit.
+	workClock       time.Duration
+	checkpointSent  bool
+	deadlineReached bool
+	deadlineAt      time.Time
 	// lastDraftPublish throttles the streamed reply draft's republishing.
 	lastDraftPublish time.Time
 
@@ -425,6 +441,12 @@ func (rs *RunSession) Delegate(req DelegateRequest) (*model.Task, error) {
 	if rs.closed {
 		rs.mu.Unlock()
 		return nil, fmt.Errorf("this run has ended; no further tasks can be created")
+	}
+	if rs.deadlineReached {
+		rs.mu.Unlock()
+		return nil, fmt.Errorf("the run's working-time budget (%ds) is used up: no new task can be created. "+
+			"Tasks already in flight are being allowed to finish — wait for them, then call finish_run with an honest "+
+			"verdict of what was achieved and what remains for a follow-up session", rs.budget.RunTimeoutSec)
 	}
 	if rs.approvalNeeded && !rs.approvalDone {
 		rs.mu.Unlock()
@@ -1211,6 +1233,66 @@ func (rs *RunSession) AmendAcceptance(taskID string, checks []model.AcceptanceCh
 	rs.appendEventLocked("acceptance_amended", taskID, fmt.Sprintf("contract amended to %d check(s)", len(checks)))
 	rs.notifyLocked()
 	rs.mu.Unlock()
+	return nil
+}
+
+// AmendScope replaces an in-flight task's owned paths. It exists because the
+// gate tells a worker to "ask the coordinator to widen the scope" — and a
+// coordinator's verbal "approved" changes nothing the hook enforces (seen in
+// a real run: three rounds of approval, three identical refusals). The new
+// scope is checked against every other in-flight task's ownership both
+// ways, so widening one task can never silently overlap another.
+func (rs *RunSession) AmendScope(taskID string, scope []string) error {
+	scope = NormalizeScope(scope, rs.workspace)
+	if len(scope) == 0 {
+		return fmt.Errorf("scope must name at least one workspace path (\".\" for the whole workspace)")
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	t := rs.run.Tasks[taskID]
+	if t == nil {
+		return fmt.Errorf("unknown task %s", taskID)
+	}
+	if model.TaskTerminal(t.Status) {
+		return fmt.Errorf("task %s is already %s; its scope no longer matters", taskID, t.Status)
+	}
+	for id, other := range rs.run.Tasks {
+		if id == taskID || settled(other.Status) || len(other.Scope) == 0 {
+			continue
+		}
+		for _, p := range scope {
+			if underScope(p, other.Scope) {
+				return fmt.Errorf("%s is owned by in-flight task %s (%q); wait for it or narrow that task first", p, id, other.Title)
+			}
+		}
+		for _, op := range other.Scope {
+			if underScope(op, scope) {
+				return fmt.Errorf("the new scope would cover %s, which in-flight task %s (%q) owns; wait for it or narrow that task first", op, id, other.Title)
+			}
+		}
+	}
+	old := t.Scope
+	t.Scope = scope
+	note := "Your task's SCOPE was AMENDED by the coordinator. You now own (and may write inside) exactly: " +
+		strings.Join(scope, ", ") + ". The engine's gate enforces this new list from now on."
+	t.Messages = append(t.Messages, model.TaskMessage{
+		Ts: time.Now(), From: RoleCoordinator, Role: model.MsgFollowup, Text: note,
+	})
+	if ctrl := rs.ctrl[taskID]; ctrl != nil && t.Status != model.TaskInputRequired {
+		ctrl.inbox = append(ctrl.inbox, note) // a parked worker gets it in the coordinator's answer
+	}
+	rs.appendEventLocked("scope_amended", taskID, fmt.Sprintf("scope %v → %v", old, scope))
+	rs.notifyLocked()
+	return nil
+}
+
+// ScopeOf returns a task's current owned paths (nil for unscoped/unknown).
+func (rs *RunSession) ScopeOf(taskID string) []string {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if t := rs.run.Tasks[taskID]; t != nil {
+		return append([]string(nil), t.Scope...)
+	}
 	return nil
 }
 
@@ -2018,13 +2100,24 @@ func (rs *RunSession) CoordinatorDraft(text string) {
 	c.Draft = text
 	if now := time.Now(); now.Sub(rs.lastDraftPublish) >= draftPublishEvery || text == "" {
 		rs.lastDraftPublish = now
-		if rs.cfg.OnChange != nil {
-			rs.cfg.OnChange(rs.run)
-		}
+		rs.publishLive()
 	}
 }
 
-const draftPublishEvery = 250 * time.Millisecond
+// publishLive broadcasts the current snapshot to watchers without touching
+// the store. Caller holds rs.mu.
+func (rs *RunSession) publishLive() {
+	switch {
+	case rs.cfg.OnLive != nil:
+		rs.cfg.OnLive(rs.run)
+	case rs.cfg.OnChange != nil:
+		rs.cfg.OnChange(rs.run)
+	}
+}
+
+// draftPublishEvery paces the streamed draft: ~12 updates/s reads as
+// continuous typing, while still bounding the snapshot fan-out.
+const draftPublishEvery = 80 * time.Millisecond
 const maxTrace = 40
 
 // CoordinatorTrace appends one tool activity line to the round's live trace
@@ -2041,9 +2134,7 @@ func (rs *RunSession) CoordinatorTrace(line string) {
 	if len(c.Trace) > maxTrace {
 		c.Trace = append([]string(nil), c.Trace[len(c.Trace)-maxTrace:]...)
 	}
-	if rs.cfg.OnChange != nil {
-		rs.cfg.OnChange(rs.run)
-	}
+	rs.publishLive()
 }
 
 // InjectNotice queues a one-shot system notice for the coordinator and wakes
@@ -2419,8 +2510,9 @@ type BudgetStatus struct {
 	MaxParallel     int    `json:"max_parallel"`
 	MaxDepth        int    `json:"max_delegation_depth"`
 	MaxTurnsPerTask int    `json:"max_turns_per_task"`
-	RunElapsedSec   int    `json:"run_elapsed_sec"`
+	RunElapsedSec   int    `json:"run_elapsed_sec"` // working time (time parked on a human excluded)
 	RunTimeoutSec   int    `json:"run_timeout_sec"`
+	DeadlineReached bool   `json:"deadline_reached"` // delegation closed; in-flight tasks finishing
 	PeerHandoff     bool   `json:"peer_handoff_allowed"`
 	AgentCreation   bool   `json:"agent_creation_allowed"`
 	ApprovalState   string `json:"approval_state"`
@@ -2452,8 +2544,9 @@ func (rs *RunSession) BudgetStatus() BudgetStatus {
 		TasksUsed: len(rs.run.Tasks), TasksMax: rs.budget.MaxTasks,
 		Running: running, MaxParallel: rs.budget.MaxParallel,
 		MaxDepth: rs.budget.MaxDelegationDepth, MaxTurnsPerTask: rs.budget.MaxTurnsPerTask,
-		RunElapsedSec: int(time.Since(rs.run.CreatedAt).Seconds()), RunTimeoutSec: rs.budget.RunTimeoutSec,
-		PeerHandoff: rs.budget.AllowPeerHandoff, AgentCreation: rs.budget.AllowAgentCreation,
+		RunElapsedSec: int(rs.workClock.Seconds()), RunTimeoutSec: rs.budget.RunTimeoutSec,
+		DeadlineReached: rs.deadlineReached,
+		PeerHandoff:     rs.budget.AllowPeerHandoff, AgentCreation: rs.budget.AllowAgentCreation,
 		ApprovalState: state,
 	}
 }

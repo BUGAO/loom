@@ -202,7 +202,7 @@ func DefaultBudget() BudgetConfig {
 		MaxDelegationDepth: 3,
 		MaxParallel:        3,
 		TaskTimeoutSec:     1800,
-		RunTimeoutSec:      7200,
+		RunTimeoutSec:      36000, // 10h of working time per activation; see hub/clock.go
 		MaxTurnsPerTask:    6,
 		MaxReworksPerTask:  2,
 		StallSec:           600,

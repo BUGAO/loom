@@ -104,7 +104,14 @@ func (s *Server) Handler() http.Handler {
 	}
 
 	sub, _ := fs.Sub(webFS, "web")
-	mux.Handle("/", http.FileServerFS(sub))
+	// Embedded files carry no modtime, so browsers get no validator; tell
+	// them to always revalidate so a reload after an upgrade never runs
+	// stale app.js against a new server.
+	static := http.FileServerFS(sub)
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		static.ServeHTTP(w, r)
+	}))
 	return mux
 }
 
